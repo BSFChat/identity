@@ -1,3 +1,7 @@
+LABEL org.opencontainers.image.source=https://github.com/BSFChat/identity
+LABEL org.opencontainers.image.description="BSFChat identity service (OIDC)"
+LABEL org.opencontainers.image.licenses=MIT
+
 # Stage 1: Build
 FROM ubuntu:24.04 AS builder
 
