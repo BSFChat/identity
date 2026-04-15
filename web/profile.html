@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Profile - BSFChat ID</title>
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+    <nav class="navbar">
+        <div class="nav-brand">BSFChat ID</div>
+        <div class="nav-links">
+            <a href="/profile.html" class="active">Profile</a>
+            <a href="/admin.html" id="admin-link" class="hidden">Admin</a>
+            <a href="#" id="logout-btn">Sign Out</a>
+        </div>
+    </nav>
+
+    <div class="container">
+        <div class="card wide">
+            <h2>Profile Settings</h2>
+
+            <div id="error-msg" class="error hidden"></div>
+            <div id="success-msg" class="success hidden"></div>
+
+            <form id="profile-form">
+                <div class="form-group">
+                    <label for="username">Username</label>
+                    <input type="text" id="username" disabled>
+                </div>
+                <div class="form-group">
+                    <label for="display_name">Display Name</label>
+                    <input type="text" id="display_name" name="display_name">
+                </div>
+                <div class="form-group">
+                    <label for="email">Email</label>
+                    <input type="email" id="email" name="email">
+                </div>
+                <div class="form-group">
+                    <label for="avatar_url">Avatar URL</label>
+                    <input type="url" id="avatar_url" name="avatar_url" placeholder="https://...">
+                </div>
+                <button type="submit" class="btn btn-primary">Save Changes</button>
+            </form>
+
+            <hr>
+
+            <h3>Change Password</h3>
+            <form id="password-form">
+                <div class="form-group">
+                    <label for="old_password">Current Password</label>
+                    <input type="password" id="old_password" name="old_password" autocomplete="current-password">
+                </div>
+                <div class="form-group">
+                    <label for="new_password">New Password</label>
+                    <input type="password" id="new_password" name="new_password" minlength="8" autocomplete="new-password">
+                </div>
+                <button type="submit" class="btn btn-secondary">Change Password</button>
+            </form>
+        </div>
+    </div>
+
+    <script src="/js/app.js"></script>
+    <script>
+        async function loadProfile() {
+            try {
+                const profile = await apiGet('/api/profile');
+                document.getElementById('username').value = profile.username;
+                document.getElementById('display_name').value = profile.display_name || '';
+                document.getElementById('email').value = profile.email || '';
+                document.getElementById('avatar_url').value = profile.avatar_url || '';
+                if (profile.is_admin) {
+                    document.getElementById('admin-link').classList.remove('hidden');
+                }
+            } catch (err) {
+                window.location.href = '/login.html';
+            }
+        }
+
+        document.getElementById('profile-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            try {
+                await apiPut('/api/profile', {
+                    display_name: document.getElementById('display_name').value,
+                    email: document.getElementById('email').value,
+                    avatar_url: document.getElementById('avatar_url').value
+                });
+                showSuccess('Profile updated successfully');
+            } catch (err) {
+                showError(err.message);
+            }
+        });
+
+        document.getElementById('password-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            try {
+                await apiPut('/api/profile', {
+                    old_password: document.getElementById('old_password').value,
+                    new_password: document.getElementById('new_password').value
+                });
+                showSuccess('Password changed successfully');
+                document.getElementById('old_password').value = '';
+                document.getElementById('new_password').value = '';
+            } catch (err) {
+                showError(err.message);
+            }
+        });
+
+        document.getElementById('logout-btn').addEventListener('click', async (e) => {
+            e.preventDefault();
+            try {
+                await apiPost('/api/logout', {});
+            } catch (err) { /* ignore */ }
+            window.location.href = '/login.html';
+        });
+
+        loadProfile();
+    </script>
+</body>
+</html>
