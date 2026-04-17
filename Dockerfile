@@ -30,6 +30,8 @@ COPY web/ /usr/share/bsfchat/web/
 
 RUN mkdir -p /data/keys
 
+WORKDIR /usr/share/bsfchat
+
 EXPOSE 8480
 VOLUME ["/data", "/etc/bsfchat"]
 
