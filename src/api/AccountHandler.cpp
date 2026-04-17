@@ -596,4 +596,72 @@ void AccountHandler::handle_login_2fa(const httplib::Request& req, httplib::Resp
     res.set_content(response.dump(), "application/json");
 }
 
+// Server memberships
+
+void AccountHandler::handle_list_servers(const httplib::Request& req, httplib::Response& res) {
+    auto account_id = get_session_account(req);
+    if (account_id.empty()) {
+        json_error(res, 401, "Not authenticated");
+        return;
+    }
+
+    auto servers = store_.list_server_memberships(account_id);
+    nlohmann::json arr = nlohmann::json::array();
+    for (const auto& s : servers) {
+        arr.push_back({
+            {"id", s.id},
+            {"server_url", s.server_url},
+            {"server_name", s.server_name},
+            {"joined_at", s.joined_at}
+        });
+    }
+    res.set_content(arr.dump(), "application/json");
+}
+
+void AccountHandler::handle_add_server(const httplib::Request& req, httplib::Response& res) {
+    auto account_id = get_session_account(req);
+    if (account_id.empty()) {
+        json_error(res, 401, "Not authenticated");
+        return;
+    }
+
+    auto body = nlohmann::json::parse(req.body, nullptr, false);
+    if (body.is_discarded() || !body.contains("server_url")) {
+        json_error(res, 400, "Missing server_url");
+        return;
+    }
+
+    std::string url = body["server_url"].get<std::string>();
+    std::string name = body.value("server_name", "");
+    store_.add_server_membership(account_id, url, name);
+    res.set_content(nlohmann::json{{"success", true}}.dump(), "application/json");
+}
+
+void AccountHandler::handle_remove_server(const httplib::Request& req, httplib::Response& res) {
+    auto account_id = get_session_account(req);
+    if (account_id.empty()) {
+        json_error(res, 401, "Not authenticated");
+        return;
+    }
+
+    // Accept server_url from query param (for DELETE which may not carry body)
+    // or from JSON body.
+    std::string url;
+    if (req.has_param("server_url")) {
+        url = req.get_param_value("server_url");
+    } else {
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (!body.is_discarded() && body.contains("server_url")) {
+            url = body["server_url"].get<std::string>();
+        }
+    }
+    if (url.empty()) {
+        json_error(res, 400, "Missing server_url");
+        return;
+    }
+
+    store_.remove_server_membership(account_id, url);
+    res.set_content(nlohmann::json{{"success", true}}.dump(), "application/json");
+}
+
 } // namespace bsfchat::id

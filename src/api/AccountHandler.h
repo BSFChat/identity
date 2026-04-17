@@ -28,6 +28,11 @@ public:
     void handle_2fa_disable(const httplib::Request& req, httplib::Response& res);
     void handle_login_2fa(const httplib::Request& req, httplib::Response& res);
 
+    // Server memberships
+    void handle_list_servers(const httplib::Request& req, httplib::Response& res);
+    void handle_add_server(const httplib::Request& req, httplib::Response& res);
+    void handle_remove_server(const httplib::Request& req, httplib::Response& res);
+
     // Helper to extract account_id from session cookie. Returns empty string if not authenticated.
     std::string get_session_account(const httplib::Request& req);
 

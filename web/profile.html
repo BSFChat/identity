@@ -28,6 +28,7 @@
                 <button class="tab-btn active" data-tab="profile">Profile</button>
                 <button class="tab-btn" data-tab="security">Security</button>
                 <button class="tab-btn" data-tab="sessions">Sessions</button>
+                <button class="tab-btn" data-tab="servers">Servers</button>
             </div>
 
             <!-- ====== Profile Tab ====== -->
@@ -137,6 +138,35 @@
                     <p style="color: var(--text-muted);">Loading...</p>
                 </div>
             </div>
+
+            <!-- ====== Servers Tab ====== -->
+            <div id="tab-servers" class="tab-panel">
+                <div class="section-title">Server Memberships</div>
+                <div class="section-desc">
+                    These are the BSFChat servers your account is connected to. When you
+                    sign in on a new device, the client can auto-connect to all of them.
+                </div>
+
+                <div id="servers-list">
+                    <p style="color: var(--text-muted);">Loading...</p>
+                </div>
+
+                <hr>
+
+                <div class="section-title">Add a Server</div>
+                <div style="display:flex; gap:8px; align-items:flex-end;">
+                    <div class="form-group" style="flex:1; margin-bottom:0;">
+                        <label for="new-server-url">Server URL</label>
+                        <input type="url" id="new-server-url" placeholder="https://chat.bsfchat.com">
+                    </div>
+                    <div class="form-group" style="flex:1; margin-bottom:0;">
+                        <label for="new-server-name">Display Name (optional)</label>
+                        <input type="text" id="new-server-name" placeholder="BSFChat">
+                    </div>
+                    <button class="btn btn-primary btn-small" style="margin-bottom:0; height:42px;"
+                            onclick="addServer()">Add</button>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -153,6 +183,7 @@
                 // Lazy-load tab data
                 if (btn.dataset.tab === 'sessions') loadSessions();
                 if (btn.dataset.tab === 'security') load2FAStatus();
+                if (btn.dataset.tab === 'servers') loadServers();
             });
         });
 
@@ -334,6 +365,60 @@
                 await apiDelete('/api/user/sessions/' + encodeURIComponent(sessionId));
                 showSuccess('Session revoked');
                 loadSessions();
+            } catch (err) {
+                showError(err.message);
+            }
+        }
+
+        // ---- Servers tab ----
+        async function loadServers() {
+            const container = document.getElementById('servers-list');
+            try {
+                const servers = await apiGet('/api/servers');
+                if (servers.length === 0) {
+                    container.innerHTML = '<p style="color:var(--text-muted);">No servers registered yet. Add one below or connect via the BSFChat client.</p>';
+                    return;
+                }
+                container.innerHTML = '';
+                servers.forEach(s => {
+                    const joined = new Date(s.joined_at * 1000).toLocaleDateString();
+                    const row = document.createElement('div');
+                    row.className = 'session-row';
+                    row.innerHTML = `
+                        <div class="session-info">
+                            <div style="font-weight:600; color:var(--text-primary);">${escapeHtml(s.server_name || s.server_url)}</div>
+                            <div class="session-time">${escapeHtml(s.server_url)} &bull; Joined ${joined}</div>
+                        </div>
+                        <button class="btn btn-danger btn-small" onclick="removeServer('${escapeHtml(s.server_url)}')">Remove</button>
+                    `;
+                    container.appendChild(row);
+                });
+            } catch (err) {
+                container.innerHTML = '<p style="color:var(--text-muted);">Could not load servers.</p>';
+            }
+        }
+
+        async function addServer() {
+            const url = document.getElementById('new-server-url').value.trim();
+            if (!url) { showError('Enter a server URL'); return; }
+            const name = document.getElementById('new-server-name').value.trim();
+            try {
+                await apiPost('/api/servers', { server_url: url, server_name: name });
+                showSuccess('Server added');
+                document.getElementById('new-server-url').value = '';
+                document.getElementById('new-server-name').value = '';
+                loadServers();
+            } catch (err) {
+                showError(err.message);
+            }
+        }
+
+        async function removeServer(serverUrl) {
+            if (!confirm('Remove this server from your account?')) return;
+            try {
+                await apiPost('/api/servers/remove', { server_url: serverUrl });
+                showSuccess('Server removed');
+                loadServers();
             } catch (err) {
                 showError(err.message);
             }

@@ -67,9 +67,6 @@ void IdentityServer::register_routes() {
     auto sso_handler = std::make_shared<SsoHandler>(*store_, config_);
     auto admin_handler = std::make_shared<AdminHandler>(*store_, *account_handler, config_);
 
-    // Static files — serve web directory
-    svr.set_mount_point("/", "web");
-
     // OIDC discovery
     svr.Get("/.well-known/openid-configuration",
             [h = oidc_handler](const httplib::Request& req, httplib::Response& res) { h->handle_discovery(req, res); });
@@ -116,6 +113,15 @@ void IdentityServer::register_routes() {
     svr.Post("/api/user/2fa/disable",
              [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_2fa_disable(req, res); });
 
+    // Server memberships — track which BSFChat servers a user has joined
+    // so the client can restore all connections from a single identity login.
+    svr.Get("/api/servers",
+            [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_list_servers(req, res); });
+    svr.Post("/api/servers",
+             [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_add_server(req, res); });
+    svr.Post("/api/servers/remove",
+             [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_remove_server(req, res); });
+
     // Admin endpoints
     svr.Get("/api/admin/users",
             [h = admin_handler](const httplib::Request& req, httplib::Response& res) { h->handle_list_users(req, res); });
@@ -125,6 +131,10 @@ void IdentityServer::register_routes() {
             [h = admin_handler](const httplib::Request& req, httplib::Response& res) { h->handle_list_clients(req, res); });
     svr.Post("/api/admin/clients",
              [h = admin_handler](const httplib::Request& req, httplib::Response& res) { h->handle_create_client(req, res); });
+
+    // Static files — AFTER all route registrations so API handlers take
+    // priority over the mount point's 404 for paths like /api/servers.
+    svr.set_mount_point("/", "web");
 }
 
 void IdentityServer::start() {

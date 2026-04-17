@@ -138,9 +138,21 @@ void IdentityStore::initialize() {
         )
     )");
 
+    exec(R"(
+        CREATE TABLE IF NOT EXISTS server_memberships (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id  TEXT NOT NULL REFERENCES accounts(id),
+            server_url  TEXT NOT NULL,
+            server_name TEXT NOT NULL DEFAULT '',
+            joined_at   INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+            UNIQUE(account_id, server_url)
+        )
+    )");
+
     exec("CREATE INDEX IF NOT EXISTS idx_accounts_username ON accounts(username)");
     exec("CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account_id)");
     exec("CREATE INDEX IF NOT EXISTS idx_refresh_tokens_account ON refresh_tokens(account_id)");
+    exec("CREATE INDEX IF NOT EXISTS idx_server_memberships_account ON server_memberships(account_id)");
 }
 
 // Accounts
@@ -558,6 +570,50 @@ void IdentityStore::delete_login_token(const std::string& token) {
     auto stmt = prepare(db_, "DELETE FROM login_tokens WHERE token = ?");
     sqlite3_bind_text(stmt.get(), 1, token.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(stmt.get());
+}
+
+// Server memberships
+
+void IdentityStore::add_server_membership(const std::string& account_id,
+                                           const std::string& server_url,
+                                           const std::string& server_name) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "INSERT OR REPLACE INTO server_memberships (account_id, server_url, server_name, joined_at) "
+        "VALUES (?, ?, ?, strftime('%s','now'))");
+    sqlite3_bind_text(stmt.get(), 1, account_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, server_url.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, server_name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt.get());
+}
+
+void IdentityStore::remove_server_membership(const std::string& account_id,
+                                              const std::string& server_url) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "DELETE FROM server_memberships WHERE account_id = ? AND server_url = ?");
+    sqlite3_bind_text(stmt.get(), 1, account_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, server_url.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt.get());
+}
+
+std::vector<IdentityStore::ServerMembership>
+IdentityStore::list_server_memberships(const std::string& account_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "SELECT id, server_url, server_name, joined_at "
+        "FROM server_memberships WHERE account_id = ? ORDER BY joined_at ASC");
+    sqlite3_bind_text(stmt.get(), 1, account_id.c_str(), -1, SQLITE_TRANSIENT);
+    std::vector<ServerMembership> out;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        ServerMembership m;
+        m.id = std::to_string(sqlite3_column_int64(stmt.get(), 0));
+        m.server_url = col_text(stmt.get(), 1);
+        m.server_name = col_text(stmt.get(), 2);
+        m.joined_at = sqlite3_column_int64(stmt.get(), 3);
+        out.push_back(std::move(m));
+    }
+    return out;
 }
 
 } // namespace bsfchat::id

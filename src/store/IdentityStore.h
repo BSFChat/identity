@@ -115,6 +115,19 @@ public:
     std::optional<std::string> validate_login_token(const std::string& token);
     void delete_login_token(const std::string& token);
 
+    // Server memberships — tracks which BSFChat servers a user has joined
+    // so the client can restore all connections from a single identity login.
+    struct ServerMembership {
+        std::string id;
+        std::string server_url;
+        std::string server_name; // human-readable, optional
+        int64_t joined_at = 0;
+    };
+    void add_server_membership(const std::string& account_id, const std::string& server_url,
+                                const std::string& server_name = "");
+    void remove_server_membership(const std::string& account_id, const std::string& server_url);
+    std::vector<ServerMembership> list_server_memberships(const std::string& account_id);
+
 private:
     void exec(const std::string& sql);
     sqlite3* db_ = nullptr;
