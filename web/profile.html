@@ -3,14 +3,14 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Profile - BSFChat ID</title>
+    <title>Account - BSFChat ID</title>
     <link rel="stylesheet" href="/css/style.css">
 </head>
 <body>
     <nav class="navbar">
         <div class="nav-brand">BSFChat ID</div>
         <div class="nav-links">
-            <a href="/profile.html" class="active">Profile</a>
+            <a href="/profile.html" class="active">Account</a>
             <a href="/admin.html" id="admin-link" class="hidden">Admin</a>
             <a href="#" id="logout-btn">Sign Out</a>
         </div>
@@ -18,50 +18,145 @@
 
     <div class="container">
         <div class="card wide">
-            <h2>Profile Settings</h2>
+            <h2>Account Settings</h2>
 
             <div id="error-msg" class="error hidden"></div>
             <div id="success-msg" class="success hidden"></div>
 
-            <form id="profile-form">
-                <div class="form-group">
-                    <label for="username">Username</label>
-                    <input type="text" id="username" disabled>
-                </div>
-                <div class="form-group">
-                    <label for="display_name">Display Name</label>
-                    <input type="text" id="display_name" name="display_name">
-                </div>
-                <div class="form-group">
-                    <label for="email">Email</label>
-                    <input type="email" id="email" name="email">
-                </div>
-                <div class="form-group">
-                    <label for="avatar_url">Avatar URL</label>
-                    <input type="url" id="avatar_url" name="avatar_url" placeholder="https://...">
-                </div>
-                <button type="submit" class="btn btn-primary">Save Changes</button>
-            </form>
+            <!-- Tabs -->
+            <div class="tabs">
+                <button class="tab-btn active" data-tab="profile">Profile</button>
+                <button class="tab-btn" data-tab="security">Security</button>
+                <button class="tab-btn" data-tab="sessions">Sessions</button>
+            </div>
 
-            <hr>
+            <!-- ====== Profile Tab ====== -->
+            <div id="tab-profile" class="tab-panel active">
+                <form id="profile-form">
+                    <div class="form-group">
+                        <label for="username">Username</label>
+                        <input type="text" id="username" disabled>
+                    </div>
+                    <div class="form-group">
+                        <label for="display_name">Display Name</label>
+                        <input type="text" id="display_name" name="display_name">
+                    </div>
+                    <div class="form-group">
+                        <label for="email">Email</label>
+                        <input type="email" id="email" name="email">
+                    </div>
+                    <div class="form-group">
+                        <label for="avatar_url">Avatar URL</label>
+                        <input type="url" id="avatar_url" name="avatar_url" placeholder="https://...">
+                    </div>
+                    <button type="submit" class="btn btn-primary">Save Changes</button>
+                </form>
+            </div>
 
-            <h3>Change Password</h3>
-            <form id="password-form">
-                <div class="form-group">
-                    <label for="old_password">Current Password</label>
-                    <input type="password" id="old_password" name="old_password" autocomplete="current-password">
+            <!-- ====== Security Tab ====== -->
+            <div id="tab-security" class="tab-panel">
+                <!-- Password -->
+                <div class="section">
+                    <div class="section-title">Change Password</div>
+                    <div class="section-desc">
+                        You'll need your current password to set a new one. Minimum 8 characters.
+                    </div>
+                    <form id="password-form">
+                        <div class="form-group">
+                            <label for="old_password">Current Password</label>
+                            <input type="password" id="old_password" autocomplete="current-password">
+                        </div>
+                        <div class="form-group">
+                            <label for="new_password">New Password</label>
+                            <input type="password" id="new_password" minlength="8" autocomplete="new-password">
+                        </div>
+                        <button type="submit" class="btn btn-secondary">Change Password</button>
+                    </form>
                 </div>
-                <div class="form-group">
-                    <label for="new_password">New Password</label>
-                    <input type="password" id="new_password" name="new_password" minlength="8" autocomplete="new-password">
+
+                <hr>
+
+                <!-- 2FA -->
+                <div class="section">
+                    <div class="section-title">Two-Factor Authentication</div>
+                    <div class="section-desc">
+                        Add an extra layer of security. You'll need an authenticator app
+                        (Google Authenticator, Authy, 1Password, etc.) to generate codes.
+                    </div>
+
+                    <!-- Status: loaded dynamically -->
+                    <div id="2fa-status-area">
+                        <p style="color: var(--text-muted);">Loading...</p>
+                    </div>
+
+                    <!-- Setup flow (hidden until user clicks Enable) -->
+                    <div id="2fa-setup-area" class="hidden">
+                        <div class="section-title">Scan this QR code</div>
+                        <div class="section-desc">
+                            Open your authenticator app and scan the code below, or enter the
+                            secret manually.
+                        </div>
+
+                        <div class="qr-container">
+                            <div id="qr-target"></div>
+                            <div>
+                                <div style="font-size:12px; color:var(--text-muted); margin-bottom:4px;">Manual entry</div>
+                                <code id="2fa-secret-display" style="font-size:14px; word-break:break-all;"></code>
+                            </div>
+                        </div>
+
+                        <div class="section-title" style="margin-top:20px;">Backup Codes</div>
+                        <div class="section-desc">
+                            Save these somewhere safe. Each code can only be used once if you
+                            lose access to your authenticator.
+                        </div>
+                        <div id="backup-codes-grid" class="backup-codes"></div>
+
+                        <div class="section-title" style="margin-top:20px;">Verify</div>
+                        <div class="section-desc">
+                            Enter a 6-digit code from your authenticator to finish setup.
+                        </div>
+                        <div class="code-input">
+                            <input type="text" id="2fa-verify-code" maxlength="6"
+                                   placeholder="000000" autocomplete="off">
+                            <button class="btn btn-primary btn-small" onclick="verify2FA()">Verify</button>
+                            <button class="btn btn-secondary btn-small" onclick="cancel2FASetup()">Cancel</button>
+                        </div>
+                    </div>
                 </div>
-                <button type="submit" class="btn btn-secondary">Change Password</button>
-            </form>
+            </div>
+
+            <!-- ====== Sessions Tab ====== -->
+            <div id="tab-sessions" class="tab-panel">
+                <div class="section-title">Active Sessions</div>
+                <div class="section-desc">
+                    These are the devices currently logged in to your account. Revoke any
+                    session you don't recognise.
+                </div>
+                <div id="sessions-list">
+                    <p style="color: var(--text-muted);">Loading...</p>
+                </div>
+            </div>
         </div>
     </div>
 
     <script src="/js/app.js"></script>
+    <script src="/js/qrcode.min.js" defer></script>
     <script>
+        // ---- Tab switching ----
+        document.querySelectorAll('.tab-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+                document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+                btn.classList.add('active');
+                document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+                // Lazy-load tab data
+                if (btn.dataset.tab === 'sessions') loadSessions();
+                if (btn.dataset.tab === 'security') load2FAStatus();
+            });
+        });
+
+        // ---- Profile tab ----
         async function loadProfile() {
             try {
                 const profile = await apiGet('/api/profile');
@@ -91,6 +186,7 @@
             }
         });
 
+        // ---- Security tab: password ----
         document.getElementById('password-form').addEventListener('submit', async (e) => {
             e.preventDefault();
             try {
@@ -106,14 +202,151 @@
             }
         });
 
+        // ---- Security tab: 2FA ----
+        let pending2FASecret = null;
+
+        async function load2FAStatus() {
+            const area = document.getElementById('2fa-status-area');
+            try {
+                const data = await apiGet('/api/user/2fa/status');
+                if (data.enabled) {
+                    area.innerHTML = `
+                        <div style="display:flex; align-items:center; justify-content:space-between;">
+                            <span class="status-badge enabled">\u2713 Enabled</span>
+                            <button class="btn btn-danger btn-small" onclick="disable2FA()">Disable 2FA</button>
+                        </div>`;
+                } else {
+                    area.innerHTML = `
+                        <div style="display:flex; align-items:center; justify-content:space-between;">
+                            <span class="status-badge disabled">Not enabled</span>
+                            <button class="btn btn-primary btn-small" onclick="setup2FA()">Enable 2FA</button>
+                        </div>`;
+                }
+            } catch (err) {
+                area.innerHTML = '<p style="color:var(--text-muted);">Could not load 2FA status.</p>';
+            }
+        }
+
+        async function setup2FA() {
+            try {
+                const data = await apiPost('/api/user/2fa/setup', {});
+                pending2FASecret = data.secret;
+
+                // Show setup area
+                document.getElementById('2fa-status-area').classList.add('hidden');
+                document.getElementById('2fa-setup-area').classList.remove('hidden');
+
+                // Secret for manual entry
+                document.getElementById('2fa-secret-display').textContent = data.secret;
+
+                // QR code (uses qrcode.min.js)
+                const qrTarget = document.getElementById('qr-target');
+                qrTarget.innerHTML = '';
+                if (typeof QRCode !== 'undefined') {
+                    new QRCode(qrTarget, {
+                        text: data.provisioning_uri,
+                        width: 160,
+                        height: 160,
+                        colorDark: '#000',
+                        colorLight: '#fff',
+                        correctLevel: QRCode.CorrectLevel.M
+                    });
+                } else {
+                    qrTarget.textContent = data.provisioning_uri;
+                }
+
+                // Backup codes
+                const grid = document.getElementById('backup-codes-grid');
+                grid.innerHTML = '';
+                (data.backup_codes || []).forEach(code => {
+                    const el = document.createElement('code');
+                    el.textContent = code;
+                    grid.appendChild(el);
+                });
+            } catch (err) {
+                showError(err.message);
+            }
+        }
+
+        async function verify2FA() {
+            const code = document.getElementById('2fa-verify-code').value.trim();
+            if (code.length !== 6) { showError('Enter a 6-digit code'); return; }
+            try {
+                await apiPost('/api/user/2fa/verify', { code });
+                showSuccess('Two-factor authentication enabled!');
+                cancel2FASetup();
+                load2FAStatus();
+            } catch (err) {
+                showError(err.message);
+            }
+        }
+
+        function cancel2FASetup() {
+            document.getElementById('2fa-setup-area').classList.add('hidden');
+            document.getElementById('2fa-status-area').classList.remove('hidden');
+            document.getElementById('2fa-verify-code').value = '';
+            pending2FASecret = null;
+        }
+
+        async function disable2FA() {
+            const password = prompt('Enter your password to disable 2FA:');
+            if (!password) return;
+            try {
+                await apiPost('/api/user/2fa/disable', { password });
+                showSuccess('Two-factor authentication disabled');
+                load2FAStatus();
+            } catch (err) {
+                showError(err.message);
+            }
+        }
+
+        // ---- Sessions tab ----
+        async function loadSessions() {
+            const container = document.getElementById('sessions-list');
+            try {
+                const sessions = await apiGet('/api/user/sessions');
+                if (sessions.length === 0) {
+                    container.innerHTML = '<p style="color:var(--text-muted);">No active sessions.</p>';
+                    return;
+                }
+                container.innerHTML = '';
+                sessions.forEach(s => {
+                    const created = new Date(s.created_at * 1000).toLocaleString();
+                    const expires = new Date(s.expires_at * 1000).toLocaleString();
+                    const row = document.createElement('div');
+                    row.className = 'session-row' + (s.is_current ? ' current' : '');
+                    row.innerHTML = `
+                        <div class="session-info">
+                            <div class="session-id">${escapeHtml(s.session_id)}${s.is_current ? '<span class="session-badge">Current</span>' : ''}</div>
+                            <div class="session-time">Created ${created} \u2022 Expires ${expires}</div>
+                        </div>
+                        ${!s.is_current ? `<button class="btn btn-danger btn-small" onclick="revokeSession('${escapeHtml(s.full_id)}')">Revoke</button>` : ''}
+                    `;
+                    container.appendChild(row);
+                });
+            } catch (err) {
+                container.innerHTML = '<p style="color:var(--text-muted);">Could not load sessions.</p>';
+            }
+        }
+
+        async function revokeSession(sessionId) {
+            try {
+                await apiDelete('/api/user/sessions/' + encodeURIComponent(sessionId));
+                showSuccess('Session revoked');
+                loadSessions();
+            } catch (err) {
+                showError(err.message);
+            }
+        }
+
+        // ---- Logout ----
         document.getElementById('logout-btn').addEventListener('click', async (e) => {
             e.preventDefault();
-            try {
-                await apiPost('/api/logout', {});
-            } catch (err) { /* ignore */ }
+            try { await apiPost('/api/logout', {}); } catch (err) { /* ignore */ }
             window.location.href = '/login.html';
         });
 
+        // ---- Init ----
         loadProfile();
     </script>
 </body>

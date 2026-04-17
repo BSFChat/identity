@@ -15,7 +15,9 @@
             </div>
 
             <div id="error-msg" class="error hidden"></div>
+            <div id="success-msg" class="success hidden"></div>
 
+            <!-- Step 1: Username + Password -->
             <form id="login-form">
                 <div class="form-group">
                     <label for="username">Username</label>
@@ -28,6 +30,28 @@
                 <button type="submit" class="btn btn-primary">Sign In</button>
             </form>
 
+            <!-- Step 2: 2FA Code (hidden until needed) -->
+            <div id="2fa-step" class="hidden">
+                <p style="color: var(--text-secondary); margin-bottom: 16px;">
+                    Enter the 6-digit code from your authenticator app, or one of your backup codes.
+                </p>
+                <form id="2fa-form">
+                    <div class="form-group">
+                        <label for="totp-code">Authentication Code</label>
+                        <input type="text" id="totp-code" maxlength="8" autocomplete="one-time-code"
+                               placeholder="000000"
+                               style="text-align:center; font-size:20px; letter-spacing:4px;
+                                      font-family:'SF Mono',Monaco,monospace;">
+                    </div>
+                    <button type="submit" class="btn btn-primary">Verify</button>
+                </form>
+                <div style="text-align:center; margin-top:12px;">
+                    <a href="#" id="back-to-login" style="color:var(--text-muted); font-size:13px;">
+                        Back to login
+                    </a>
+                </div>
+            </div>
+
             <div class="card-footer">
                 <p>Don't have an account? <a href="/register.html">Create one</a></p>
             </div>
@@ -36,6 +60,30 @@
 
     <script src="/js/app.js"></script>
     <script>
+        let pendingLoginToken = null;
+
+        // Preserve any OIDC redirect params so we can re-trigger after login.
+        function getOidcRedirectUrl() {
+            const params = new URLSearchParams(window.location.search);
+            const redirect = params.get('redirect');
+            if (!redirect) return null;
+            return '/authorize?' + new URLSearchParams({
+                client_id: params.get('client_id') || '',
+                redirect_uri: redirect,
+                response_type: params.get('response_type') || 'code',
+                scope: params.get('scope') || 'openid',
+                state: params.get('state') || '',
+                code_challenge: params.get('code_challenge') || '',
+                code_challenge_method: params.get('code_challenge_method') || ''
+            }).toString();
+        }
+
+        function onLoginComplete() {
+            const oidcUrl = getOidcRedirectUrl();
+            window.location.href = oidcUrl || '/profile.html';
+        }
+
+        // Step 1: password
         document.getElementById('login-form').addEventListener('submit', async (e) => {
             e.preventDefault();
             const username = document.getElementById('username').value;
@@ -44,27 +92,44 @@
             try {
                 const data = await apiPost('/api/login', { username, password });
 
-                // Check if we have OIDC redirect params
-                const params = new URLSearchParams(window.location.search);
-                const redirect = params.get('redirect');
-                if (redirect) {
-                    // Re-trigger the authorize flow now that we have a session
-                    const authorizeUrl = '/authorize?' + new URLSearchParams({
-                        client_id: params.get('client_id') || '',
-                        redirect_uri: redirect,
-                        response_type: params.get('response_type') || 'code',
-                        scope: params.get('scope') || 'openid',
-                        state: params.get('state') || '',
-                        code_challenge: params.get('code_challenge') || '',
-                        code_challenge_method: params.get('code_challenge_method') || ''
-                    }).toString();
-                    window.location.href = authorizeUrl;
+                if (data.requires_2fa) {
+                    // Server didn't create a session yet — need a TOTP code.
+                    pendingLoginToken = data.login_token;
+                    document.getElementById('login-form').classList.add('hidden');
+                    document.getElementById('2fa-step').classList.remove('hidden');
+                    document.getElementById('totp-code').focus();
                 } else {
-                    window.location.href = '/profile.html';
+                    onLoginComplete();
                 }
             } catch (err) {
                 showError(err.message);
             }
+        });
+
+        // Step 2: TOTP code
+        document.getElementById('2fa-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const code = document.getElementById('totp-code').value.trim();
+            if (!code) return;
+
+            try {
+                await apiPost('/api/login/2fa', {
+                    login_token: pendingLoginToken,
+                    code: code
+                });
+                onLoginComplete();
+            } catch (err) {
+                showError(err.message);
+            }
+        });
+
+        // Back link
+        document.getElementById('back-to-login').addEventListener('click', (e) => {
+            e.preventDefault();
+            pendingLoginToken = null;
+            document.getElementById('2fa-step').classList.add('hidden');
+            document.getElementById('login-form').classList.remove('hidden');
+            document.getElementById('totp-code').value = '';
         });
     </script>
 </body>

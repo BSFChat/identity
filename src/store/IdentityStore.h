@@ -57,6 +57,12 @@ struct Session {
     int64_t expires_at = 0;
 };
 
+struct TotpInfo {
+    std::string secret;
+    bool enabled = false;
+    std::string backup_codes_json;
+};
+
 class IdentityStore {
 public:
     explicit IdentityStore(const std::string& db_path);
@@ -95,6 +101,19 @@ public:
     std::optional<Session> get_session(const std::string& session_id);
     void delete_session(const std::string& session_id);
     void delete_expired_sessions();
+    std::vector<Session> list_sessions_for_account(const std::string& account_id);
+
+    // TOTP
+    void set_totp_secret(const std::string& account_id, const std::string& secret, const std::string& backup_codes_json);
+    std::optional<TotpInfo> get_totp(const std::string& account_id);
+    void enable_totp(const std::string& account_id);
+    void disable_totp(const std::string& account_id);
+    bool consume_backup_code(const std::string& account_id, const std::string& code);
+
+    // Login tokens (temporary 5min tokens for 2FA flow)
+    void create_login_token(const std::string& token, const std::string& account_id, int64_t expires_at);
+    std::optional<std::string> validate_login_token(const std::string& token);
+    void delete_login_token(const std::string& token);
 
 private:
     void exec(const std::string& sql);

@@ -91,12 +91,30 @@ void IdentityServer::register_routes() {
              [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_register(req, res); });
     svr.Post("/api/login",
              [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_login(req, res); });
+    svr.Post("/api/login/2fa",
+             [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_login_2fa(req, res); });
     svr.Post("/api/logout",
              [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_logout(req, res); });
     svr.Get("/api/profile",
             [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_get_profile(req, res); });
     svr.Put("/api/profile",
             [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_update_profile(req, res); });
+
+    // Session management
+    svr.Get("/api/user/sessions",
+            [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_list_sessions(req, res); });
+    svr.Delete(R"(/api/user/sessions/(.+))",
+               [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_revoke_session(req, res); });
+
+    // 2FA endpoints
+    svr.Get("/api/user/2fa/status",
+            [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_2fa_status(req, res); });
+    svr.Post("/api/user/2fa/setup",
+             [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_2fa_setup(req, res); });
+    svr.Post("/api/user/2fa/verify",
+             [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_2fa_verify(req, res); });
+    svr.Post("/api/user/2fa/disable",
+             [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_2fa_disable(req, res); });
 
     // Admin endpoints
     svr.Get("/api/admin/users",

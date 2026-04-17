@@ -120,6 +120,24 @@ void IdentityStore::initialize() {
         )
     )");
 
+    exec(R"(
+        CREATE TABLE IF NOT EXISTS user_totp (
+            account_id TEXT PRIMARY KEY REFERENCES accounts(id),
+            secret TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            backup_codes TEXT,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+        )
+    )");
+
+    exec(R"(
+        CREATE TABLE IF NOT EXISTS login_tokens (
+            token TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL,
+            expires_at INTEGER NOT NULL
+        )
+    )");
+
     exec("CREATE INDEX IF NOT EXISTS idx_accounts_username ON accounts(username)");
     exec("CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account_id)");
     exec("CREATE INDEX IF NOT EXISTS idx_refresh_tokens_account ON refresh_tokens(account_id)");
@@ -417,6 +435,128 @@ void IdentityStore::delete_expired_sessions() {
         std::chrono::system_clock::now().time_since_epoch()).count();
     auto stmt = prepare(db_, "DELETE FROM sessions WHERE expires_at < ?");
     sqlite3_bind_int64(stmt.get(), 1, now);
+    sqlite3_step(stmt.get());
+}
+
+std::vector<Session> IdentityStore::list_sessions_for_account(const std::string& account_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "SELECT session_id, account_id, created_at, expires_at FROM sessions WHERE account_id = ? ORDER BY created_at DESC");
+    sqlite3_bind_text(stmt.get(), 1, account_id.c_str(), -1, SQLITE_TRANSIENT);
+
+    std::vector<Session> sessions;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        Session s;
+        s.session_id = col_text(stmt.get(), 0);
+        s.account_id = col_text(stmt.get(), 1);
+        s.created_at = sqlite3_column_int64(stmt.get(), 2);
+        s.expires_at = sqlite3_column_int64(stmt.get(), 3);
+        sessions.push_back(std::move(s));
+    }
+    return sessions;
+}
+
+// TOTP
+
+void IdentityStore::set_totp_secret(const std::string& account_id, const std::string& secret, const std::string& backup_codes_json) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "INSERT OR REPLACE INTO user_totp (account_id, secret, enabled, backup_codes) VALUES (?, ?, 0, ?)");
+    sqlite3_bind_text(stmt.get(), 1, account_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, secret.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, backup_codes_json.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt.get());
+}
+
+std::optional<TotpInfo> IdentityStore::get_totp(const std::string& account_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "SELECT secret, enabled, backup_codes FROM user_totp WHERE account_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, account_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        TotpInfo info;
+        info.secret = col_text(stmt.get(), 0);
+        info.enabled = sqlite3_column_int(stmt.get(), 1) != 0;
+        info.backup_codes_json = col_text(stmt.get(), 2);
+        return info;
+    }
+    return std::nullopt;
+}
+
+void IdentityStore::enable_totp(const std::string& account_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "UPDATE user_totp SET enabled = 1 WHERE account_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, account_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt.get());
+}
+
+void IdentityStore::disable_totp(const std::string& account_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "DELETE FROM user_totp WHERE account_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, account_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt.get());
+}
+
+bool IdentityStore::consume_backup_code(const std::string& account_id, const std::string& code) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "SELECT backup_codes FROM user_totp WHERE account_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, account_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) {
+        return false;
+    }
+
+    auto codes_str = col_text(stmt.get(), 0);
+    nlohmann::json codes;
+    try {
+        codes = nlohmann::json::parse(codes_str);
+    } catch (...) {
+        return false;
+    }
+
+    auto it = std::find(codes.begin(), codes.end(), code);
+    if (it == codes.end()) {
+        return false;
+    }
+
+    codes.erase(it);
+    auto updated = codes.dump();
+    auto update_stmt = prepare(db_, "UPDATE user_totp SET backup_codes = ? WHERE account_id = ?");
+    sqlite3_bind_text(update_stmt.get(), 1, updated.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(update_stmt.get(), 2, account_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(update_stmt.get());
+    return true;
+}
+
+// Login tokens
+
+void IdentityStore::create_login_token(const std::string& token, const std::string& account_id, int64_t expires_at) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "INSERT INTO login_tokens (token, account_id, expires_at) VALUES (?, ?, ?)");
+    sqlite3_bind_text(stmt.get(), 1, token.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, account_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt.get(), 3, expires_at);
+    sqlite3_step(stmt.get());
+}
+
+std::optional<std::string> IdentityStore::validate_login_token(const std::string& token) {
+    std::lock_guard lock(mutex_);
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    auto stmt = prepare(db_,
+        "SELECT account_id FROM login_tokens WHERE token = ? AND expires_at > ?");
+    sqlite3_bind_text(stmt.get(), 1, token.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt.get(), 2, now);
+    if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        return col_text(stmt.get(), 0);
+    }
+    return std::nullopt;
+}
+
+void IdentityStore::delete_login_token(const std::string& token) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "DELETE FROM login_tokens WHERE token = ?");
+    sqlite3_bind_text(stmt.get(), 1, token.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(stmt.get());
 }
 

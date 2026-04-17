@@ -1,5 +1,6 @@
 #include "api/AccountHandler.h"
 #include "crypto/PasswordHash.h"
+#include "crypto/Totp.h"
 #include "core/Logger.h"
 
 #include <bsfchat/Identifiers.h>
@@ -50,6 +51,30 @@ std::string generate_session_id() {
 void json_error(httplib::Response& res, int status, const std::string& error) {
     res.status = status;
     res.set_content(json{{"error", error}}.dump(), "application/json");
+}
+
+std::string extract_session_id(const httplib::Request& req) {
+    if (req.has_header("Cookie")) {
+        auto cookie = req.get_header_value("Cookie");
+        auto pos = cookie.find("session=");
+        if (pos != std::string::npos) {
+            auto start = pos + 8;
+            auto end = cookie.find(';', start);
+            return (end != std::string::npos) ? cookie.substr(start, end - start) : cookie.substr(start);
+        }
+    }
+    return "";
+}
+
+std::string generate_hex_token(int bytes) {
+    std::vector<unsigned char> buf(bytes);
+    RAND_bytes(buf.data(), bytes);
+    std::ostringstream ss;
+    ss << std::hex << std::setfill('0');
+    for (int i = 0; i < bytes; ++i) {
+        ss << std::setw(2) << static_cast<int>(buf[i]);
+    }
+    return ss.str();
 }
 
 } // namespace
@@ -196,6 +221,23 @@ void AccountHandler::handle_login(const httplib::Request& req, httplib::Response
         return;
     }
 
+    // Check if 2FA is enabled
+    auto totp_info = store_.get_totp(account->id);
+    if (totp_info && totp_info->enabled) {
+        auto login_token = generate_hex_token(32);
+        auto now = now_seconds();
+        store_.create_login_token(login_token, account->id, now + 300); // 5 minutes
+
+        log->info("Login requires 2FA: {}", username);
+
+        json response = {
+            {"requires_2fa", true},
+            {"login_token", login_token}
+        };
+        res.set_content(response.dump(), "application/json");
+        return;
+    }
+
     auto now = now_seconds();
     auto session_id = generate_session_id();
     Session session;
@@ -314,6 +356,243 @@ void AccountHandler::handle_update_profile(const httplib::Request& req, httplib:
         {"avatar_url", account->avatar_url},
         {"email", account->email}
     };
+    res.set_content(response.dump(), "application/json");
+}
+
+// Session management
+
+void AccountHandler::handle_list_sessions(const httplib::Request& req, httplib::Response& res) {
+    auto account_id = get_session_account(req);
+    if (account_id.empty()) {
+        json_error(res, 401, "Not authenticated");
+        return;
+    }
+
+    auto current_session_id = extract_session_id(req);
+    auto sessions = store_.list_sessions_for_account(account_id);
+
+    json result = json::array();
+    for (const auto& s : sessions) {
+        result.push_back({
+            {"session_id", s.session_id.substr(0, 8) + "..."},
+            {"created_at", s.created_at},
+            {"expires_at", s.expires_at},
+            {"is_current", s.session_id == current_session_id}
+        });
+    }
+    res.set_content(result.dump(), "application/json");
+}
+
+void AccountHandler::handle_revoke_session(const httplib::Request& req, httplib::Response& res) {
+    auto account_id = get_session_account(req);
+    if (account_id.empty()) {
+        json_error(res, 401, "Not authenticated");
+        return;
+    }
+
+    // Extract session_id from path: /api/user/sessions/<id>
+    auto target_session_id = req.matches[1].str();
+    if (target_session_id.empty()) {
+        json_error(res, 400, "Session ID required");
+        return;
+    }
+
+    // Can't revoke own current session
+    auto current_session_id = extract_session_id(req);
+    if (target_session_id == current_session_id) {
+        json_error(res, 400, "Cannot revoke current session");
+        return;
+    }
+
+    // Verify the session belongs to the authenticated user
+    auto session = store_.get_session(target_session_id);
+    if (!session || session->account_id != account_id) {
+        json_error(res, 404, "Session not found");
+        return;
+    }
+
+    store_.delete_session(target_session_id);
+    res.set_content(json{{"success", true}}.dump(), "application/json");
+}
+
+// 2FA / TOTP
+
+void AccountHandler::handle_2fa_status(const httplib::Request& req, httplib::Response& res) {
+    auto account_id = get_session_account(req);
+    if (account_id.empty()) {
+        json_error(res, 401, "Not authenticated");
+        return;
+    }
+
+    auto totp = store_.get_totp(account_id);
+    bool enabled = totp && totp->enabled;
+    res.set_content(json{{"enabled", enabled}}.dump(), "application/json");
+}
+
+void AccountHandler::handle_2fa_setup(const httplib::Request& req, httplib::Response& res) {
+    auto account_id = get_session_account(req);
+    if (account_id.empty()) {
+        json_error(res, 401, "Not authenticated");
+        return;
+    }
+
+    auto account = store_.get_account_by_id(account_id);
+    if (!account) {
+        json_error(res, 404, "Account not found");
+        return;
+    }
+
+    auto secret = bsfchat::generate_totp_secret();
+    auto backup_codes = bsfchat::generate_backup_codes(8);
+    auto uri = bsfchat::totp_provisioning_uri(secret, account->username, "BSFChat");
+
+    json codes_json = backup_codes;
+    store_.set_totp_secret(account_id, secret, codes_json.dump());
+
+    json response = {
+        {"secret", secret},
+        {"provisioning_uri", uri},
+        {"backup_codes", backup_codes}
+    };
+    res.set_content(response.dump(), "application/json");
+}
+
+void AccountHandler::handle_2fa_verify(const httplib::Request& req, httplib::Response& res) {
+    auto account_id = get_session_account(req);
+    if (account_id.empty()) {
+        json_error(res, 401, "Not authenticated");
+        return;
+    }
+
+    json body;
+    try {
+        body = json::parse(req.body);
+    } catch (...) {
+        json_error(res, 400, "Invalid JSON");
+        return;
+    }
+
+    auto code = body.value("code", "");
+    if (code.empty()) {
+        json_error(res, 400, "Code is required");
+        return;
+    }
+
+    auto totp = store_.get_totp(account_id);
+    if (!totp) {
+        json_error(res, 400, "2FA not set up - call setup first");
+        return;
+    }
+
+    if (!bsfchat::verify_totp(totp->secret, code)) {
+        json_error(res, 400, "Invalid code");
+        return;
+    }
+
+    store_.enable_totp(account_id);
+    res.set_content(json{{"success", true}}.dump(), "application/json");
+}
+
+void AccountHandler::handle_2fa_disable(const httplib::Request& req, httplib::Response& res) {
+    auto account_id = get_session_account(req);
+    if (account_id.empty()) {
+        json_error(res, 401, "Not authenticated");
+        return;
+    }
+
+    json body;
+    try {
+        body = json::parse(req.body);
+    } catch (...) {
+        json_error(res, 400, "Invalid JSON");
+        return;
+    }
+
+    auto password = body.value("password", "");
+    if (password.empty()) {
+        json_error(res, 400, "Password is required");
+        return;
+    }
+
+    auto account = store_.get_account_by_id(account_id);
+    if (!account) {
+        json_error(res, 404, "Account not found");
+        return;
+    }
+
+    if (!verify_password(password, account->password_hash)) {
+        json_error(res, 403, "Invalid password");
+        return;
+    }
+
+    store_.disable_totp(account_id);
+    res.set_content(json{{"success", true}}.dump(), "application/json");
+}
+
+void AccountHandler::handle_login_2fa(const httplib::Request& req, httplib::Response& res) {
+    auto log = get_logger();
+
+    json body;
+    try {
+        body = json::parse(req.body);
+    } catch (...) {
+        json_error(res, 400, "Invalid JSON");
+        return;
+    }
+
+    auto login_token = body.value("login_token", "");
+    auto code = body.value("code", "");
+
+    if (login_token.empty() || code.empty()) {
+        json_error(res, 400, "login_token and code are required");
+        return;
+    }
+
+    auto account_id = store_.validate_login_token(login_token);
+    if (!account_id) {
+        json_error(res, 401, "Invalid or expired login token");
+        return;
+    }
+
+    auto totp = store_.get_totp(*account_id);
+    if (!totp || !totp->enabled) {
+        json_error(res, 400, "2FA not enabled for this account");
+        return;
+    }
+
+    // Try TOTP code first, then backup code
+    bool code_valid = bsfchat::verify_totp(totp->secret, code);
+    if (!code_valid) {
+        code_valid = store_.consume_backup_code(*account_id, code);
+    }
+    if (!code_valid) {
+        json_error(res, 401, "Invalid 2FA code");
+        return;
+    }
+
+    // Consume the login token
+    store_.delete_login_token(login_token);
+
+    // Create session
+    auto now = now_seconds();
+    auto session_id = generate_session_id();
+    Session session;
+    session.session_id = session_id;
+    session.account_id = *account_id;
+    session.created_at = now;
+    session.expires_at = now + 86400 * 7;
+    store_.create_session(session);
+
+    auto account = store_.get_account_by_id(*account_id);
+    log->info("Login 2FA successful: {}", account ? account->username : *account_id);
+
+    json response = {
+        {"user_id", *account_id},
+        {"username", account ? account->username : ""},
+        {"session_id", session_id}
+    };
+
+    res.set_header("Set-Cookie", "session=" + session_id + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800");
     res.set_content(response.dump(), "application/json");
 }
 

@@ -29,6 +29,10 @@ function apiPut(url, body) {
     return apiRequest('PUT', url, body);
 }
 
+function apiDelete(url) {
+    return apiRequest('DELETE', url);
+}
+
 function showError(msg) {
     const el = document.getElementById('error-msg');
     if (el) {
