@@ -14,6 +14,8 @@ add_executable(bsfchat-id
     src/core/Config.cpp
     src/core/Logger.cpp
     src/core/IdentityServer.cpp
+    src/core/RateLimiter.cpp
+    src/core/WebUtil.cpp
     src/http/HttpServer.cpp
     src/crypto/KeyManager.cpp
     src/crypto/PasswordHash.cpp
@@ -21,7 +23,6 @@ add_executable(bsfchat-id
     src/store/IdentityStore.cpp
     src/api/AccountHandler.cpp
     src/api/OidcHandler.cpp
-    src/api/SsoHandler.cpp
     src/api/AdminHandler.cpp
 )
 

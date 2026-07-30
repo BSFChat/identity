@@ -7,22 +7,22 @@
 using namespace bsfchat::id;
 
 TEST(PasswordHashTest, HashAndVerify) {
-    auto hash = hash_password("mysecretpassword", 10); // use lower cost for test speed
+    auto hash = hash_password("mysecretpassword", 1000); // low iteration count for test speed
     EXPECT_FALSE(hash.empty());
-    EXPECT_TRUE(hash.starts_with("$pbkdf2$"));
+    EXPECT_TRUE(hash.starts_with("$pbkdf2-sha256$"));
     EXPECT_TRUE(verify_password("mysecretpassword", hash));
     EXPECT_FALSE(verify_password("wrongpassword", hash));
 }
 
 TEST(PasswordHashTest, DifferentPasswordsDifferentHashes) {
-    auto hash1 = hash_password("password1", 10);
-    auto hash2 = hash_password("password2", 10);
+    auto hash1 = hash_password("password1", 1000);
+    auto hash2 = hash_password("password2", 1000);
     EXPECT_NE(hash1, hash2);
 }
 
 TEST(PasswordHashTest, SamPasswordDifferentSalts) {
-    auto hash1 = hash_password("samepassword", 10);
-    auto hash2 = hash_password("samepassword", 10);
+    auto hash1 = hash_password("samepassword", 1000);
+    auto hash2 = hash_password("samepassword", 1000);
     // Different salts should produce different hashes
     EXPECT_NE(hash1, hash2);
     // But both should verify
@@ -49,7 +49,7 @@ TEST(RegistrationValidationTest, UsernameValidation) {
     Account a;
     a.id = "uuid-1";
     a.username = "validuser";
-    a.password_hash = hash_password("password123", 10);
+    a.password_hash = hash_password("password123", 1000);
     a.created_at = now;
     a.updated_at = now;
     EXPECT_TRUE(store->create_account(a));

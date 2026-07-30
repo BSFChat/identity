@@ -14,12 +14,14 @@ add_executable(identity_tests
     test_identity_store.cpp
     test_oidc.cpp
     test_accounts.cpp
+    test_auth_flows.cpp
 )
 
 target_include_directories(identity_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 target_link_libraries(identity_tests PRIVATE
     bsfchat_protocol
+    httplib::httplib
     spdlog::spdlog
     tomlplusplus::tomlplusplus
     SQLite::SQLite3
@@ -32,9 +34,14 @@ target_link_libraries(identity_tests PRIVATE
 target_sources(identity_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/core/Logger.cpp
     ${CMAKE_SOURCE_DIR}/src/core/Config.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/RateLimiter.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/WebUtil.cpp
     ${CMAKE_SOURCE_DIR}/src/crypto/KeyManager.cpp
     ${CMAKE_SOURCE_DIR}/src/crypto/PasswordHash.cpp
+    ${CMAKE_SOURCE_DIR}/src/crypto/Totp.cpp
     ${CMAKE_SOURCE_DIR}/src/store/IdentityStore.cpp
+    ${CMAKE_SOURCE_DIR}/src/api/AccountHandler.cpp
+    ${CMAKE_SOURCE_DIR}/src/api/OidcHandler.cpp
 )
 
 include(GoogleTest)

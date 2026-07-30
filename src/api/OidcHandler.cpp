@@ -1,5 +1,6 @@
 #include "api/OidcHandler.h"
 #include "core/Logger.h"
+#include "core/WebUtil.h"
 
 #include <bsfchat/Identifiers.h>
 #include <nlohmann/json.hpp>
@@ -95,6 +96,19 @@ void json_error(httplib::Response& res, int status, const std::string& error) {
     res.set_content(json{{"error", error}}.dump(), "application/json");
 }
 
+// RFC 6749 error response for the token endpoint.
+void oauth_error(httplib::Response& res, int status, const std::string& error,
+                 const std::string& description = "") {
+    res.status = status;
+    json body = {{"error", error}};
+    if (!description.empty()) body["error_description"] = description;
+    res.set_header("Cache-Control", "no-store");
+    if (status == 401) {
+        res.set_header("WWW-Authenticate", "Basic realm=\"token\"");
+    }
+    res.set_content(body.dump(), "application/json");
+}
+
 // Parse URL-encoded form body
 std::map<std::string, std::string> parse_form(const std::string& body) {
     std::map<std::string, std::string> params;
@@ -103,24 +117,30 @@ std::map<std::string, std::string> parse_form(const std::string& body) {
     while (std::getline(ss, pair, '&')) {
         auto eq = pair.find('=');
         if (eq != std::string::npos) {
-            auto key = pair.substr(0, eq);
-            auto val = pair.substr(eq + 1);
-            // Simple URL decode for common cases
-            std::string decoded;
-            for (size_t i = 0; i < val.size(); ++i) {
-                if (val[i] == '%' && i + 2 < val.size()) {
-                    decoded += static_cast<char>(std::stoi(val.substr(i + 1, 2), nullptr, 16));
-                    i += 2;
-                } else if (val[i] == '+') {
-                    decoded += ' ';
-                } else {
-                    decoded += val[i];
-                }
-            }
-            params[key] = decoded;
+            params[percent_decode(pair.substr(0, eq))] = percent_decode(pair.substr(eq + 1));
         }
     }
     return params;
+}
+
+// Appends a query parameter to a URL, choosing '?' or '&' as appropriate and
+// percent-encoding the value. Raw concatenation here is how an unencoded
+// `state` containing '&' used to be able to inject extra parameters.
+void append_query_param(std::string& url, const std::string& key, const std::string& value) {
+    url += (url.find('?') == std::string::npos) ? '?' : '&';
+    url += percent_encode(key);
+    url += '=';
+    url += percent_encode(value);
+}
+
+// Redirects the user agent back to the client with an OAuth error, per RFC 6749
+// section 4.1.2.1. Only used once redirect_uri has been validated.
+void redirect_with_error(httplib::Response& res, const std::string& redirect_uri,
+                         const std::string& error, const std::string& state) {
+    std::string location = redirect_uri;
+    append_query_param(location, "error", error);
+    if (!state.empty()) append_query_param(location, "state", state);
+    res.set_redirect(location);
 }
 
 } // namespace
@@ -144,8 +164,11 @@ void OidcHandler::handle_discovery(const httplib::Request&, httplib::Response& r
         {"grant_types_supported", json::array({"authorization_code", "refresh_token"})},
         {"subject_types_supported", json::array({"public"})},
         {"id_token_signing_alg_values_supported", json::array({"RS256"})},
-        {"token_endpoint_auth_methods_supported", json::array({"client_secret_post", "client_secret_basic"})},
-        {"code_challenge_methods_supported", json::array({"S256", "plain"})}
+        {"token_endpoint_auth_methods_supported",
+            json::array({"client_secret_post", "client_secret_basic", "none"})},
+        // "plain" was advertised but never implemented by the token endpoint,
+        // and is rejected outright now.
+        {"code_challenge_methods_supported", json::array({"S256"})}
     };
     res.set_content(discovery.dump(), "application/json");
 }
@@ -176,70 +199,262 @@ void OidcHandler::handle_authorize(const httplib::Request& req, httplib::Respons
         return;
     }
 
-    // Validate redirect_uri against client's registered URIs
+    // Validate redirect_uri against client's registered URIs.
+    //
+    // The old check accepted anything starting with "http://localhost:", which
+    // "http://localhost:1234@attacker.example/" satisfies while actually
+    // pointing at attacker.example. redirect_uri_matches() parses both URIs and
+    // only relaxes the *port* for genuine loopback registrations.
     {
         bool uri_valid = false;
-        try {
-            auto uris = json::parse(client->redirect_uris);
+        auto uris = json::parse(client->redirect_uris, nullptr, false);
+        if (!uris.is_discarded() && uris.is_array()) {
             for (const auto& registered : uris) {
-                auto reg_str = registered.get<std::string>();
-                if (reg_str == redirect_uri) {
-                    uri_valid = true;
-                    break;
-                }
-                // RFC 8252: for native apps, "http://localhost" matches any port
-                if (reg_str == "http://localhost" &&
-                    redirect_uri.starts_with("http://localhost:")) {
+                if (!registered.is_string()) continue;
+                if (redirect_uri_matches(registered.get<std::string>(), redirect_uri)) {
                     uri_valid = true;
                     break;
                 }
             }
-        } catch (...) {
-            // If redirect_uris isn't valid JSON, fall through to reject
         }
         if (!uri_valid) {
+            // Never redirect to an unvalidated URI — report in-band instead.
             json_error(res, 400, "Invalid redirect_uri for this client");
             return;
         }
     }
 
+    // A client with no registered secret is a public client. Public clients get
+    // no client authentication at the token endpoint, so PKCE is the only thing
+    // binding the code to the requester — it is mandatory, not optional.
+    const bool is_public_client = client->client_secret.empty();
+
+    if (!code_challenge_method.empty() && code_challenge_method != "S256") {
+        redirect_with_error(res, redirect_uri, "invalid_request", state);
+        return;
+    }
+    if (code_challenge.empty()) {
+        if (is_public_client) {
+            redirect_with_error(res, redirect_uri, "invalid_request", state);
+            return;
+        }
+    } else if (code_challenge.size() < 43 || code_challenge.size() > 128) {
+        // RFC 7636: a S256 challenge is base64url of a 32-byte digest.
+        redirect_with_error(res, redirect_uri, "invalid_request", state);
+        return;
+    }
+
     // Check if user is logged in (has session cookie)
     auto account_id = account_handler_.get_session_account(req);
     if (account_id.empty()) {
-        // Redirect to login page with return URL
-        std::string login_url = "/login.html?redirect=" + redirect_uri
-            + "&client_id=" + client_id
-            + "&response_type=" + response_type
-            + "&scope=" + scope
-            + "&state=" + state;
+        // Redirect to the login page, preserving the request. Every value is
+        // percent-encoded: previously a '&' or '?' inside redirect_uri or state
+        // silently corrupted or injected parameters here.
+        std::string login_url = "/login.html";
+        append_query_param(login_url, "redirect", redirect_uri);
+        append_query_param(login_url, "client_id", client_id);
+        append_query_param(login_url, "response_type", response_type);
+        append_query_param(login_url, "scope", scope);
+        append_query_param(login_url, "state", state);
         if (!code_challenge.empty()) {
-            login_url += "&code_challenge=" + code_challenge;
-            login_url += "&code_challenge_method=" + code_challenge_method;
+            append_query_param(login_url, "code_challenge", code_challenge);
+            append_query_param(login_url, "code_challenge_method", "S256");
         }
         res.set_redirect(login_url);
         return;
     }
 
-    // Generate authorization code
-    auto code = random_hex(32);
-    auto now = now_seconds();
+    auto account = store_.get_account_by_id(account_id);
+    if (!account) {
+        json_error(res, 500, "Account not found");
+        return;
+    }
 
+    // Do NOT mint a code here. A GET to /authorize is reachable by any site
+    // that navigates the browser to it, and the session cookie is SameSite=Lax
+    // so it rides along. Issuing on GET meant a third-party page could silently
+    // obtain a code on a redirect_uri of its choosing. Instead we render a
+    // consent page whose approval token the attacker cannot read (same-origin
+    // policy) and cannot guess.
+    auto consent_token = random_hex(32);
+
+    ConsentRequest consent;
+    consent.token = consent_token;
+    consent.session_id = account_handler_.authenticate(req, "").credential_id;
+    consent.account_id = account_id;
+    consent.client_id = client_id;
+    consent.redirect_uri = redirect_uri;
+    consent.scope = scope;
+    consent.state = state;
+    consent.code_challenge = code_challenge;
+    consent.expires_at = now_seconds() + 300; // 5 minutes
+
+    if (consent.session_id.empty() || !store_.store_consent_request(consent)) {
+        json_error(res, 500, "Failed to start authorization");
+        return;
+    }
+
+    render_consent_page(res, *client, *account, scope, consent_token, redirect_uri);
+}
+
+void OidcHandler::render_consent_page(httplib::Response& res, const OAuthClient& client,
+                                      const Account& account, const std::string& scope,
+                                      const std::string& consent_token,
+                                      const std::string& redirect_uri) {
+    std::ostringstream scopes_html;
+    std::istringstream scope_stream(scope);
+    std::string token;
+    while (scope_stream >> token) {
+        std::string label = token;
+        if (token == "openid") label = "Confirm your identity";
+        else if (token == "profile") label = "Your display name and avatar";
+        else if (token == "email") label = "Your email address";
+        scopes_html << "<li>" << html_escape(label) << "</li>";
+    }
+    if (scopes_html.str().empty()) {
+        scopes_html << "<li>Confirm your identity</li>";
+    }
+
+    std::ostringstream html;
+    html << "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
+         << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
+         << "<title>Authorize - BSFChat ID</title>"
+         << "<link rel=\"stylesheet\" href=\"/css/style.css\"></head><body>"
+         << "<div class=\"container\"><div class=\"card\">"
+         << "<div class=\"logo\"><h1>BSFChat ID</h1>"
+         << "<p class=\"subtitle\">Authorize application</p></div>"
+         << "<p><strong>" << html_escape(client.name.empty() ? client.client_id : client.name)
+         << "</strong> wants to sign you in as <strong>"
+         << html_escape(account.username) << "</strong> and access:</p>"
+         << "<ul>" << scopes_html.str() << "</ul>"
+         << "<p style=\"color:var(--text-muted);font-size:13px;word-break:break-all;\">"
+         << "You will be returned to " << html_escape(redirect_uri) << "</p>"
+         << "<form method=\"POST\" action=\"/authorize/decision\">"
+         << "<input type=\"hidden\" name=\"consent_token\" value=\"" << html_escape(consent_token) << "\">"
+         << "<button type=\"submit\" name=\"approve\" value=\"true\" class=\"btn btn-primary\">Allow</button>"
+         << "<button type=\"submit\" name=\"approve\" value=\"false\" class=\"btn btn-secondary\">Deny</button>"
+         << "</form></div></div></body></html>";
+
+    res.set_header("Cache-Control", "no-store");
+    // This page must never be framed: a clickjacked "Allow" is the same as a
+    // silent grant.
+    res.set_header("X-Frame-Options", "DENY");
+    res.set_header("Content-Security-Policy", "frame-ancestors 'none'");
+    res.set_content(html.str(), "text/html");
+}
+
+void OidcHandler::handle_authorize_decision(const httplib::Request& req, httplib::Response& res) {
+    auto log = get_logger();
+
+    auto params = parse_form(req.body);
+    auto consent_token = params["consent_token"];
+    auto approve = params["approve"];
+
+    if (consent_token.empty()) {
+        json_error(res, 400, "Missing consent token");
+        return;
+    }
+
+    // The consent token is bound to the browser session that was shown the
+    // prompt. This is the CSRF check: a cross-site POST cannot carry a token it
+    // was never able to read, and a token lifted from another user's session
+    // does not match here.
+    auto ctx = account_handler_.authenticate(req, "");
+    if (!ctx.authenticated() || !ctx.is_browser_session()) {
+        json_error(res, 401, "Not authenticated");
+        return;
+    }
+
+    // Consumption is conditional on that binding, so a rejected decision leaves
+    // the pending request intact for its rightful owner.
+    auto consent = store_.consume_consent_request(consent_token, ctx.credential_id);
+    if (!consent) {
+        log->warn("Rejected consent decision that did not match the issuing session");
+        json_error(res, 403, "Authorization request does not belong to this session");
+        return;
+    }
+    if (consent->expires_at < now_seconds() || ctx.account_id != consent->account_id) {
+        json_error(res, 400, "Authorization request expired — please try again");
+        return;
+    }
+
+    if (approve != "true") {
+        redirect_with_error(res, consent->redirect_uri, "access_denied", consent->state);
+        return;
+    }
+
+    auto code = random_hex(32);
     AuthCode auth_code;
     auth_code.code = code;
-    auth_code.client_id = client_id;
-    auth_code.account_id = account_id;
-    auth_code.redirect_uri = redirect_uri;
-    auth_code.scope = scope;
-    auth_code.code_challenge = code_challenge;
-    auth_code.expires_at = now + 300; // 5 minutes
+    auth_code.client_id = consent->client_id;
+    auth_code.account_id = consent->account_id;
+    auth_code.redirect_uri = consent->redirect_uri;
+    auth_code.scope = consent->scope;
+    auth_code.code_challenge = consent->code_challenge;
+    auth_code.expires_at = now_seconds() + 300; // 5 minutes
 
-    store_.store_auth_code(auth_code);
+    if (!store_.store_auth_code(auth_code)) {
+        json_error(res, 500, "Failed to issue authorization code");
+        return;
+    }
 
-    // Redirect back to client with code
-    std::string location = redirect_uri + "?code=" + code;
-    if (!state.empty()) location += "&state=" + state;
+    std::string location = consent->redirect_uri;
+    append_query_param(location, "code", code);
+    if (!consent->state.empty()) append_query_param(location, "state", consent->state);
 
+    log->info("Authorization code issued to client {} for account {}",
+              consent->client_id, consent->account_id);
     res.set_redirect(location);
+}
+
+OidcHandler::ClientAuthResult OidcHandler::authenticate_client(const std::string& client_id,
+                                                               const std::string& presented_secret,
+                                                               bool secret_was_presented) {
+    ClientAuthResult result;
+
+    if (client_id.empty()) {
+        result.error = "invalid_client";
+        result.description = "client_id is required";
+        return result;
+    }
+
+    auto client = store_.get_oauth_client(client_id);
+    if (!client) {
+        result.error = "invalid_client";
+        result.description = "Unknown client";
+        return result;
+    }
+
+    if (client->client_secret.empty()) {
+        // Public client: it has no secret to prove, so it must not present one
+        // (that would mean the caller believes it is confidential), and it must
+        // use PKCE instead.
+        if (secret_was_presented && !presented_secret.empty()) {
+            result.error = "invalid_client";
+            result.description = "This client is public and must not present a client_secret";
+            return result;
+        }
+        result.ok = true;
+        result.requires_pkce = true;
+        return result;
+    }
+
+    // Confidential client: the registered secret must actually be presented and
+    // must match. Previously the secret was parsed from three places and then
+    // never compared against anything at all.
+    if (!secret_was_presented || presented_secret.empty()) {
+        result.error = "invalid_client";
+        result.description = "Client authentication required";
+        return result;
+    }
+    if (!constant_time_equals(client->client_secret, presented_secret)) {
+        result.error = "invalid_client";
+        result.description = "Client authentication failed";
+        return result;
+    }
+
+    result.ok = true;
+    return result;
 }
 
 void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& res) {
@@ -247,6 +462,7 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
 
     // Parse either form-encoded or JSON body
     std::string grant_type, code, redirect_uri, client_id, client_secret, refresh_token_str, code_verifier;
+    bool secret_presented = false;
 
     if (req.get_header_value("Content-Type").find("application/x-www-form-urlencoded") != std::string::npos) {
         auto params = parse_form(req.body);
@@ -254,95 +470,128 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
         code = params["code"];
         redirect_uri = params["redirect_uri"];
         client_id = params["client_id"];
-        client_secret = params["client_secret"];
         refresh_token_str = params["refresh_token"];
         code_verifier = params["code_verifier"];
+        if (params.count("client_secret")) {
+            client_secret = params["client_secret"];
+            secret_presented = true;
+        }
     } else {
-        try {
-            auto body = json::parse(req.body);
-            grant_type = body.value("grant_type", "");
-            code = body.value("code", "");
-            redirect_uri = body.value("redirect_uri", "");
-            client_id = body.value("client_id", "");
-            client_secret = body.value("client_secret", "");
-            refresh_token_str = body.value("refresh_token", "");
-            code_verifier = body.value("code_verifier", "");
-        } catch (...) {
-            json_error(res, 400, "Invalid request body");
+        auto body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.is_object()) {
+            oauth_error(res, 400, "invalid_request", "Invalid request body");
             return;
+        }
+        grant_type = body.value("grant_type", "");
+        code = body.value("code", "");
+        redirect_uri = body.value("redirect_uri", "");
+        client_id = body.value("client_id", "");
+        refresh_token_str = body.value("refresh_token", "");
+        code_verifier = body.value("code_verifier", "");
+        if (body.contains("client_secret") && body["client_secret"].is_string()) {
+            client_secret = body["client_secret"].get<std::string>();
+            secret_presented = true;
         }
     }
 
-    // Also check for HTTP Basic auth for client credentials
-    if (client_id.empty() && req.has_header("Authorization")) {
+    // HTTP Basic client authentication (RFC 6749 section 2.3.1) takes
+    // precedence and must not be silently ignored when a client_id also
+    // appeared in the body.
+    if (req.has_header("Authorization")) {
         auto auth = req.get_header_value("Authorization");
         if (auth.starts_with("Basic ")) {
             auto decoded_bytes = base64_decode_local(auth.substr(6));
             std::string credentials(decoded_bytes.begin(), decoded_bytes.end());
             auto colon = credentials.find(':');
-            if (colon != std::string::npos) {
-                client_id = credentials.substr(0, colon);
-                client_secret = credentials.substr(colon + 1);
+            if (colon == std::string::npos) {
+                oauth_error(res, 401, "invalid_client", "Malformed Basic credentials");
+                return;
             }
+            auto basic_id = percent_decode(credentials.substr(0, colon));
+            auto basic_secret = percent_decode(credentials.substr(colon + 1));
+            if (!client_id.empty() && client_id != basic_id) {
+                oauth_error(res, 400, "invalid_request",
+                            "client_id in body does not match Basic credentials");
+                return;
+            }
+            client_id = basic_id;
+            client_secret = basic_secret;
+            secret_presented = true;
         }
     }
 
     if (grant_type == "authorization_code") {
         if (code.empty()) {
-            json_error(res, 400, "code is required");
+            oauth_error(res, 400, "invalid_request", "code is required");
             return;
         }
 
-        auto auth_code = store_.get_auth_code(code);
+        // Single fetch-and-delete inside one transaction. The old code did a
+        // separate SELECT and DELETE, so two concurrent redemptions of the same
+        // code could both pass the lookup and both get tokens.
+        auto auth_code = store_.consume_auth_code(code);
         if (!auth_code) {
-            json_error(res, 400, "Invalid authorization code");
+            oauth_error(res, 400, "invalid_grant", "Invalid authorization code");
             return;
         }
 
-        // Check expiry
         if (auth_code->expires_at < now_seconds()) {
-            store_.delete_auth_code(code);
-            json_error(res, 400, "Authorization code expired");
+            oauth_error(res, 400, "invalid_grant", "Authorization code expired");
             return;
         }
 
-        // Verify client
+        // The code identifies the client it was issued to; an explicitly
+        // supplied client_id must agree with it.
         if (!client_id.empty() && auth_code->client_id != client_id) {
-            json_error(res, 400, "client_id mismatch");
+            oauth_error(res, 400, "invalid_grant", "client_id mismatch");
+            return;
+        }
+        auto effective_client_id = client_id.empty() ? auth_code->client_id : client_id;
+
+        auto auth = authenticate_client(effective_client_id, client_secret, secret_presented);
+        if (!auth.ok) {
+            log->warn("Token request rejected for client '{}': {}", effective_client_id, auth.description);
+            oauth_error(res, 401, auth.error, auth.description);
             return;
         }
 
-        // Verify redirect_uri
-        if (!redirect_uri.empty() && auth_code->redirect_uri != redirect_uri) {
-            json_error(res, 400, "redirect_uri mismatch");
+        // RFC 6749 4.1.3: redirect_uri is REQUIRED when it was present in the
+        // authorization request, and must be identical.
+        if (redirect_uri.empty() || auth_code->redirect_uri != redirect_uri) {
+            oauth_error(res, 400, "invalid_grant", "redirect_uri mismatch");
             return;
         }
 
-        // PKCE verification
+        // PKCE. Mandatory for public clients — an attacker can no longer simply
+        // omit code_challenge to skip the check, because /authorize refuses to
+        // issue a code without one.
+        if (auth.requires_pkce && auth_code->code_challenge.empty()) {
+            oauth_error(res, 400, "invalid_grant", "PKCE is required for public clients");
+            return;
+        }
         if (!auth_code->code_challenge.empty()) {
             if (code_verifier.empty()) {
-                json_error(res, 400, "code_verifier is required");
+                oauth_error(res, 400, "invalid_grant", "code_verifier is required");
                 return;
             }
-            // S256: SHA256(code_verifier), then base64url encode
+            if (code_verifier.size() < 43 || code_verifier.size() > 128) {
+                oauth_error(res, 400, "invalid_grant", "Malformed code_verifier");
+                return;
+            }
             unsigned char hash[SHA256_DIGEST_LENGTH];
             SHA256(reinterpret_cast<const unsigned char*>(code_verifier.c_str()),
                    code_verifier.size(), hash);
-            // Base64url encode the hash
             auto computed_challenge = base64url_encode_local(hash, SHA256_DIGEST_LENGTH);
-            if (computed_challenge != auth_code->code_challenge) {
-                json_error(res, 400, "PKCE code_verifier mismatch");
+            if (!constant_time_equals(computed_challenge, auth_code->code_challenge)) {
+                oauth_error(res, 400, "invalid_grant", "PKCE code_verifier mismatch");
                 return;
             }
         }
-
-        // Delete the code (single use)
-        store_.delete_auth_code(code);
 
         // Get account
         auto account = store_.get_account_by_id(auth_code->account_id);
         if (!account) {
-            json_error(res, 500, "Account not found");
+            oauth_error(res, 400, "invalid_grant", "Account no longer exists");
             return;
         }
 
@@ -353,12 +602,16 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
 
         auto now = now_seconds();
 
-        // Store access token as a session so userinfo can look it up
+        // Access tokens live in the sessions table but are tagged as OIDC
+        // credentials, so they cannot act as account-portal session cookies.
         Session access_session;
         access_session.session_id = access_token;
         access_session.account_id = account->id;
         access_session.created_at = now;
         access_session.expires_at = now + 3600; // 1 hour
+        access_session.token_type = token_type::kOidcAccess;
+        access_session.scope = auth_code->scope;
+        access_session.client_id = auth_code->client_id;
         store_.create_session(access_session);
 
         // Store refresh token
@@ -374,6 +627,7 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
             {"access_token", access_token},
             {"token_type", "Bearer"},
             {"expires_in", 3600},
+            {"scope", auth_code->scope},
             {"id_token", id_token},
             {"refresh_token", refresh_token}
         };
@@ -383,25 +637,39 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
 
     } else if (grant_type == "refresh_token") {
         if (refresh_token_str.empty()) {
-            json_error(res, 400, "refresh_token is required");
+            oauth_error(res, 400, "invalid_request", "refresh_token is required");
             return;
         }
 
         auto rt = store_.get_refresh_token(refresh_token_str);
         if (!rt) {
-            json_error(res, 400, "Invalid refresh token");
+            oauth_error(res, 400, "invalid_grant", "Invalid refresh token");
+            return;
+        }
+
+        if (!client_id.empty() && rt->client_id != client_id) {
+            oauth_error(res, 400, "invalid_grant", "client_id mismatch");
+            return;
+        }
+        auto effective_client_id = client_id.empty() ? rt->client_id : client_id;
+
+        auto auth = authenticate_client(effective_client_id, client_secret, secret_presented);
+        if (!auth.ok) {
+            log->warn("Refresh rejected for client '{}': {}", effective_client_id, auth.description);
+            oauth_error(res, 401, auth.error, auth.description);
             return;
         }
 
         if (rt->expires_at < now_seconds()) {
             store_.delete_refresh_token(refresh_token_str);
-            json_error(res, 400, "Refresh token expired");
+            oauth_error(res, 400, "invalid_grant", "Refresh token expired");
             return;
         }
 
         auto account = store_.get_account_by_id(rt->account_id);
         if (!account) {
-            json_error(res, 500, "Account not found");
+            store_.delete_refresh_token(refresh_token_str);
+            oauth_error(res, 400, "invalid_grant", "Account no longer exists");
             return;
         }
 
@@ -412,12 +680,14 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
 
         auto now = now_seconds();
 
-        // Store new access token session
         Session access_session;
         access_session.session_id = access_token;
         access_session.account_id = account->id;
         access_session.created_at = now;
         access_session.expires_at = now + 3600;
+        access_session.token_type = token_type::kOidcAccess;
+        access_session.scope = rt->scope;
+        access_session.client_id = rt->client_id;
         store_.create_session(access_session);
 
         // Rotate refresh token
@@ -434,6 +704,7 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
             {"access_token", access_token},
             {"token_type", "Bearer"},
             {"expires_in", 3600},
+            {"scope", rt->scope},
             {"id_token", id_token},
             {"refresh_token", new_refresh_token}
         };
@@ -442,7 +713,7 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
         res.set_content(response.dump(), "application/json");
 
     } else {
-        json_error(res, 400, "Unsupported grant_type");
+        oauth_error(res, 400, "unsupported_grant_type", "Unsupported grant_type");
     }
 }
 
@@ -460,9 +731,19 @@ void OidcHandler::handle_userinfo(const httplib::Request& req, httplib::Response
     }
 
     auto token = auth.substr(7);
-    auto session = store_.get_session(token);
+
+    // Only an OIDC access token is accepted here — a browser session cookie
+    // value is not an OAuth credential and must not be usable as one.
+    auto session = store_.get_oidc_access_token(token);
     if (!session || session->expires_at < now_seconds()) {
+        res.set_header("WWW-Authenticate", "Bearer error=\"invalid_token\"");
         json_error(res, 401, "Invalid or expired access token");
+        return;
+    }
+
+    if (!scope_contains(session->scope, "openid")) {
+        res.set_header("WWW-Authenticate", "Bearer error=\"insufficient_scope\", scope=\"openid\"");
+        json_error(res, 403, "Token does not carry the openid scope");
         return;
     }
 
@@ -472,14 +753,19 @@ void OidcHandler::handle_userinfo(const httplib::Request& req, httplib::Response
         return;
     }
 
-    json response = {
-        {"sub", account->id},
-        {"name", account->display_name},
-        {"preferred_username", account->username},
-        {"email", account->email},
-        {"picture", account->avatar_url}
-    };
+    // Claims are released according to the granted scope rather than always
+    // being dumped in full.
+    json response = {{"sub", account->id}};
+    if (scope_contains(session->scope, "profile")) {
+        response["name"] = account->display_name;
+        response["preferred_username"] = account->username;
+        response["picture"] = account->avatar_url;
+    }
+    if (scope_contains(session->scope, "email")) {
+        response["email"] = account->email;
+    }
 
+    res.set_header("Cache-Control", "no-store");
     res.set_content(response.dump(), "application/json");
 }
 
@@ -508,11 +794,16 @@ void OidcHandler::handle_revoke(const httplib::Request& req, httplib::Response& 
         return;
     }
 
-    // Try to delete as refresh token
+    // Try to delete as refresh token.
     store_.delete_refresh_token(token);
-    // Also try to delete as session/access token
-    store_.delete_session(token);
+    // Also try to delete as an OIDC access token. Restricted to that credential
+    // kind so this unauthenticated endpoint cannot be used to destroy browser
+    // sessions.
+    if (store_.get_oidc_access_token(token)) {
+        store_.delete_session(token);
+    }
 
+    res.set_header("Cache-Control", "no-store");
     res.set_content(json{{"success", true}}.dump(), "application/json");
 }
 

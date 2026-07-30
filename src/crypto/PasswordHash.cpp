@@ -1,4 +1,5 @@
 #include "crypto/PasswordHash.h"
+#include "core/WebUtil.h"
 
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -12,6 +13,9 @@ namespace bsfchat::id {
 
 namespace {
 
+constexpr const char* kPrefix = "$pbkdf2-sha256$";
+constexpr const char* kLegacyPrefix = "$pbkdf2$";
+
 std::string bytes_to_hex(const unsigned char* data, size_t len) {
     std::ostringstream ss;
     for (size_t i = 0; i < len; ++i) {
@@ -22,8 +26,19 @@ std::string bytes_to_hex(const unsigned char* data, size_t len) {
 
 std::vector<unsigned char> hex_to_bytes(const std::string& hex) {
     std::vector<unsigned char> bytes;
+    if (hex.size() % 2 != 0) return bytes;
+    bytes.reserve(hex.size() / 2);
     for (size_t i = 0; i < hex.size(); i += 2) {
-        bytes.push_back(static_cast<unsigned char>(std::stoi(hex.substr(i, 2), nullptr, 16)));
+        auto nibble = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        int hi = nibble(hex[i]);
+        int lo = nibble(hex[i + 1]);
+        if (hi < 0 || lo < 0) return {};
+        bytes.push_back(static_cast<unsigned char>((hi << 4) | lo));
     }
     return bytes;
 }
@@ -38,43 +53,102 @@ std::string pbkdf2_hash(const std::string& password, const unsigned char* salt, 
     return bytes_to_hex(hash, 32);
 }
 
+// Decomposed representation of a stored hash string.
+struct ParsedHash {
+    bool valid = false;
+    bool legacy = false;
+    int iterations = 0;
+    std::string salt_hex;
+    std::string expected_hash;
+};
+
+ParsedHash parse_stored(const std::string& stored) {
+    ParsedHash out;
+
+    std::string body;
+    if (stored.rfind(kPrefix, 0) == 0) {
+        body = stored.substr(std::string(kPrefix).size());
+    } else if (stored.rfind(kLegacyPrefix, 0) == 0) {
+        out.legacy = true;
+        body = stored.substr(std::string(kLegacyPrefix).size());
+    } else {
+        return out;
+    }
+
+    auto p1 = body.find('$');
+    if (p1 == std::string::npos) return out;
+    auto p2 = body.find('$', p1 + 1);
+    if (p2 == std::string::npos) return out;
+
+    auto number = body.substr(0, p1);
+    if (number.empty()) return out;
+    for (char c : number) {
+        if (c < '0' || c > '9') return out;
+    }
+
+    long parsed = 0;
+    try {
+        parsed = std::stol(number);
+    } catch (...) {
+        return out;
+    }
+
+    if (out.legacy) {
+        // Legacy field is a log2 cost; 2^cost iterations.
+        if (parsed < 1 || parsed > 31) return out;
+        out.iterations = 1 << static_cast<int>(parsed);
+    } else {
+        // Guard against a hostile/corrupt row asking us to burn CPU forever.
+        if (parsed < 1 || parsed > 50000000) return out;
+        out.iterations = static_cast<int>(parsed);
+    }
+
+    out.salt_hex = body.substr(p1 + 1, p2 - p1 - 1);
+    out.expected_hash = body.substr(p2 + 1);
+    if (out.salt_hex.empty() || out.expected_hash.empty()) return out;
+
+    out.valid = true;
+    return out;
+}
+
 } // namespace
 
-std::string hash_password(const std::string& password, int cost) {
-    // Generate 16-byte random salt
+std::string hash_password(const std::string& password, int iterations) {
+    if (iterations < 1) iterations = kDefaultPbkdf2Iterations;
+
     unsigned char salt[16];
     if (RAND_bytes(salt, sizeof(salt)) != 1) {
         throw std::runtime_error("Failed to generate random salt");
     }
 
-    int iterations = 1 << cost; // 2^cost iterations
     std::string salt_hex = bytes_to_hex(salt, sizeof(salt));
     std::string hash_hex = pbkdf2_hash(password, salt, sizeof(salt), iterations);
 
-    // Format: $pbkdf2$cost$salt_hex$hash_hex
-    return "$pbkdf2$" + std::to_string(cost) + "$" + salt_hex + "$" + hash_hex;
+    return std::string(kPrefix) + std::to_string(iterations) + "$" + salt_hex + "$" + hash_hex;
 }
 
 bool verify_password(const std::string& password, const std::string& stored_hash) {
-    // Parse: $pbkdf2$cost$salt_hex$hash_hex
-    if (stored_hash.substr(0, 8) != "$pbkdf2$") return false;
+    auto parsed = parse_stored(stored_hash);
+    if (!parsed.valid) return false;
 
-    size_t pos1 = 8;
-    size_t pos2 = stored_hash.find('$', pos1);
-    if (pos2 == std::string::npos) return false;
+    auto salt_bytes = hex_to_bytes(parsed.salt_hex);
+    if (salt_bytes.empty()) return false;
 
-    int cost = std::stoi(stored_hash.substr(pos1, pos2 - pos1));
-    size_t pos3 = stored_hash.find('$', pos2 + 1);
-    if (pos3 == std::string::npos) return false;
+    std::string computed;
+    try {
+        computed = pbkdf2_hash(password, salt_bytes.data(), salt_bytes.size(), parsed.iterations);
+    } catch (...) {
+        return false;
+    }
 
-    std::string salt_hex = stored_hash.substr(pos2 + 1, pos3 - pos2 - 1);
-    std::string expected_hash = stored_hash.substr(pos3 + 1);
+    return constant_time_equals(computed, parsed.expected_hash);
+}
 
-    auto salt_bytes = hex_to_bytes(salt_hex);
-    int iterations = 1 << cost;
-    std::string computed_hash = pbkdf2_hash(password, salt_bytes.data(), salt_bytes.size(), iterations);
-
-    return computed_hash == expected_hash;
+bool password_needs_rehash(const std::string& stored_hash, int target_iterations) {
+    auto parsed = parse_stored(stored_hash);
+    if (!parsed.valid) return false; // nothing usable to upgrade
+    if (parsed.legacy) return true;
+    return parsed.iterations < target_iterations;
 }
 
 } // namespace bsfchat::id

@@ -2,7 +2,6 @@
 #include "core/Logger.h"
 #include "api/AccountHandler.h"
 #include "api/OidcHandler.h"
-#include "api/SsoHandler.h"
 #include "api/AdminHandler.h"
 
 #include <chrono>
@@ -10,8 +9,22 @@
 
 namespace bsfchat::id {
 
+namespace {
+
+// The desktop client binds an ephemeral loopback port and listens on
+// /oauth/callback. Registering the full path (rather than a bare
+// "http://localhost") lets redirect_uri_matches() relax only the port.
+constexpr const char* kDesktopRedirectUris =
+    R"(["http://127.0.0.1/oauth/callback","http://localhost/oauth/callback"])";
+
+// The value shipped previously, which matched any path on any localhost port.
+constexpr const char* kLegacyDesktopRedirectUris = R"(["http://localhost"])";
+
+} // namespace
+
 IdentityServer::IdentityServer(Config config)
     : config_(std::move(config)) {
+    auto log = get_logger();
 
     // Ensure data directories exist
     auto db_dir = std::filesystem::path(config_.database_path).parent_path();
@@ -22,25 +35,63 @@ IdentityServer::IdentityServer(Config config)
     store_->initialize();
 
     // Auto-create the well-known desktop client if it doesn't exist
-    if (!store_->get_oauth_client("bsfchat-desktop").has_value()) {
+    auto desktop = store_->get_oauth_client("bsfchat-desktop");
+    if (!desktop.has_value()) {
         OAuthClient client;
         client.client_id = "bsfchat-desktop";
-        client.client_secret = "";
+        client.client_secret = ""; // public client — authenticates via PKCE
         client.name = "BSFChat Desktop";
-        client.redirect_uris = R"(["http://localhost"])";
+        client.redirect_uris = kDesktopRedirectUris;
         client.created_at = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         store_->create_oauth_client(client);
+    } else if (desktop->redirect_uris == kLegacyDesktopRedirectUris) {
+        // Narrow the existing registration to the path the client actually
+        // uses. Left alone if an operator has customised it.
+        store_->update_oauth_client_redirect_uris("bsfchat-desktop", kDesktopRedirectUris);
+        log->info("Tightened bsfchat-desktop redirect_uris to the loopback callback path");
     }
 
     key_manager_ = std::make_unique<KeyManager>(config_.keys_path);
     http_server_ = std::make_unique<HttpServer>(config_);
 
     register_routes();
+    start_sweeper();
 }
 
 IdentityServer::~IdentityServer() {
     stop();
+    stop_sweeper();
+}
+
+void IdentityServer::start_sweeper() {
+    sweeper_ = std::thread([this]() {
+        auto log = get_logger();
+        while (true) {
+            std::unique_lock lock(sweeper_mutex_);
+            sweeper_cv_.wait_for(lock, std::chrono::seconds(config_.session_sweep_interval),
+                                 [this] { return stopping_.load(); });
+            if (stopping_.load()) return;
+            lock.unlock();
+
+            try {
+                store_->sweep_expired();
+                if (account_handler_) account_handler_->prune_limiters();
+            } catch (const std::exception& e) {
+                log->warn("Expiry sweep failed: {}", e.what());
+            }
+        }
+    });
+}
+
+void IdentityServer::stop_sweeper() {
+    if (!sweeper_.joinable()) return;
+    {
+        std::lock_guard lock(sweeper_mutex_);
+        stopping_ = true;
+    }
+    sweeper_cv_.notify_all();
+    sweeper_.join();
 }
 
 void IdentityServer::register_routes() {
@@ -63,8 +114,8 @@ void IdentityServer::register_routes() {
     });
 
     auto account_handler = std::make_shared<AccountHandler>(*store_, config_);
+    account_handler_ = account_handler;
     auto oidc_handler = std::make_shared<OidcHandler>(*store_, *key_manager_, *account_handler, config_);
-    auto sso_handler = std::make_shared<SsoHandler>(*store_, config_);
     auto admin_handler = std::make_shared<AdminHandler>(*store_, *account_handler, config_);
 
     // OIDC discovery
@@ -74,6 +125,8 @@ void IdentityServer::register_routes() {
     // OIDC endpoints
     svr.Get("/authorize",
             [h = oidc_handler](const httplib::Request& req, httplib::Response& res) { h->handle_authorize(req, res); });
+    svr.Post("/authorize/decision",
+             [h = oidc_handler](const httplib::Request& req, httplib::Response& res) { h->handle_authorize_decision(req, res); });
     svr.Post("/token",
              [h = oidc_handler](const httplib::Request& req, httplib::Response& res) { h->handle_token(req, res); });
     svr.Get("/userinfo",

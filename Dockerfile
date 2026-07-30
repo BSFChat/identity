@@ -10,7 +10,7 @@ WORKDIR /src
 
 RUN cmake -B /build \
     -DCMAKE_BUILD_TYPE=Release \
-    -DGAMECHAT_IDENTITY_BUILD_TESTS=OFF \
+    -DGAMECHAT_ID_BUILD_TESTS=OFF \
     && cmake --build /build -j$(nproc)
 
 # Stage 2: Runtime

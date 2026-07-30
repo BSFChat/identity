@@ -1,4 +1,28 @@
+# Build directories (CMake out-of-tree). `build-*/` covers the throwaway
+# trees people actually use — build-sec/, build-fix/, build-asan/ — which
+# were showing up as hundreds of megabytes of untracked noise in git status.
 build/
+build-*/
+
+# Local runtime state. This is load-bearing for secrets: data/keys/ holds the
+# OIDC RSA signing keypair (data/keys/private.pem), and data/identity.db
+# holds account rows. Never commit either.
 data/
+
+# CMake incremental / tooling artefacts
 .cache/
+CMakeFiles/
+CMakeCache.txt
 compile_commands.json
+CMakeUserPresets.json
+
+# Local config with real secrets. Only config/*.example.toml is tracked.
+*.local.toml
+
+# Logs and editor noise
+*.log
+*.swp
+*~
+.DS_Store
+.vscode/
+.idea/

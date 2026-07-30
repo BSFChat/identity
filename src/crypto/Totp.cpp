@@ -1,5 +1,6 @@
 #include "crypto/Totp.h"
 
+#include <openssl/crypto.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
 
@@ -126,17 +127,41 @@ std::string compute_totp(const std::string& base32_secret, uint64_t time_step) {
 }
 
 bool verify_totp(const std::string& base32_secret, const std::string& code, int window) {
+    // Reject anything that is not a 6-digit code before doing any HMAC work, so
+    // that backup-code guesses and junk cannot be distinguished by timing and
+    // do not cost us CPU.
+    if (code.size() != 6) return false;
+    for (char c : code) {
+        if (c < '0' || c > '9') return false;
+    }
+
+    // A +/-1 step tolerance (30s either side of the current step) is the
+    // smallest window that still copes with ordinary client clock skew.
+    if (window < 0) window = 0;
+    if (window > 1) window = 1;
+
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     uint64_t current_step = static_cast<uint64_t>(now) / 30;
 
+    // Accumulate rather than returning early: every candidate step is compared
+    // with a constant-time comparison and the loop always runs to completion,
+    // so neither which step matched nor how many digits were right is leaked.
+    unsigned char matched = 0;
     for (int i = -window; i <= window; ++i) {
         uint64_t step = current_step + static_cast<uint64_t>(i);
-        if (compute_totp(base32_secret, step) == code) {
-            return true;
+        std::string expected;
+        try {
+            expected = compute_totp(base32_secret, step);
+        } catch (...) {
+            return false;
+        }
+        if (expected.size() == code.size() &&
+            CRYPTO_memcmp(expected.data(), code.data(), code.size()) == 0) {
+            matched = 1;
         }
     }
-    return false;
+    return matched != 0;
 }
 
 std::string totp_provisioning_uri(const std::string& secret, const std::string& username, const std::string& issuer) {
