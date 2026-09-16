@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "crypto/KeyManager.h"
+#include "TempPaths.h"
 
 #include <bsfchat/JwtUtils.h>
 #include <nlohmann/json.hpp>
@@ -21,9 +22,10 @@ int64_t now_seconds() {
 class OidcTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        // Use a temp directory for keys
-        test_keys_dir = std::filesystem::temp_directory_path() / "bsfchat_id_test_keys";
-        std::filesystem::remove_all(test_keys_dir);
+        // Per-process temp directory for keys: ctest -j4 runs each test
+        // as its own process over the same binary, so a fixed path means
+        // one process wipes the keys another is loading.
+        test_keys_dir = bsfchat::test::unique_temp_dir("bsfchat_id_test_keys");
         key_manager = std::make_unique<KeyManager>(test_keys_dir.string());
     }
 
