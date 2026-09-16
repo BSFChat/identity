@@ -12,6 +12,7 @@
 #include "crypto/PasswordHash.h"
 #include "crypto/Totp.h"
 #include "store/IdentityStore.h"
+#include "TempPaths.h"
 
 #include <nlohmann/json.hpp>
 #include <openssl/sha.h>
@@ -115,8 +116,10 @@ std::string query_param(const std::string& url, const std::string& key) {
 class AuthFlowTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        keys_dir = std::filesystem::temp_directory_path() / "bsfchat_id_authflow_keys";
-        std::filesystem::remove_all(keys_dir);
+        // Unique per process+fixture — see TempPaths.h. A shared key dir
+        // made AuthFlowTest/TokenSeparationTest/TwoFactorTest fail under
+        // ctest -j4.
+        keys_dir = bsfchat::test::unique_temp_dir("bsfchat_id_authflow_keys");
 
         config.password_hash_iterations = kMinPbkdf2Iterations;
         config.totp_max_attempts = 3;
@@ -899,7 +902,7 @@ TEST(WebUtilTest, CookieParsingMatchesWholeNames) {
 // ---------------------------------------------------------------------------
 
 TEST(SchemaMigrationTest, UpgradesAPreExistingDatabaseInPlace) {
-    auto db_path = std::filesystem::temp_directory_path() / "bsfchat_id_migration_test.db";
+    auto db_path = bsfchat::test::unique_temp_file("bsfchat_id_migration_test", ".db");
     std::filesystem::remove(db_path);
     std::filesystem::remove(db_path.string() + "-wal");
     std::filesystem::remove(db_path.string() + "-shm");

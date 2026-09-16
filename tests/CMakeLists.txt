@@ -17,7 +17,10 @@ add_executable(identity_tests
     test_auth_flows.cpp
 )
 
-target_include_directories(identity_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(identity_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
 
 target_link_libraries(identity_tests PRIVATE
     bsfchat_protocol
