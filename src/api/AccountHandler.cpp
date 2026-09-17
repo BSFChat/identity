@@ -80,6 +80,44 @@ std::string extract_bearer_token(const httplib::Request& req) {
 // session control, 2FA and admin remain browser-session only.
 constexpr const char* kServersScope = "openid";
 
+// Bounds on a server-membership row. The desktop client walks this list on
+// login and connects to each entry, so a hostile value here is a hostile
+// value in somebody's client, and the token that can write it only has to
+// carry the "openid" scope that every relying party asks for.
+constexpr size_t kMaxServerUrlLength = 512;
+constexpr size_t kMaxServerNameLength = 128;
+constexpr size_t kMaxServerMemberships = 100;
+
+// The list used to take any string at all: `file:///etc/passwd`,
+// `javascript:…`, or `https://real.example@evil.example/` (userinfo
+// smuggling, which parse_uri rejects outright). There is no reason for a
+// homeserver URL to be anything but absolute http(s) with a host.
+bool server_url_acceptable(const std::string& url, std::string& why) {
+    if (url.empty() || url.size() > kMaxServerUrlLength) {
+        why = "server_url must be 1-512 characters";
+        return false;
+    }
+    if (std::any_of(url.begin(), url.end(),
+                    [](unsigned char c) { return c < 0x21 || c == 0x7f; })) {
+        why = "server_url contains invalid characters";
+        return false;
+    }
+    const auto uri = parse_uri(url);
+    if (!uri.valid || uri.host.empty()) {
+        why = "server_url must be an absolute URL with a host";
+        return false;
+    }
+    if (uri.scheme != "http" && uri.scheme != "https") {
+        why = "server_url must use http or https";
+        return false;
+    }
+    if (uri.has_fragment) {
+        why = "server_url must not have a fragment";
+        return false;
+    }
+    return true;
+}
+
 std::string generate_hex_token(int bytes) {
     std::vector<unsigned char> buf(bytes);
     RAND_bytes(buf.data(), bytes);
@@ -789,13 +827,35 @@ void AccountHandler::handle_add_server(const httplib::Request& req, httplib::Res
     const auto& account_id = ctx.account_id;
 
     auto body = nlohmann::json::parse(req.body, nullptr, false);
-    if (body.is_discarded() || !body.contains("server_url")) {
+    // .contains() does not type-check: body["server_url"].get<std::string>()
+    // on {"server_url": 1} threw json::type_error, which httplib turned into
+    // a 500 rather than a 400.
+    if (body.is_discarded() || !body.contains("server_url")
+        || !body["server_url"].is_string()) {
         json_error(res, 400, "Missing server_url");
         return;
     }
 
     std::string url = body["server_url"].get<std::string>();
-    std::string name = body.value("server_name", "");
+    std::string why;
+    if (!server_url_acceptable(url, why)) {
+        json_error(res, 400, why);
+        return;
+    }
+
+    std::string name;
+    if (body.contains("server_name") && body["server_name"].is_string()) {
+        name = body["server_name"].get<std::string>();
+        if (name.size() > kMaxServerNameLength) name.resize(kMaxServerNameLength);
+    }
+
+    // The list is a convenience sync, not storage. Without a cap a single
+    // "openid"-scoped token could grow it without limit.
+    if (store_.list_server_memberships(account_id).size() >= kMaxServerMemberships) {
+        json_error(res, 409, "Too many servers on this account");
+        return;
+    }
+
     store_.add_server_membership(account_id, url, name);
     res.set_content(nlohmann::json{{"success", true}}.dump(), "application/json");
 }
@@ -815,7 +875,8 @@ void AccountHandler::handle_remove_server(const httplib::Request& req, httplib::
         url = req.get_param_value("server_url");
     } else {
         auto body = nlohmann::json::parse(req.body, nullptr, false);
-        if (!body.is_discarded() && body.contains("server_url")) {
+        if (!body.is_discarded() && body.contains("server_url")
+            && body["server_url"].is_string()) {
             url = body["server_url"].get<std::string>();
         }
     }
