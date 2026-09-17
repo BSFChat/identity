@@ -1,4 +1,5 @@
 #include "api/OidcHandler.h"
+#include "core/Version.h"
 #include "core/Logger.h"
 #include "core/WebUtil.h"
 
@@ -170,6 +171,17 @@ void OidcHandler::handle_discovery(const httplib::Request&, httplib::Response& r
         // and is rejected outright now.
         {"code_challenge_methods_supported", json::array({"S256"})}
     };
+
+    // Additive, vendor-namespaced, and outside every field an OIDC client
+    // reads. OpenID Connect Discovery 1.0 section 3 says a provider MAY
+    // publish additional metadata and that clients MUST ignore what they
+    // do not recognise, so this cannot change how any relying party
+    // behaves — it just means an operator can ask a running identity
+    // service what build it is without shell access to the container.
+    discovery["bsfchat_version"] = build::version_string();
+    discovery["bsfchat_revision"] = build::revision_string();
+    discovery["bsfchat_channel"] = build::channel_of(build::kVersion);
+
     res.set_content(discovery.dump(), "application/json");
 }
 

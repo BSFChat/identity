@@ -1,6 +1,7 @@
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "core/IdentityServer.h"
+#include "core/Version.h"
 
 #include <csignal>
 #include <iostream>
@@ -15,6 +16,11 @@ void signal_handler(int) {
 int main(int argc, char* argv[]) {
     bsfchat::id::init_logger("info");
     auto log = bsfchat::id::get_logger();
+
+    // First line in the log, before config loading can fail: the build
+    // that produced a log excerpt is the first thing worth knowing, and a
+    // config error must not swallow it.
+    log->info("BSFChat identity {}", bsfchat::id::build::describe());
 
     bsfchat::id::Config config;
     if (argc > 2 && std::string(argv[1]) == "--config") {

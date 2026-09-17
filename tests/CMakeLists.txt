@@ -15,12 +15,20 @@ add_executable(identity_tests
     test_oidc.cpp
     test_accounts.cpp
     test_auth_flows.cpp
+    test_version.cpp
 )
 
 target_include_directories(identity_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+
+# Same definitions the service target gets, so test_version.cpp checks the
+# string the shipped binary would actually report rather than the
+# #ifndef fallback inside the header.
+target_compile_definitions(identity_tests PRIVATE
+    BSFCHAT_ID_VERSION="${BSFCHAT_ID_VERSION}"
+    BSFCHAT_ID_REVISION="${BSFCHAT_ID_REVISION}")
 
 target_link_libraries(identity_tests PRIVATE
     bsfchat_protocol
@@ -49,3 +57,19 @@ target_sources(identity_tests PRIVATE
 
 include(GoogleTest)
 gtest_discover_tests(identity_tests)
+
+# --- release-channel script --------------------------------------------------
+#
+# scripts/channel_tags.py decides which of :latest / :latest-beta a pushed
+# git tag takes. It runs in CI, but it is registered here too so that
+# breaking the semver rule fails the same `ctest` run everyone already
+# does before pushing, instead of only being caught by a release.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME channel_tags
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_SOURCE_DIR}/scripts/test_channel_tags.py)
+else()
+    message(STATUS "python3 not found - skipping the channel_tags test "
+                   "(CI always has it; this only affects local ctest runs)")
+endif()

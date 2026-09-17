@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
-project(bsfchat-id VERSION 0.1.0 LANGUAGES CXX)
+
+# Version.cmake before project(): project(VERSION ...) needs the strict
+# MAJOR.MINOR.PATCH form, and CI passes -DBSFCHAT_ID_VERSION on tag builds
+# so the number in the image matches the tag that produced it.
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Version.cmake)
+
+project(bsfchat-id VERSION ${BSFCHAT_ID_VERSION_DOTS} LANGUAGES CXX)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Ccache.cmake)
 
@@ -29,6 +35,12 @@ add_executable(bsfchat-id
 )
 
 target_include_directories(bsfchat-id PRIVATE src)
+
+# src/core/Version.h reads these. Defined on the target rather than
+# globally so a stale definition cannot leak in from a parent scope.
+target_compile_definitions(bsfchat-id PRIVATE
+    BSFCHAT_ID_VERSION="${BSFCHAT_ID_VERSION}"
+    BSFCHAT_ID_REVISION="${BSFCHAT_ID_REVISION}")
 
 target_link_libraries(bsfchat-id PRIVATE
     bsfchat_protocol
