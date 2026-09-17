@@ -690,6 +690,74 @@ TEST_F(TokenSeparationTest, AccessTokenCanStillSyncServerList) {
     EXPECT_EQ(status_of(res), 200) << res.body;
 }
 
+// The server list is the one thing an OIDC access token may write, and the
+// desktop client connects to every entry on login. Anything a relying party
+// with the ubiquitous "openid" scope can put here ends up in somebody's
+// client, so the values have to be homeserver-shaped.
+TEST_F(TokenSeparationTest, ServerUrlMustBeAbsoluteHttp) {
+    auto token = mint_access_token();
+
+    auto add = [&](const json& body) {
+        auto req = json_request(body);
+        req.set_header("Authorization", "Bearer " + token);
+        httplib::Response res;
+        accounts->handle_add_server(req, res);
+        return status_of(res);
+    };
+
+    EXPECT_EQ(add(json{{"server_url", "file:///etc/passwd"}}), 400);
+    EXPECT_EQ(add(json{{"server_url", "javascript:alert(1)"}}), 400);
+    EXPECT_EQ(add(json{{"server_url", "not a url"}}), 400);
+    EXPECT_EQ(add(json{{"server_url", "/relative"}}), 400);
+    EXPECT_EQ(add(json{{"server_url", ""}}), 400);
+    // Userinfo smuggling: a naive reader of this list sees "real.example".
+    EXPECT_EQ(add(json{{"server_url", "https://real.example@evil.example/"}}), 400);
+    // Fragments and control characters never belong in a homeserver URL.
+    EXPECT_EQ(add(json{{"server_url", "https://ok.example/#x"}}), 400);
+    EXPECT_EQ(add(json{{"server_url", "https://ok.example/\r\nX-Injected: 1"}}), 400);
+    EXPECT_EQ(add(json{{"server_url", std::string("https://x.example/")
+                                          + std::string(600, 'a')}}), 400);
+
+    // Real homeserver URLs still work.
+    EXPECT_EQ(add(json{{"server_url", "https://bsfchat.com"}}), 200);
+    EXPECT_EQ(add(json{{"server_url", "http://192.168.1.10:8448"}}), 200);
+}
+
+// body["server_url"].get<std::string>() on a non-string threw json::type_error,
+// which httplib turns into a 500. A malformed request is the client's fault
+// and must say so.
+TEST_F(TokenSeparationTest, NonStringServerUrlIsARequestError) {
+    auto token = mint_access_token();
+    auto req = json_request(json{{"server_url", 1}});
+    req.set_header("Authorization", "Bearer " + token);
+    httplib::Response res;
+    accounts->handle_add_server(req, res);
+    EXPECT_EQ(status_of(res), 400);
+
+    auto remove_req = json_request(json{{"server_url", json::object()}});
+    remove_req.set_header("Authorization", "Bearer " + token);
+    httplib::Response remove_res;
+    accounts->handle_remove_server(remove_req, remove_res);
+    EXPECT_EQ(status_of(remove_res), 400);
+}
+
+TEST_F(TokenSeparationTest, ServerListIsBounded) {
+    auto token = mint_access_token();
+    for (int i = 0; i < 100; ++i) {
+        auto req = json_request(json{
+            {"server_url", "https://s" + std::to_string(i) + ".example"}});
+        req.set_header("Authorization", "Bearer " + token);
+        httplib::Response res;
+        accounts->handle_add_server(req, res);
+        ASSERT_EQ(status_of(res), 200) << "row " << i << ": " << res.body;
+    }
+    auto req = json_request(json{{"server_url", "https://one-too-many.example"}});
+    req.set_header("Authorization", "Bearer " + token);
+    httplib::Response res;
+    accounts->handle_add_server(req, res);
+    EXPECT_EQ(status_of(res), 409);
+}
+
 TEST_F(TokenSeparationTest, BrowserSessionCannotBeUsedAsAccessToken) {
     auto req = bearer_request(browser_session);
     httplib::Response res;
@@ -749,6 +817,43 @@ protected:
 
     std::string secret;
 };
+
+// /2fa/setup does INSERT OR REPLACE with enabled = 0, so re-running it on an
+// enrolled account silently turned 2FA OFF. It needs only a session cookie,
+// while /2fa/disable deliberately demands the password — so the no-password
+// endpoint was the cheap route to single-factor for anyone holding a stolen
+// cookie.
+TEST_F(TwoFactorTest, SetupCannotSilentlyDisableEnrolled2fa) {
+    ASSERT_TRUE(store->get_totp("acct-1")->enabled);
+
+    httplib::Request req;
+    req.method = "POST";
+    req.remote_addr = "10.0.0.1";
+    req.set_header("Cookie", "session=" + browser_session);
+    httplib::Response res;
+    accounts->handle_2fa_setup(req, res);
+
+    EXPECT_EQ(status_of(res), 409) << res.body;
+    auto totp = store->get_totp("acct-1");
+    ASSERT_TRUE(totp.has_value());
+    EXPECT_TRUE(totp->enabled) << "setup turned 2FA off";
+    EXPECT_EQ(totp->secret, secret) << "setup replaced the enrolled secret";
+}
+
+// Enrolling for the first time must still work.
+TEST_F(AuthFlowTest, SetupWorksWhenNo2faIsEnrolled) {
+    httplib::Request req;
+    req.method = "POST";
+    req.remote_addr = "10.0.0.1";
+    req.set_header("Cookie", "session=" + browser_session);
+    httplib::Response res;
+    accounts->handle_2fa_setup(req, res);
+
+    ASSERT_EQ(status_of(res), 200) << res.body;
+    auto body = json::parse(res.body);
+    EXPECT_FALSE(body.value("secret", "").empty());
+    EXPECT_EQ(body["backup_codes"].size(), 8u);
+}
 
 TEST_F(TwoFactorTest, LoginTokenIsBurnedAfterRepeatedWrongCodes) {
     auto login_token = start_login();
