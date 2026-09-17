@@ -26,3 +26,7 @@ CMakeUserPresets.json
 .DS_Store
 .vscode/
 .idea/
+
+# Python bytecode from scripts/ (the release-channel tooling).
+__pycache__/
+*.pyc
