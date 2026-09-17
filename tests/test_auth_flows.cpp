@@ -750,6 +750,43 @@ protected:
     std::string secret;
 };
 
+// /2fa/setup does INSERT OR REPLACE with enabled = 0, so re-running it on an
+// enrolled account silently turned 2FA OFF. It needs only a session cookie,
+// while /2fa/disable deliberately demands the password — so the no-password
+// endpoint was the cheap route to single-factor for anyone holding a stolen
+// cookie.
+TEST_F(TwoFactorTest, SetupCannotSilentlyDisableEnrolled2fa) {
+    ASSERT_TRUE(store->get_totp("acct-1")->enabled);
+
+    httplib::Request req;
+    req.method = "POST";
+    req.remote_addr = "10.0.0.1";
+    req.set_header("Cookie", "session=" + browser_session);
+    httplib::Response res;
+    accounts->handle_2fa_setup(req, res);
+
+    EXPECT_EQ(status_of(res), 409) << res.body;
+    auto totp = store->get_totp("acct-1");
+    ASSERT_TRUE(totp.has_value());
+    EXPECT_TRUE(totp->enabled) << "setup turned 2FA off";
+    EXPECT_EQ(totp->secret, secret) << "setup replaced the enrolled secret";
+}
+
+// Enrolling for the first time must still work.
+TEST_F(AuthFlowTest, SetupWorksWhenNo2faIsEnrolled) {
+    httplib::Request req;
+    req.method = "POST";
+    req.remote_addr = "10.0.0.1";
+    req.set_header("Cookie", "session=" + browser_session);
+    httplib::Response res;
+    accounts->handle_2fa_setup(req, res);
+
+    ASSERT_EQ(status_of(res), 200) << res.body;
+    auto body = json::parse(res.body);
+    EXPECT_FALSE(body.value("secret", "").empty());
+    EXPECT_EQ(body["backup_codes"].size(), 8u);
+}
+
 TEST_F(TwoFactorTest, LoginTokenIsBurnedAfterRepeatedWrongCodes) {
     auto login_token = start_login();
     ASSERT_FALSE(login_token.empty());

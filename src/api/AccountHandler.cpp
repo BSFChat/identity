@@ -545,6 +545,19 @@ void AccountHandler::handle_2fa_setup(const httplib::Request& req, httplib::Resp
         return;
     }
 
+    // Re-running setup on an account that already has 2FA is a downgrade, not
+    // an enrolment: set_totp_secret() does INSERT OR REPLACE with enabled = 0,
+    // so a single POST here silently stripped the second factor and left a new
+    // unconfirmed secret behind. This endpoint only needs a session cookie,
+    // while /2fa/disable deliberately demands the password — so the cheap path
+    // to single-factor was the one with no password on it. Turning 2FA off is
+    // /2fa/disable's job, and it asks.
+    if (auto existing = store_.get_totp(account_id); existing && existing->enabled) {
+        json_error(res, 409,
+                   "Two-factor authentication is already enabled. Disable it first.");
+        return;
+    }
+
     auto secret = bsfchat::generate_totp_secret();
     auto backup_codes = bsfchat::generate_backup_codes(8);
     auto uri = bsfchat::totp_provisioning_uri(secret, account->username, "BSFChat");
