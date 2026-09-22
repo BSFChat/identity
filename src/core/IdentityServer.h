@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/ClientRegistration.h"
 #include "core/Config.h"
 #include "http/HttpServer.h"
 #include "store/IdentityStore.h"

@@ -46,6 +46,7 @@ target_link_libraries(identity_tests PRIVATE
 # Compile required source files for testing
 target_sources(identity_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/core/ClientAddress.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/ClientRegistration.cpp
     ${CMAKE_SOURCE_DIR}/src/core/Logger.cpp
     ${CMAKE_SOURCE_DIR}/src/core/Config.cpp
     ${CMAKE_SOURCE_DIR}/src/core/RateLimiter.cpp
@@ -91,6 +92,7 @@ endif()
 add_executable(identity_security_audit_tests
     test_security_audit.cpp
     ${CMAKE_SOURCE_DIR}/src/core/ClientAddress.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/ClientRegistration.cpp
     ${CMAKE_SOURCE_DIR}/src/core/Logger.cpp
     ${CMAKE_SOURCE_DIR}/src/core/Config.cpp
     ${CMAKE_SOURCE_DIR}/src/core/RateLimiter.cpp
