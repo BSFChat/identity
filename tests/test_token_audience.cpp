@@ -28,6 +28,7 @@
 #include "api/AccountHandler.h"
 #include "api/OidcHandler.h"
 #include "core/Config.h"
+#include "core/ClientRegistration.h"
 #include "core/WebUtil.h"
 #include "crypto/PasswordHash.h"
 #include "store/IdentityStore.h"
@@ -160,7 +161,9 @@ protected:
         OAuthClient desktop;
         desktop.client_id = "bsfchat-desktop";
         desktop.name = "BSFChat Desktop";
-        desktop.redirect_uris = R"(["http://127.0.0.1/oauth/callback","http://localhost/oauth/callback"])";
+        // Exactly what IdentityServer seeds, so the iOS private-use callback
+        // is registered here the same way it is in production.
+        desktop.redirect_uris = first_party_redirect_uris();
         desktop.created_at = now;
         ASSERT_TRUE(store->create_oauth_client(desktop));
 
@@ -555,4 +558,72 @@ TEST_F(TokenAudienceTest, ServerListWritesRefuseCrossSiteBrowserRequests) {
     auto desktop_token = desktop_login()["access_token"].get<std::string>();
     EXPECT_EQ(post("application/json", {}, /*remove=*/true, desktop_token), 200);
     EXPECT_TRUE(store->list_server_memberships("acct-1").empty());
+}
+
+
+// ---------------------------------------------------------------------------
+// The iOS transport does not touch any of this.
+//
+// iOS signs in through ASWebAuthenticationSession with a private-use URI
+// scheme callback, because the desktop loopback redirect cannot work there —
+// the browser hand-off suspends the app and the callback is never accepted.
+// What changed is where the redirect lands. What must NOT change is the
+// audience binding C1 exists for, the nonce, azp, or the token's lifetime.
+// ---------------------------------------------------------------------------
+
+TEST_F(TokenAudienceTest, TheNativeCallbackKeepsTheAudienceBinding) {
+    const std::string kNative = "bsfchat://oauth/callback";
+
+    auto req = cookie_request();
+    req.params.emplace("client_id", "bsfchat-desktop");
+    req.params.emplace("redirect_uri", kNative);
+    req.params.emplace("response_type", "code");
+    req.params.emplace("scope", "openid profile");
+    req.params.emplace("state", "xyz");
+    req.params.emplace("nonce", "n-from-ios");
+    req.params.emplace("resource", kChat);
+    req.params.emplace("code_challenge", s256_challenge(kVerifier));
+    req.params.emplace("code_challenge_method", "S256");
+
+    httplib::Response res;
+    oidc->handle_authorize(req, res);
+    ASSERT_EQ(status_of(res), 200) << res.body;
+
+    auto code = approve(res);
+    ASSERT_FALSE(code.empty());
+
+    auto tres = redeem(code, {{"redirect_uri", kNative}, {"resource", kChat}});
+    ASSERT_EQ(status_of(tres), 200) << tres.body;
+
+    auto claims = jwt_payload(json::parse(tres.body)["id_token"].get<std::string>());
+    EXPECT_EQ(claims["aud"], kChat);              // C1: the chat server, not the client
+    EXPECT_EQ(claims.value("azp", ""), "bsfchat-desktop");
+    EXPECT_EQ(claims.value("nonce", ""), "n-from-ios");
+    EXPECT_LE(claims["exp"].get<int64_t>() - claims["iat"].get<int64_t>(), 300);
+}
+
+TEST_F(TokenAudienceTest, TheNativeCallbackCannotBorrowAnotherServersToken) {
+    // The C1 proof, over the iOS transport: a code issued for one chat server
+    // cannot be redeemed naming another.
+    const std::string kNative = "bsfchat://oauth/callback";
+
+    auto req = cookie_request();
+    req.params.emplace("client_id", "bsfchat-desktop");
+    req.params.emplace("redirect_uri", kNative);
+    req.params.emplace("response_type", "code");
+    req.params.emplace("scope", "openid profile");
+    req.params.emplace("state", "xyz");
+    req.params.emplace("resource", kChat);
+    req.params.emplace("code_challenge", s256_challenge(kVerifier));
+    req.params.emplace("code_challenge_method", "S256");
+
+    httplib::Response res;
+    oidc->handle_authorize(req, res);
+    ASSERT_EQ(status_of(res), 200) << res.body;
+    auto code = approve(res);
+    ASSERT_FALSE(code.empty());
+
+    auto tres = redeem(code, {{"redirect_uri", kNative},
+                              {"resource", "https://evil.example"}});
+    EXPECT_NE(status_of(tres), 200) << tres.body;
 }

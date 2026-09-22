@@ -8,6 +8,7 @@
 #include "api/AccountHandler.h"
 #include "api/OidcHandler.h"
 #include "core/Config.h"
+#include "core/ClientRegistration.h"
 #include "core/WebUtil.h"
 #include "crypto/PasswordHash.h"
 #include "crypto/Secrets.h"
@@ -146,12 +147,16 @@ protected:
         account.updated_at = now;
         ASSERT_TRUE(store->create_account(account));
 
-        // Public client (no secret) — must use PKCE.
+        // Public client (no secret) — must use PKCE. Registered with exactly
+        // what IdentityServer seeds in production (first_party_redirect_uris),
+        // so the loopback redirect desktop uses and the private-use scheme
+        // iOS uses are both exercised against the real list rather than a
+        // convenient one.
         OAuthClient publicc;
         publicc.client_id = "bsfchat-desktop";
         publicc.client_secret = "";
         publicc.name = "BSFChat Desktop";
-        publicc.redirect_uris = R"(["http://127.0.0.1/oauth/callback","http://localhost/oauth/callback"])";
+        publicc.redirect_uris = first_party_redirect_uris();
         publicc.created_at = now;
         ASSERT_TRUE(store->create_oauth_client(publicc));
 
@@ -990,6 +995,228 @@ TEST(RedirectUriTest, NonLoopbackRequiresExactMatch) {
     EXPECT_FALSE(redirect_uri_matches(reg, "https://app.example.com/cb2"));
     EXPECT_FALSE(redirect_uri_matches(reg, "https://app.example.com:8443/cb"));
 }
+
+// ---------------------------------------------------------------------------
+// The native (private-use URI scheme) callback — RFC 8252 section 7.1
+//
+// iOS cannot use the loopback redirect: handing off to the system browser
+// suspends the app, so nothing ever accepts the callback connection and
+// sign-in hangs. It presents ASWebAuthenticationSession in-process and
+// redirects to bsfchat://oauth/callback instead.
+// ---------------------------------------------------------------------------
+
+TEST(RedirectUriTest, PrivateUseSchemeRequiresExactMatch) {
+    // The port-flexible rule is for loopback http only. A custom scheme must
+    // not inherit it — if it did, "bsfchat://oauth/callback" would start
+    // matching things that merely look like it.
+    const std::string reg = "bsfchat://oauth/callback";
+    EXPECT_TRUE(redirect_uri_matches(reg, "bsfchat://oauth/callback"));
+    EXPECT_FALSE(redirect_uri_matches(reg, "bsfchat://oauth/callback2"));
+    EXPECT_FALSE(redirect_uri_matches(reg, "bsfchat://evil/oauth/callback"));
+    EXPECT_FALSE(redirect_uri_matches(reg, "bsfchat://oauth/callback#frag"));
+    EXPECT_FALSE(redirect_uri_matches(reg, "bsfchatx://oauth/callback"));
+    EXPECT_FALSE(redirect_uri_matches(reg, "http://oauth/callback"));
+    EXPECT_FALSE(redirect_uri_matches(reg, "bsfchat://oauth/callback/"));
+}
+
+TEST(FirstPartyClientTest, RegistrationCarriesBothCallbackShapes) {
+    // What the client actually sends, byte for byte. The iOS client builds
+    // this string from oidc::kNativeRedirectUri; /token compares it to the
+    // stored value exactly, so a difference here is an iOS-only failure that
+    // no desktop test would catch.
+    const std::string uris = first_party_redirect_uris();
+    EXPECT_NE(uris.find("\"bsfchat://oauth/callback\""), std::string::npos) << uris;
+    EXPECT_NE(uris.find("\"http://localhost/oauth/callback\""), std::string::npos) << uris;
+    EXPECT_NE(uris.find("\"http://127.0.0.1/oauth/callback\""), std::string::npos) << uris;
+}
+
+TEST(FirstPartyClientTest, SeedsAPublicClientSoPkceStaysMandatory) {
+    IdentityStore store(":memory:");
+    store.initialize();
+    ensure_first_party_client(store);
+
+    auto client = store.get_oauth_client("bsfchat-desktop");
+    ASSERT_TRUE(client.has_value());
+    // The whole safety argument for registering a scheme any app on the
+    // device can claim rests on this being empty: no secret means public
+    // means PKCE is enforced at /authorize and /token, so a stolen code is
+    // worthless without the verifier.
+    EXPECT_TRUE(client->client_secret.empty());
+    EXPECT_EQ(client->redirect_uris, std::string(first_party_redirect_uris()));
+}
+
+TEST(FirstPartyClientTest, AnExistingLoopbackOnlyRegistrationIsWidened) {
+    // Every deployment that predates the iOS client is sitting on this exact
+    // value. Left alone, it refuses every iOS sign-in with "Invalid
+    // redirect_uri for this client" and the fix looks like a client bug.
+    IdentityStore store(":memory:");
+    store.initialize();
+
+    OAuthClient existing;
+    existing.client_id = "bsfchat-desktop";
+    existing.client_secret = "";
+    existing.name = "BSFChat Desktop";
+    existing.redirect_uris =
+        R"(["http://127.0.0.1/oauth/callback","http://localhost/oauth/callback"])";
+    existing.created_at = now_seconds();
+    ASSERT_TRUE(store.create_oauth_client(existing));
+
+    ensure_first_party_client(store);
+
+    auto client = store.get_oauth_client("bsfchat-desktop");
+    ASSERT_TRUE(client.has_value());
+    EXPECT_EQ(client->redirect_uris, std::string(first_party_redirect_uris()));
+}
+
+TEST(FirstPartyClientTest, ACustomisedRegistrationIsLeftAlone) {
+    // Only the exact values this project shipped are upgraded. An operator
+    // who narrowed or extended the list keeps what they wrote.
+    IdentityStore store(":memory:");
+    store.initialize();
+
+    const std::string custom = R"(["http://127.0.0.1/oauth/callback"])";
+    OAuthClient existing;
+    existing.client_id = "bsfchat-desktop";
+    existing.client_secret = "";
+    existing.name = "BSFChat Desktop";
+    existing.redirect_uris = custom;
+    existing.created_at = now_seconds();
+    ASSERT_TRUE(store.create_oauth_client(existing));
+
+    ensure_first_party_client(store);
+
+    auto client = store.get_oauth_client("bsfchat-desktop");
+    ASSERT_TRUE(client.has_value());
+    EXPECT_EQ(client->redirect_uris, custom);
+}
+
+TEST_F(AuthFlowTest, NativeCallbackCompletesTheAuthorizationCodeFlow) {
+    // The iOS sign-in, end to end through the handlers: authorize with the
+    // private-use redirect, consent, then redeem the code with the verifier.
+    auto location = authorize_and_consent(
+        "bsfchat-desktop", "bsfchat://oauth/callback", s256_challenge(kVerifier));
+    ASSERT_FALSE(location.empty());
+    // The provider must redirect to the scheme itself — this is the URL
+    // ASWebAuthenticationSession watches for, and anything else leaves the
+    // sheet open.
+    EXPECT_TRUE(location.starts_with("bsfchat://oauth/callback?")) << location;
+
+    auto code = query_param(location, "code");
+    ASSERT_FALSE(code.empty()) << location;
+    EXPECT_EQ(query_param(location, "state"), "xyz");
+
+    auto req = form_request({
+        {"grant_type", "authorization_code"},
+        {"code", code},
+        {"redirect_uri", "bsfchat://oauth/callback"},
+        {"client_id", "bsfchat-desktop"},
+        {"code_verifier", kVerifier},
+    });
+    httplib::Response res;
+    oidc->handle_token(req, res);
+    ASSERT_EQ(status_of(res), 200) << res.body;
+    EXPECT_FALSE(json::parse(res.body)["id_token"].get<std::string>().empty());
+}
+
+TEST_F(AuthFlowTest, NativeCallbackWithoutPkceIsRejectedAtAuthorize) {
+    // The load-bearing check for a scheme another app can claim. Without it,
+    // a hijacked redirect would be a complete account takeover.
+    httplib::Request req;
+    req.method = "GET";
+    req.set_header("Cookie", "session=" + browser_session);
+    req.params.emplace("client_id", "bsfchat-desktop");
+    req.params.emplace("redirect_uri", "bsfchat://oauth/callback");
+    req.params.emplace("response_type", "code");
+    req.params.emplace("scope", "openid");
+    req.params.emplace("state", "st");
+
+    httplib::Response res;
+    oidc->handle_authorize(req, res);
+
+    EXPECT_EQ(status_of(res), 302);
+    EXPECT_EQ(query_param(extract_location(res), "error"), "invalid_request");
+    EXPECT_TRUE(query_param(extract_location(res), "code").empty());
+}
+
+TEST_F(AuthFlowTest, NativeCallbackCodeIsUselessWithoutTheVerifier) {
+    // The attack this defends against: another app registers bsfchat://,
+    // wins the redirect, and presents the code it caught. It never saw the
+    // verifier, so the grant fails.
+    auto location = authorize_and_consent(
+        "bsfchat-desktop", "bsfchat://oauth/callback", s256_challenge(kVerifier));
+    auto code = query_param(location, "code");
+    ASSERT_FALSE(code.empty());
+
+    auto stolen = form_request({
+        {"grant_type", "authorization_code"},
+        {"code", code},
+        {"redirect_uri", "bsfchat://oauth/callback"},
+        {"client_id", "bsfchat-desktop"},
+        {"code_verifier", "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"},
+    });
+    httplib::Response res;
+    oidc->handle_token(stolen, res);
+    EXPECT_EQ(status_of(res), 400);
+    EXPECT_EQ(json::parse(res.body)["error"], "invalid_grant");
+
+    // And with no verifier at all.
+    auto none = form_request({
+        {"grant_type", "authorization_code"},
+        {"code", code},
+        {"redirect_uri", "bsfchat://oauth/callback"},
+        {"client_id", "bsfchat-desktop"},
+    });
+    httplib::Response nres;
+    oidc->handle_token(none, nres);
+    EXPECT_EQ(status_of(nres), 400);
+    EXPECT_EQ(json::parse(nres.body)["error"], "invalid_grant");
+}
+
+TEST_F(AuthFlowTest, NativeCallbackCannotBeSwappedForLoopbackAtToken) {
+    // RFC 6749 4.1.3: /token's redirect_uri must be identical to the one the
+    // code was issued against. Both of these are registered for this client,
+    // which is exactly why the check has to be equality and not membership.
+    auto location = authorize_and_consent(
+        "bsfchat-desktop", "bsfchat://oauth/callback", s256_challenge(kVerifier));
+    auto code = query_param(location, "code");
+    ASSERT_FALSE(code.empty());
+
+    auto req = form_request({
+        {"grant_type", "authorization_code"},
+        {"code", code},
+        {"redirect_uri", "http://localhost:41234/oauth/callback"},
+        {"client_id", "bsfchat-desktop"},
+        {"code_verifier", kVerifier},
+    });
+    httplib::Response res;
+    oidc->handle_token(req, res);
+    EXPECT_EQ(status_of(res), 400);
+    EXPECT_EQ(json::parse(res.body)["error"], "invalid_grant");
+}
+
+TEST_F(AuthFlowTest, AnUnregisteredNativeSchemeIsRejected) {
+    // Adding one private-use scheme must not open the door to any other.
+    for (const char* uri : {"bsfchatx://oauth/callback",
+                            "bsfchat://oauth/callback2",
+                            "bsfchat://evil/oauth/callback"}) {
+        httplib::Request req;
+        req.method = "GET";
+        req.set_header("Cookie", "session=" + browser_session);
+        req.params.emplace("client_id", "bsfchat-desktop");
+        req.params.emplace("redirect_uri", uri);
+        req.params.emplace("response_type", "code");
+        req.params.emplace("scope", "openid");
+        req.params.emplace("code_challenge", s256_challenge(kVerifier));
+        req.params.emplace("code_challenge_method", "S256");
+
+        httplib::Response res;
+        oidc->handle_authorize(req, res);
+        // In-band 400, never a redirect: the URI was never validated, so it
+        // is not somewhere an error may be sent.
+        EXPECT_EQ(status_of(res), 400) << uri;
+    }
+}
+
 
 TEST(WebUtilTest, PercentEncodingRoundTrips) {
     const std::string raw = "a&b=c?d #e/f";

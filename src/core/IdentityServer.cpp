@@ -10,23 +10,8 @@
 
 namespace bsfchat::id {
 
-namespace {
-
-// The desktop client binds an ephemeral loopback port and listens on
-// /oauth/callback. Registering the full path (rather than a bare
-// "http://localhost") lets redirect_uri_matches() relax only the port.
-constexpr const char* kDesktopRedirectUris =
-    R"(["http://127.0.0.1/oauth/callback","http://localhost/oauth/callback"])";
-
-// The value shipped previously, which matched any path on any localhost port.
-constexpr const char* kLegacyDesktopRedirectUris = R"(["http://localhost"])";
-
-} // namespace
-
 IdentityServer::IdentityServer(Config config)
     : config_(std::move(config)) {
-    auto log = get_logger();
-
     // Ensure data directories exist
     auto db_dir = std::filesystem::path(config_.database_path).parent_path();
     if (!db_dir.empty()) std::filesystem::create_directories(db_dir);
@@ -35,23 +20,7 @@ IdentityServer::IdentityServer(Config config)
     store_ = std::make_unique<IdentityStore>(config_.database_path);
     store_->initialize();
 
-    // Auto-create the well-known desktop client if it doesn't exist
-    auto desktop = store_->get_oauth_client("bsfchat-desktop");
-    if (!desktop.has_value()) {
-        OAuthClient client;
-        client.client_id = "bsfchat-desktop";
-        client.client_secret = ""; // public client — authenticates via PKCE
-        client.name = "BSFChat Desktop";
-        client.redirect_uris = kDesktopRedirectUris;
-        client.created_at = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        store_->create_oauth_client(client);
-    } else if (desktop->redirect_uris == kLegacyDesktopRedirectUris) {
-        // Narrow the existing registration to the path the client actually
-        // uses. Left alone if an operator has customised it.
-        store_->update_oauth_client_redirect_uris("bsfchat-desktop", kDesktopRedirectUris);
-        log->info("Tightened bsfchat-desktop redirect_uris to the loopback callback path");
-    }
+    ensure_first_party_client(*store_);
 
     key_manager_ = std::make_unique<KeyManager>(config_.keys_path);
     http_server_ = std::make_unique<HttpServer>(config_);
