@@ -1186,6 +1186,14 @@ void AccountHandler::handle_add_server(const httplib::Request& req, httplib::Res
         json_error(res, 403, "This client may not access the server list");
         return;
     }
+    // H3 as everywhere else that writes: JSON only, and no cross-site
+    // browser request. It runs after M5 so a foreign client's token is told
+    // 403 either way. Harmless to the desktop client, which sends JSON and
+    // (not being a browser) neither Origin nor Sec-Fetch-Site; it is the
+    // browser-session half of M5's "browser session or desktop token" rule
+    // that needs it, since a cookie is the credential a third-party page can
+    // make the browser attach.
+    if (!reject_unsafe_request(req, res)) return;
     const auto& account_id = ctx.account_id;
 
     auto body = nlohmann::json::parse(req.body, nullptr, false);
@@ -1232,6 +1240,9 @@ void AccountHandler::handle_remove_server(const httplib::Request& req, httplib::
         json_error(res, 403, "This client may not access the server list");
         return;
     }
+    // See handle_add_server. The body is optional here (server_url may come
+    // as a query parameter), but a body that is sent must be JSON.
+    if (!reject_unsafe_request(req, res, /*body_required=*/false)) return;
     const auto& account_id = ctx.account_id;
 
     // Accept server_url from query param (for DELETE which may not carry body)

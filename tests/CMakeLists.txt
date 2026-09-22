@@ -123,10 +123,13 @@ target_link_libraries(identity_security_audit_tests PRIVATE
 # they guard against regression in CI while the proofs for findings still open
 # stay out of the run. Fixed on fix/security-audit-2026-09: H1, H2, H3, H4
 # (the proof is named H2b), M1, M2, M3 and the L2 email case. Fixed on
-# fix/token-audience: C1, M4 and the nonce proof, registered in the next
-# commit. Add each one here as its finding is fixed; never add a proof that
-# still fails.
+# fix/token-audience: C1, M4 and the nonce proof. That is all thirteen; any
+# proof added to test_security_audit.cpp later goes here once its finding is
+# fixed, never while it still fails.
 foreach(proof
+        C1_IdTokenAudienceIsBoundToTheChatServer
+        M4_IdTokenOmitsEmailWithoutEmailScope
+        Lnonce_NonceIsEchoedIntoIdToken
         H1_DisabledAccountCannotKeepMintingIdTokens
         H2_OneClientsFailuresDoNotLockOutEveryone
         H2b_PasswordChangeRevokesOtherSessionsAndRefreshTokens

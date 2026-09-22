@@ -2,7 +2,7 @@
 // audit's own proof tests (test_security_audit.cpp) do not cover: trusted
 // proxies, targeted lockout, same-origin checks, refresh-token lifetime and
 // replay, credential visibility and revocation, hashing at rest, TOTP replay
-// through enrolment, profile bounds, security headers and the v2 migration.
+// through enrolment, profile bounds, security headers and the v3 migration.
 //
 // Same approach as test_auth_flows.cpp: handlers driven directly with
 // synthetic httplib::Request objects, nothing listens on a socket.
@@ -719,7 +719,7 @@ TEST(SecurityHeadersTest, PagesCannotBeFramedOrRunInlineScript) {
 }
 
 // ---------------------------------------------------------------------------
-// Schema v2 migration on a v1 database
+// Schema migration on a v1 database (through C1's v2 and this branch's v3)
 // ---------------------------------------------------------------------------
 
 TEST(SchemaMigrationV2Test, HashesCredentialsOnceAndKeepsThemWorking) {
@@ -730,7 +730,7 @@ TEST(SchemaMigrationV2Test, HashesCredentialsOnceAndKeepsThemWorking) {
     // A v1 database as the previous release leaves it.
     {
         IdentityStore v0(db_path.string());
-        v0.initialize(); // creates v2; roll the relevant parts back to v1 below
+        v0.initialize(); // creates v3; roll the relevant parts back to v1 below
     }
     {
         sqlite3* raw = nullptr;
@@ -785,4 +785,163 @@ TEST(SchemaMigrationV2Test, HashesCredentialsOnceAndKeepsThemWorking) {
     std::filesystem::remove(db_path);
     std::filesystem::remove(db_path.string() + "-wal");
     std::filesystem::remove(db_path.string() + "-shm");
+}
+
+// ---------------------------------------------------------------------------
+// Schema v3 (this migration was "v2" on fix/security-audit-2026-09 and was
+// renumbered to run after the audience-binding v2 when the branches were
+// integrated).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+int user_version_of(const std::string& path) {
+    sqlite3* raw = nullptr;
+    EXPECT_EQ(sqlite3_open(path.c_str(), &raw), SQLITE_OK);
+    sqlite3_stmt* stmt = nullptr;
+    sqlite3_prepare_v2(raw, "PRAGMA user_version", -1, &stmt, nullptr);
+    int v = sqlite3_step(stmt) == SQLITE_ROW ? sqlite3_column_int(stmt, 0) : -1;
+    sqlite3_finalize(stmt);
+    sqlite3_close(raw);
+    return v;
+}
+
+void run_sql(const std::string& path, const std::string& sql) {
+    sqlite3* raw = nullptr;
+    ASSERT_EQ(sqlite3_open(path.c_str(), &raw), SQLITE_OK);
+    char* err = nullptr;
+    auto rc = sqlite3_exec(raw, sql.c_str(), nullptr, nullptr, &err);
+    std::string msg = err ? err : "";
+    sqlite3_free(err);
+    sqlite3_close(raw);
+    ASSERT_EQ(rc, SQLITE_OK) << msg;
+}
+
+void remove_db(const std::filesystem::path& p) {
+    std::filesystem::remove(p);
+    std::filesystem::remove(p.string() + "-wal");
+    std::filesystem::remove(p.string() + "-shm");
+}
+
+// The tables the v3 step rewrites, as a v2 database (identity main after the
+// audience-binding merge) has them: consent_requests already carries C1's
+// resource and nonce, refresh_tokens has no family yet.
+const char* kV2RefreshTokens =
+    "CREATE TABLE refresh_tokens (token TEXT PRIMARY KEY, client_id TEXT NOT NULL,"
+    " account_id TEXT NOT NULL, scope TEXT, expires_at INTEGER NOT NULL)";
+const char* kV2Accounts =
+    "CREATE TABLE accounts (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, email TEXT UNIQUE,"
+    " password_hash TEXT, display_name TEXT, avatar_url TEXT, is_admin BOOLEAN DEFAULT FALSE,"
+    " created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)";
+const char* kV2UserTotp =
+    "CREATE TABLE user_totp (account_id TEXT PRIMARY KEY, secret TEXT NOT NULL,"
+    " enabled INTEGER NOT NULL DEFAULT 0, backup_codes TEXT, created_at INTEGER NOT NULL DEFAULT 0)";
+
+} // namespace
+
+// A database at C1's v2 — the state identity main leaves it in — is hashed at
+// v3, and C1's columns on the consent request survive the session_id rehash.
+TEST(SchemaMigrationV3Test, AudienceV2DatabaseIsHashedOnceAndKeepsC1Columns) {
+    auto db_path = bsfchat::test::unique_temp_file("bsfchat_id_migration_v3", ".db");
+    remove_db(db_path);
+    const auto path = db_path.string();
+    auto now = now_seconds();
+    {
+        IdentityStore fresh(path);
+        fresh.initialize();
+    }
+    run_sql(path, "DROP TABLE refresh_tokens");
+    run_sql(path, kV2RefreshTokens);
+    run_sql(path, "DROP TABLE accounts");
+    run_sql(path, kV2Accounts);
+    run_sql(path, "DROP TABLE user_totp");
+    run_sql(path, kV2UserTotp);
+    run_sql(path, "INSERT INTO accounts (id, username, created_at, updated_at) VALUES ('a1', 'alice', 0, 0)");
+    run_sql(path, "INSERT INTO sessions (session_id, account_id, created_at, expires_at, token_type) VALUES"
+                  " ('raw-session', 'a1', " + std::to_string(now) + ", " + std::to_string(now + 3600) +
+                  ", 'session')");
+    run_sql(path, "INSERT INTO refresh_tokens VALUES ('raw-refresh', 'bsfchat-desktop', 'a1', 'openid', " +
+                  std::to_string(now + 86400) + ")");
+    // A consent prompt pending across the upgrade, bound to the raw session
+    // id and to a chat server.
+    run_sql(path, "INSERT INTO consent_requests (token, session_id, account_id, client_id, redirect_uri,"
+                  " scope, state, code_challenge, expires_at, resource, nonce) VALUES ('ct', 'raw-session',"
+                  " 'a1', 'bsfchat-desktop', 'http://127.0.0.1/cb', 'openid', 's', 'cc', " +
+                  std::to_string(now + 300) + ", 'https://chat.example', 'n-1')");
+    run_sql(path, "PRAGMA user_version = 2");
+
+    for (int open = 0; open < 2; ++open) {  // the second open must change nothing
+        {
+            IdentityStore store(path);
+            ASSERT_NO_THROW(store.initialize());
+            auto session = store.get_browser_session("raw-session");
+            ASSERT_TRUE(session.has_value()) << "open " << open;
+            EXPECT_EQ(session->session_id, hash_token("raw-session"));
+            auto rt = store.get_refresh_token("raw-refresh");
+            ASSERT_TRUE(rt.has_value()) << "open " << open;
+            EXPECT_FALSE(rt->family_id.empty());
+        }
+        EXPECT_EQ(user_version_of(path), 3);
+    }
+    {
+        IdentityStore store(path);
+        store.initialize();
+        auto consent = store.consume_consent_request("ct", "raw-session");
+        ASSERT_TRUE(consent.has_value()) << "consent binding lost or hashed twice";
+        EXPECT_EQ(consent->resource, "https://chat.example");
+        EXPECT_EQ(consent->nonce, "n-1");
+    }
+    remove_db(db_path);
+}
+
+// Before integration the security branch called this step "v2". A database
+// that ran it says user_version = 2, has refresh-token families and hashed
+// credentials, and has none of C1's columns. It must gain those columns and
+// must NOT be hashed a second time (which would sign everybody out).
+TEST(SchemaMigrationV3Test, PreIntegrationSecurityV2DatabaseIsNotHashedTwice) {
+    auto db_path = bsfchat::test::unique_temp_file("bsfchat_id_migration_v3b", ".db");
+    remove_db(db_path);
+    const auto path = db_path.string();
+    auto now = now_seconds();
+    {
+        IdentityStore fresh(path);
+        fresh.initialize();
+        Session s;
+        s.session_id = "raw-session";
+        s.account_id = "a1";
+        s.created_at = now;
+        s.expires_at = now + 3600;
+        s.token_type = token_type::kBrowserSession;
+        Account a;
+        a.id = "a1";
+        a.username = "alice";
+        a.created_at = a.updated_at = now;
+        ASSERT_TRUE(fresh.create_account(a));
+        ASSERT_TRUE(fresh.create_session(s));  // stored hashed
+    }
+    for (const char* table : {"auth_codes", "consent_requests"}) {
+        run_sql(path, std::string("ALTER TABLE ") + table + " DROP COLUMN resource");
+        run_sql(path, std::string("ALTER TABLE ") + table + " DROP COLUMN nonce");
+    }
+    run_sql(path, "PRAGMA user_version = 2");
+
+    {
+        IdentityStore store(path);
+        ASSERT_NO_THROW(store.initialize());
+        auto session = store.get_browser_session("raw-session");
+        ASSERT_TRUE(session.has_value()) << "credentials were hashed a second time";
+        AuthCode code;
+        code.code = "c1";
+        code.client_id = "bsfchat-desktop";
+        code.account_id = "a1";
+        code.redirect_uri = "http://127.0.0.1/cb";
+        code.expires_at = now + 300;
+        code.resource = "https://chat.example";
+        ASSERT_TRUE(store.store_auth_code(code));
+        auto back = store.consume_auth_code("c1");
+        ASSERT_TRUE(back.has_value());
+        EXPECT_EQ(back->resource, "https://chat.example");
+    }
+    EXPECT_EQ(user_version_of(path), 3);
+    remove_db(db_path);
 }
