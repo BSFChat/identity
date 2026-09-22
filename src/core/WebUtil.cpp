@@ -150,12 +150,12 @@ ParsedUri parse_uri(const std::string& uri) {
     auto hash = remainder.find('#');
     if (hash != std::string::npos) {
         out.has_fragment = true;
-        remainder = remainder.substr(0, hash);
+        remainder.resize(hash);
     }
     auto qmark = remainder.find('?');
     if (qmark != std::string::npos) {
         out.query = remainder.substr(qmark + 1);
-        remainder = remainder.substr(0, qmark);
+        remainder.resize(qmark);
     }
     out.path = remainder;
 
