@@ -127,12 +127,17 @@ std::string compute_totp(const std::string& base32_secret, uint64_t time_step) {
 }
 
 bool verify_totp(const std::string& base32_secret, const std::string& code, int window) {
+    return verify_totp_step(base32_secret, code, window).has_value();
+}
+
+std::optional<uint64_t> verify_totp_step(const std::string& base32_secret, const std::string& code,
+                                         int window) {
     // Reject anything that is not a 6-digit code before doing any HMAC work, so
     // that backup-code guesses and junk cannot be distinguished by timing and
     // do not cost us CPU.
-    if (code.size() != 6) return false;
+    if (code.size() != 6) return std::nullopt;
     for (char c : code) {
-        if (c < '0' || c > '9') return false;
+        if (c < '0' || c > '9') return std::nullopt;
     }
 
     // A +/-1 step tolerance (30s either side of the current step) is the
@@ -147,21 +152,27 @@ bool verify_totp(const std::string& base32_secret, const std::string& code, int 
     // Accumulate rather than returning early: every candidate step is compared
     // with a constant-time comparison and the loop always runs to completion,
     // so neither which step matched nor how many digits were right is leaked.
+    // The matched step is selected with a mask rather than a branch for the
+    // same reason. If two steps in the window share a code, the later wins,
+    // which is the conservative choice for replay tracking.
     unsigned char matched = 0;
+    uint64_t matched_step = 0;
     for (int i = -window; i <= window; ++i) {
         uint64_t step = current_step + static_cast<uint64_t>(i);
         std::string expected;
         try {
             expected = compute_totp(base32_secret, step);
         } catch (...) {
-            return false;
+            return std::nullopt;
         }
-        if (expected.size() == code.size() &&
-            CRYPTO_memcmp(expected.data(), code.data(), code.size()) == 0) {
-            matched = 1;
-        }
+        const unsigned char hit = (expected.size() == code.size() &&
+            CRYPTO_memcmp(expected.data(), code.data(), code.size()) == 0) ? 1 : 0;
+        const uint64_t mask = 0 - static_cast<uint64_t>(hit);
+        matched_step = (step & mask) | (matched_step & ~mask);
+        matched |= hit;
     }
-    return matched != 0;
+    if (!matched) return std::nullopt;
+    return matched_step;
 }
 
 std::string totp_provisioning_uri(const std::string& secret, const std::string& username, const std::string& issuer) {

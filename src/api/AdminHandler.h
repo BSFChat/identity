@@ -14,6 +14,7 @@ public:
 
     void handle_list_users(const httplib::Request& req, httplib::Response& res);
     void handle_disable_user(const httplib::Request& req, httplib::Response& res);
+    void handle_enable_user(const httplib::Request& req, httplib::Response& res);
     void handle_list_clients(const httplib::Request& req, httplib::Response& res);
     void handle_create_client(const httplib::Request& req, httplib::Response& res);
 

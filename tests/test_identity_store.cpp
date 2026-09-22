@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "store/IdentityStore.h"
+#include "crypto/Secrets.h"
 
 #include <chrono>
 
@@ -208,7 +209,10 @@ TEST_F(IdentityStoreTest, OAuthClientCRUD) {
     auto retrieved = store->get_oauth_client("client-abc");
     ASSERT_TRUE(retrieved.has_value());
     EXPECT_EQ(retrieved->name, "Test App");
-    EXPECT_EQ(retrieved->client_secret, "secret-xyz");
+    // Only a digest is stored (security audit L5), and it still verifies.
+    EXPECT_EQ(retrieved->client_secret, hash_client_secret("secret-xyz"));
+    EXPECT_TRUE(client_secret_matches(retrieved->client_secret, "secret-xyz"));
+    EXPECT_FALSE(client_secret_matches(retrieved->client_secret, "secret-xyZ"));
 
     auto clients = store->list_oauth_clients();
     EXPECT_EQ(clients.size(), 1u);
@@ -226,7 +230,14 @@ TEST_F(IdentityStoreTest, DisableAccount) {
     ASSERT_TRUE(store->create_account(account));
     ASSERT_TRUE(store->disable_account("uuid-disable"));
 
+    // Disabling is a flag now (security audit H1), not a blanked hash, so it
+    // can be undone without resetting the password.
     auto retrieved = store->get_account_by_id("uuid-disable");
     ASSERT_TRUE(retrieved.has_value());
-    EXPECT_TRUE(retrieved->password_hash.empty());
+    EXPECT_TRUE(retrieved->disabled());
+    EXPECT_EQ(retrieved->password_hash, "secrethash");
+
+    ASSERT_TRUE(store->enable_account("uuid-disable"));
+    EXPECT_FALSE(store->get_account_by_id("uuid-disable")->disabled());
+    EXPECT_FALSE(store->disable_account("no-such-account"));
 }

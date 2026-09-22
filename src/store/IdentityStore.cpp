@@ -1,7 +1,9 @@
 #include "store/IdentityStore.h"
 #include "core/Logger.h"
 #include "core/WebUtil.h"
+#include "core/Username.h"
 #include "crypto/PasswordHash.h"
+#include "crypto/Secrets.h"
 
 #include <algorithm>
 #include <chrono>
@@ -12,7 +14,7 @@ namespace bsfchat::id {
 namespace {
 
 // Bump when a new migration step is appended to migrate_locked().
-constexpr int kSchemaVersion = 2;
+constexpr int kSchemaVersion = 3;
 
 // Backup codes carry ~47 bits of entropy and are checked one at a time against
 // at most a handful of stored hashes, so a lighter KDF than the password one is
@@ -302,6 +304,9 @@ void IdentityStore::migrate_locked() {
             sqlite3_step(upd.get());
             log->info("Schema migration: hashed backup codes for account {}", account_id);
         }
+
+        exec("PRAGMA user_version = 1");
+        log->info("Identity database schema migrated to version 1");
     }
 
     // --- v2: bind a grant to the chat server it is for, and carry a nonce ---
@@ -314,7 +319,14 @@ void IdentityStore::migrate_locked() {
     // Both tables hold rows that live five minutes, so nothing is backfilled:
     // a pending grant from before the upgrade simply has no resource, and
     // gets the legacy audience that upgraded chat servers refuse.
-    if (version < 2) {
+    //
+    // The column checks run whatever user_version says (they are cheap and
+    // guarded): before the two audit branches were integrated,
+    // fix/security-audit-2026-09 ALSO called its migration "v2", so a
+    // development database that ran that branch says user_version = 2 but
+    // has no resource/nonce columns. Keying this step on the version alone
+    // would skip it there and every /authorize would then fail in prepare().
+    {
         for (const char* table : {"auth_codes", "consent_requests"}) {
             if (!has_column_locked(table, "resource")) {
                 exec(std::string("ALTER TABLE ") + table +
@@ -325,21 +337,183 @@ void IdentityStore::migrate_locked() {
                      " ADD COLUMN nonce TEXT NOT NULL DEFAULT ''");
             }
         }
+        if (version < 2) {
+            exec("PRAGMA user_version = 2");
+            log->info("Identity database schema migrated to version 2");
+        }
     }
 
-    if (version < kSchemaVersion) {
-        exec("PRAGMA user_version = " + std::to_string(kSchemaVersion));
+    // --- v3: security audit 2026-09 ------------------------------------------
+    // Disabled accounts (H1), username skeletons (H3), TOTP replay (M2),
+    // refresh-token families with an absolute lifetime (H4/L4), and no bearer
+    // credential or client secret stored in the clear (L5).
+    //
+    // Written as "v2" on fix/security-audit-2026-09 and renumbered to v3 when
+    // it was integrated after the audience-binding v2 above (C1); the two
+    // touch different columns. C1's resource/nonce columns on auth_codes and
+    // consent_requests are not secrets (a public server URL and a nonce that
+    // is echoed into the id_token), and the consent_requests rehash below
+    // rewrites session_id only, by value, so it leaves them intact.
+    //
+    // One transaction, so a failure part-way leaves the database at v2 rather
+    // than half-hashed. Every step is additive; no row is dropped. Existing
+    // sessions and refresh tokens keep working, because lookups hash the
+    // presented value and the rows are hashed here to match.
+    if (version < 3) {
+        Transaction txn(db_);
+
+        // Hashing is not idempotent, so it is tied to a column this same step
+        // creates rather than to user_version alone: a database whose
+        // user_version was lost must not have its tokens hashed twice (which
+        // would sign everybody out). Still the right marker at v3: nothing
+        // in v1 or v2 creates refresh_tokens.family_id, and a database that
+        // ran the pre-integration "v2" of this step (user_version 2, family_id
+        // present) re-enters here and correctly skips the hashing.
+        const bool hash_credentials = !has_column_locked("refresh_tokens", "family_id");
+
+        if (!has_column_locked("accounts", "disabled_at")) {
+            exec("ALTER TABLE accounts ADD COLUMN disabled_at INTEGER NOT NULL DEFAULT 0");
+        }
+        if (!has_column_locked("accounts", "username_skeleton")) {
+            exec("ALTER TABLE accounts ADD COLUMN username_skeleton TEXT NOT NULL DEFAULT ''");
+        }
+        {
+            std::vector<std::pair<std::string, std::string>> rows;
+            auto stmt = prepare(db_, "SELECT id, username FROM accounts WHERE username_skeleton = ''");
+            while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+                rows.emplace_back(col_text(stmt.get(), 0), username_skeleton(col_text(stmt.get(), 1)));
+            }
+            auto upd = prepare(db_, "UPDATE accounts SET username_skeleton = ? WHERE id = ?");
+            for (const auto& [id, skeleton] : rows) {
+                sqlite3_reset(upd.get());
+                bind_text(upd.get(), 1, skeleton);
+                bind_text(upd.get(), 2, id);
+                sqlite3_step(upd.get());
+            }
+        }
+        exec("CREATE INDEX IF NOT EXISTS idx_accounts_username_skeleton ON accounts(username_skeleton)");
+        {
+            // Pre-policy lookalikes are left alone (refusing an existing
+            // user's login would be worse), but the operator should know.
+            auto stmt = prepare(db_,
+                "SELECT COUNT(*) FROM (SELECT username_skeleton FROM accounts "
+                "GROUP BY username_skeleton HAVING COUNT(*) > 1)");
+            if (sqlite3_step(stmt.get()) == SQLITE_ROW && sqlite3_column_int(stmt.get(), 0) > 0) {
+                log->warn("Schema migration: {} group(s) of existing usernames are confusable with "
+                          "each other; they keep working, new lookalikes are refused",
+                          sqlite3_column_int(stmt.get(), 0));
+            }
+        }
+
+        if (!has_column_locked("user_totp", "last_step")) {
+            exec("ALTER TABLE user_totp ADD COLUMN last_step INTEGER NOT NULL DEFAULT 0");
+        }
+
+        if (!has_column_locked("refresh_tokens", "family_id")) {
+            exec("ALTER TABLE refresh_tokens ADD COLUMN family_id TEXT NOT NULL DEFAULT ''");
+        }
+        if (!has_column_locked("refresh_tokens", "family_expires_at")) {
+            exec("ALTER TABLE refresh_tokens ADD COLUMN family_expires_at INTEGER NOT NULL DEFAULT 0");
+        }
+        if (!has_column_locked("refresh_tokens", "created_at")) {
+            exec("ALTER TABLE refresh_tokens ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0");
+        }
+        if (!has_column_locked("refresh_tokens", "replaced_at")) {
+            exec("ALTER TABLE refresh_tokens ADD COLUMN replaced_at INTEGER NOT NULL DEFAULT 0");
+        }
+        // Every pre-existing token is its own family. Its absolute expiry is
+        // its current expiry plus 60 days: the 90-day default less the 30 it
+        // was last issued with, so nobody is signed out by the upgrade and no
+        // token in circulation lives past about 90 days from now.
+        exec("UPDATE refresh_tokens SET family_id = lower(hex(randomblob(16))) WHERE family_id = ''");
+        exec("UPDATE refresh_tokens SET family_expires_at = expires_at + 5184000 WHERE family_expires_at = 0");
+        exec("UPDATE refresh_tokens SET created_at = expires_at - 2592000 WHERE created_at = 0");
+        exec("CREATE INDEX IF NOT EXISTS idx_refresh_tokens_family ON refresh_tokens(family_id)");
+
+        if (hash_credentials) {
+            const auto rehash = [&](const char* table, const char* column) {
+                std::vector<std::string> values;
+                {
+                    auto stmt = prepare(db_, std::string("SELECT ") + column + " FROM " + table);
+                    while (sqlite3_step(stmt.get()) == SQLITE_ROW) values.push_back(col_text(stmt.get(), 0));
+                }
+                auto upd = prepare(db_, std::string("UPDATE ") + table + " SET " + column +
+                                            " = ? WHERE " + column + " = ?");
+                for (const auto& v : values) {
+                    sqlite3_reset(upd.get());
+                    bind_text(upd.get(), 1, hash_token(v));
+                    bind_text(upd.get(), 2, v);
+                    sqlite3_step(upd.get());
+                }
+                log->info("Schema migration: hashed {} {}.{} value(s) at rest", values.size(), table, column);
+            };
+            rehash("sessions", "session_id");
+            rehash("refresh_tokens", "token");
+            rehash("consent_requests", "session_id");
+        }
+
+        // Client secrets carry their own prefix, so this is idempotent alone.
+        {
+            std::vector<std::pair<std::string, std::string>> rows;
+            auto stmt = prepare(db_, "SELECT client_id, client_secret FROM oauth_clients");
+            while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+                auto secret = col_text(stmt.get(), 1);
+                if (secret.empty() || secret.rfind(kClientSecretHashPrefix, 0) == 0) continue;
+                rows.emplace_back(col_text(stmt.get(), 0), hash_client_secret(secret));
+            }
+            auto upd = prepare(db_, "UPDATE oauth_clients SET client_secret = ? WHERE client_id = ?");
+            for (const auto& [id, hashed] : rows) {
+                sqlite3_reset(upd.get());
+                bind_text(upd.get(), 1, hashed);
+                bind_text(upd.get(), 2, id);
+                sqlite3_step(upd.get());
+            }
+            if (!rows.empty()) log->info("Schema migration: hashed {} OAuth client secret(s)", rows.size());
+        }
+
+        exec("PRAGMA user_version = 3");
+        txn.commit();
         log->info("Identity database schema migrated to version {}", kSchemaVersion);
     }
 }
 
 // Accounts
 
+namespace {
+
+constexpr const char* kAccountColumns =
+    "SELECT id, username, email, password_hash, display_name, avatar_url, is_admin, created_at, "
+    "updated_at, disabled_at FROM accounts ";
+
+Account read_account_row(sqlite3_stmt* stmt) {
+    Account a;
+    a.id = col_text(stmt, 0);
+    a.username = col_text(stmt, 1);
+    a.email = col_text(stmt, 2);
+    a.password_hash = col_text(stmt, 3);
+    a.display_name = col_text(stmt, 4);
+    a.avatar_url = col_text(stmt, 5);
+    a.is_admin = sqlite3_column_int(stmt, 6) != 0;
+    a.created_at = sqlite3_column_int64(stmt, 7);
+    a.updated_at = sqlite3_column_int64(stmt, 8);
+    a.disabled_at = sqlite3_column_int64(stmt, 9);
+    return a;
+}
+
+// Appended to credential lookups so a disabled account's rows resolve to
+// nothing even if something were to survive disable_account()'s purge.
+std::string account_enabled(const char* table) {
+    return std::string(" AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = ") + table +
+           ".account_id AND a.disabled_at != 0)";
+}
+
+} // namespace
+
 bool IdentityStore::create_account(const Account& account) {
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_,
-        "INSERT OR IGNORE INTO accounts (id, username, email, password_hash, display_name, avatar_url, is_admin, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        "INSERT OR IGNORE INTO accounts (id, username, email, password_hash, display_name, avatar_url, is_admin, "
+        "created_at, updated_at, username_skeleton) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     sqlite3_bind_text(stmt.get(), 1, account.id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 2, account.username.c_str(), -1, SQLITE_TRANSIENT);
     if (account.email.empty()) {
@@ -353,51 +527,42 @@ bool IdentityStore::create_account(const Account& account) {
     sqlite3_bind_int(stmt.get(), 7, account.is_admin ? 1 : 0);
     sqlite3_bind_int64(stmt.get(), 8, account.created_at);
     sqlite3_bind_int64(stmt.get(), 9, account.updated_at);
+    bind_text(stmt.get(), 10, username_skeleton(account.username));
     return sqlite3_step(stmt.get()) == SQLITE_DONE && sqlite3_changes(db_) > 0;
 }
 
 std::optional<Account> IdentityStore::get_account_by_id(const std::string& id) {
     std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_,
-        "SELECT id, username, email, password_hash, display_name, avatar_url, is_admin, created_at, updated_at "
-        "FROM accounts WHERE id = ?");
-    sqlite3_bind_text(stmt.get(), 1, id.c_str(), -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
-        Account a;
-        a.id = col_text(stmt.get(), 0);
-        a.username = col_text(stmt.get(), 1);
-        a.email = col_text(stmt.get(), 2);
-        a.password_hash = col_text(stmt.get(), 3);
-        a.display_name = col_text(stmt.get(), 4);
-        a.avatar_url = col_text(stmt.get(), 5);
-        a.is_admin = sqlite3_column_int(stmt.get(), 6) != 0;
-        a.created_at = sqlite3_column_int64(stmt.get(), 7);
-        a.updated_at = sqlite3_column_int64(stmt.get(), 8);
-        return a;
-    }
+    auto stmt = prepare(db_, std::string(kAccountColumns) + "WHERE id = ?");
+    bind_text(stmt.get(), 1, id);
+    if (sqlite3_step(stmt.get()) == SQLITE_ROW) return read_account_row(stmt.get());
     return std::nullopt;
 }
 
 std::optional<Account> IdentityStore::get_account_by_username(const std::string& username) {
     std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_,
-        "SELECT id, username, email, password_hash, display_name, avatar_url, is_admin, created_at, updated_at "
-        "FROM accounts WHERE username = ?");
-    sqlite3_bind_text(stmt.get(), 1, username.c_str(), -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
-        Account a;
-        a.id = col_text(stmt.get(), 0);
-        a.username = col_text(stmt.get(), 1);
-        a.email = col_text(stmt.get(), 2);
-        a.password_hash = col_text(stmt.get(), 3);
-        a.display_name = col_text(stmt.get(), 4);
-        a.avatar_url = col_text(stmt.get(), 5);
-        a.is_admin = sqlite3_column_int(stmt.get(), 6) != 0;
-        a.created_at = sqlite3_column_int64(stmt.get(), 7);
-        a.updated_at = sqlite3_column_int64(stmt.get(), 8);
-        return a;
-    }
+    auto stmt = prepare(db_, std::string(kAccountColumns) + "WHERE username = ?");
+    bind_text(stmt.get(), 1, username);
+    if (sqlite3_step(stmt.get()) == SQLITE_ROW) return read_account_row(stmt.get());
     return std::nullopt;
+}
+
+std::optional<std::string> IdentityStore::find_account_by_username_skeleton(const std::string& skeleton) {
+    if (skeleton.empty()) return std::nullopt;
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "SELECT id FROM accounts WHERE username_skeleton = ? LIMIT 1");
+    bind_text(stmt.get(), 1, skeleton);
+    if (sqlite3_step(stmt.get()) == SQLITE_ROW) return col_text(stmt.get(), 0);
+    return std::nullopt;
+}
+
+bool IdentityStore::email_in_use(const std::string& email, const std::string& except_account_id) {
+    if (email.empty()) return false;
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "SELECT 1 FROM accounts WHERE email = ? AND id != ?");
+    bind_text(stmt.get(), 1, email);
+    bind_text(stmt.get(), 2, except_account_id);
+    return sqlite3_step(stmt.get()) == SQLITE_ROW;
 }
 
 bool IdentityStore::update_account(const Account& account) {
@@ -427,38 +592,82 @@ bool IdentityStore::update_password_hash(const std::string& id, const std::strin
 
 std::vector<Account> IdentityStore::list_accounts(int limit, int offset) {
     std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_,
-        "SELECT id, username, email, password_hash, display_name, avatar_url, is_admin, created_at, updated_at "
-        "FROM accounts ORDER BY created_at DESC LIMIT ? OFFSET ?");
+    auto stmt = prepare(db_, std::string(kAccountColumns) + "ORDER BY created_at DESC LIMIT ? OFFSET ?");
     sqlite3_bind_int(stmt.get(), 1, limit);
     sqlite3_bind_int(stmt.get(), 2, offset);
 
     std::vector<Account> accounts;
     while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
-        Account a;
-        a.id = col_text(stmt.get(), 0);
-        a.username = col_text(stmt.get(), 1);
-        a.email = col_text(stmt.get(), 2);
-        a.password_hash = col_text(stmt.get(), 3);
-        a.display_name = col_text(stmt.get(), 4);
-        a.avatar_url = col_text(stmt.get(), 5);
-        a.is_admin = sqlite3_column_int(stmt.get(), 6) != 0;
-        a.created_at = sqlite3_column_int64(stmt.get(), 7);
-        a.updated_at = sqlite3_column_int64(stmt.get(), 8);
-        accounts.push_back(std::move(a));
+        accounts.push_back(read_account_row(stmt.get()));
     }
     return accounts;
 }
 
+int IdentityStore::revoke_credentials_locked(const std::string& account_id, const std::string& keep_hash) {
+    int ended = 0;
+    const auto run = [&](const char* sql, bool with_keep) {
+        auto stmt = prepare(db_, sql);
+        bind_text(stmt.get(), 1, account_id);
+        if (with_keep) bind_text(stmt.get(), 2, keep_hash);
+        sqlite3_step(stmt.get());
+        return sqlite3_changes(db_);
+    };
+    {
+        // Counted before deleting: the user-facing number is browser sessions
+        // and refresh-token families, not access tokens or rotated-out rows.
+        auto stmt = prepare(db_,
+            "SELECT (SELECT COUNT(*) FROM sessions WHERE account_id = ?1 AND token_type = ?2 "
+            "AND session_id != ?3) + "
+            "(SELECT COUNT(DISTINCT family_id) FROM refresh_tokens WHERE account_id = ?1 AND replaced_at = 0)");
+        bind_text(stmt.get(), 1, account_id);
+        bind_text(stmt.get(), 2, token_type::kBrowserSession);
+        bind_text(stmt.get(), 3, keep_hash);
+        if (sqlite3_step(stmt.get()) == SQLITE_ROW) ended = sqlite3_column_int(stmt.get(), 0);
+    }
+    run("DELETE FROM sessions WHERE account_id = ? AND session_id != ?", true);
+    run("DELETE FROM refresh_tokens WHERE account_id = ?", false);
+    // A code issued before the change could otherwise still be redeemed for
+    // a fresh refresh token afterwards.
+    run("DELETE FROM auth_codes WHERE account_id = ?", false);
+    run("DELETE FROM login_tokens WHERE account_id = ?", false);
+    run("DELETE FROM consent_requests WHERE account_id = ? AND session_id != ?", true);
+    return ended;
+}
+
 bool IdentityStore::disable_account(const std::string& id) {
     std::lock_guard lock(mutex_);
-    // Set password_hash to empty to disable login
-    auto stmt = prepare(db_, "UPDATE accounts SET password_hash = '', updated_at = ? WHERE id = ?");
-    auto now = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    sqlite3_bind_int64(stmt.get(), 1, now);
-    sqlite3_bind_text(stmt.get(), 2, id.c_str(), -1, SQLITE_TRANSIENT);
+    Transaction txn(db_);
+    // The password hash is kept so that re-enabling restores the account as
+    // it was. Nothing authenticates a disabled account: login refuses it and
+    // every credential lookup filters it out.
+    auto stmt = prepare(db_,
+        "UPDATE accounts SET disabled_at = CASE WHEN disabled_at = 0 THEN ?1 ELSE disabled_at END, "
+        "updated_at = ?1 WHERE id = ?2");
+    sqlite3_bind_int64(stmt.get(), 1, now_seconds());
+    bind_text(stmt.get(), 2, id);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE || sqlite3_changes(db_) == 0) return false;
+    revoke_credentials_locked(id, "");
+    txn.commit();
+    return true;
+}
+
+bool IdentityStore::enable_account(const std::string& id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "UPDATE accounts SET disabled_at = 0, updated_at = ? WHERE id = ?");
+    sqlite3_bind_int64(stmt.get(), 1, now_seconds());
+    bind_text(stmt.get(), 2, id);
     return sqlite3_step(stmt.get()) == SQLITE_DONE && sqlite3_changes(db_) > 0;
+}
+
+int IdentityStore::revoke_account_credentials(const std::string& account_id,
+                                              const std::string& keep_session_id) {
+    std::lock_guard lock(mutex_);
+    Transaction txn(db_);
+    // An empty keep value must not match anything; a hash never equals "".
+    auto ended = revoke_credentials_locked(account_id,
+                                           keep_session_id.empty() ? "" : hash_token(keep_session_id));
+    txn.commit();
+    return ended;
 }
 
 // OAuth clients
@@ -469,7 +678,12 @@ bool IdentityStore::create_oauth_client(const OAuthClient& client) {
         "INSERT OR IGNORE INTO oauth_clients (client_id, client_secret, name, redirect_uris, created_at) "
         "VALUES (?, ?, ?, ?, ?)");
     sqlite3_bind_text(stmt.get(), 1, client.client_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 2, client.client_secret.c_str(), -1, SQLITE_TRANSIENT);
+    // Only the digest is kept (security audit L5); the plaintext is shown to
+    // the admin once, in the creation response, and never again.
+    const bool already_hashed = client.client_secret.rfind(kClientSecretHashPrefix, 0) == 0;
+    bind_text(stmt.get(), 2, client.client_secret.empty() || already_hashed
+                                 ? client.client_secret
+                                 : hash_client_secret(client.client_secret));
     sqlite3_bind_text(stmt.get(), 3, client.name.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 4, client.redirect_uris.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt.get(), 5, client.created_at);
@@ -616,40 +830,154 @@ void IdentityStore::delete_expired_auth_codes() {
 
 // Refresh tokens
 
+namespace {
+
+constexpr const char* kRefreshColumns =
+    "SELECT token, client_id, account_id, scope, expires_at, family_id, family_expires_at, "
+    "created_at, replaced_at FROM refresh_tokens ";
+
+RefreshToken read_refresh_row(sqlite3_stmt* stmt) {
+    RefreshToken rt;
+    rt.token = col_text(stmt, 0);
+    rt.client_id = col_text(stmt, 1);
+    rt.account_id = col_text(stmt, 2);
+    rt.scope = col_text(stmt, 3);
+    rt.expires_at = sqlite3_column_int64(stmt, 4);
+    rt.family_id = col_text(stmt, 5);
+    rt.family_expires_at = sqlite3_column_int64(stmt, 6);
+    rt.created_at = sqlite3_column_int64(stmt, 7);
+    rt.replaced_at = sqlite3_column_int64(stmt, 8);
+    return rt;
+}
+
+bool insert_refresh_row(sqlite3* db, const RefreshToken& token) {
+    auto stmt = prepare(db,
+        "INSERT INTO refresh_tokens (token, client_id, account_id, scope, expires_at, family_id, "
+        "family_expires_at, created_at, replaced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)");
+    bind_text(stmt.get(), 1, hash_token(token.token));
+    bind_text(stmt.get(), 2, token.client_id);
+    bind_text(stmt.get(), 3, token.account_id);
+    bind_text(stmt.get(), 4, token.scope);
+    sqlite3_bind_int64(stmt.get(), 5, token.expires_at);
+    // A caller that predates families still gets one: its own.
+    bind_text(stmt.get(), 6, token.family_id.empty() ? hash_token(token.token).substr(0, 32)
+                                                      : token.family_id);
+    sqlite3_bind_int64(stmt.get(), 7, token.family_expires_at ? token.family_expires_at : token.expires_at);
+    sqlite3_bind_int64(stmt.get(), 8, token.created_at ? token.created_at : now_seconds());
+    return sqlite3_step(stmt.get()) == SQLITE_DONE;
+}
+
+} // namespace
+
 bool IdentityStore::store_refresh_token(const RefreshToken& token) {
     std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_,
-        "INSERT INTO refresh_tokens (token, client_id, account_id, scope, expires_at) VALUES (?, ?, ?, ?, ?)");
-    sqlite3_bind_text(stmt.get(), 1, token.token.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 2, token.client_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 3, token.account_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 4, token.scope.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt.get(), 5, token.expires_at);
-    return sqlite3_step(stmt.get()) == SQLITE_DONE;
+    return insert_refresh_row(db_, token);
 }
 
 std::optional<RefreshToken> IdentityStore::get_refresh_token(const std::string& token) {
     std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_,
-        "SELECT token, client_id, account_id, scope, expires_at FROM refresh_tokens WHERE token = ?");
-    sqlite3_bind_text(stmt.get(), 1, token.c_str(), -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
-        RefreshToken rt;
-        rt.token = col_text(stmt.get(), 0);
-        rt.client_id = col_text(stmt.get(), 1);
-        rt.account_id = col_text(stmt.get(), 2);
-        rt.scope = col_text(stmt.get(), 3);
-        rt.expires_at = sqlite3_column_int64(stmt.get(), 4);
-        return rt;
-    }
+    auto stmt = prepare(db_, std::string(kRefreshColumns) + "WHERE token = ?" +
+                                 account_enabled("refresh_tokens"));
+    bind_text(stmt.get(), 1, hash_token(token));
+    if (sqlite3_step(stmt.get()) == SQLITE_ROW) return read_refresh_row(stmt.get());
     return std::nullopt;
 }
 
 void IdentityStore::delete_refresh_token(const std::string& token) {
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_, "DELETE FROM refresh_tokens WHERE token = ?");
-    sqlite3_bind_text(stmt.get(), 1, token.c_str(), -1, SQLITE_TRANSIENT);
+    bind_text(stmt.get(), 1, hash_token(token));
     sqlite3_step(stmt.get());
+}
+
+RotateResult IdentityStore::rotate_refresh_token(const std::string& old_token,
+                                                 const RefreshToken& replacement) {
+    std::lock_guard lock(mutex_);
+    Transaction txn(db_);
+
+    std::optional<RefreshToken> current;
+    {
+        auto stmt = prepare(db_, std::string(kRefreshColumns) + "WHERE token = ?" +
+                                     account_enabled("refresh_tokens"));
+        bind_text(stmt.get(), 1, hash_token(old_token));
+        if (sqlite3_step(stmt.get()) == SQLITE_ROW) current = read_refresh_row(stmt.get());
+    }
+    if (!current) return RotateResult::Invalid;
+
+    if (current->replaced_at != 0) {
+        // A retired token came back. Either the client is replaying (it lost
+        // the response and retried — its family is dead to it anyway, since it
+        // never received the successor) or somebody else holds a copy. Kill
+        // the family so the copy stops working too (OAuth 2.0 Security BCP,
+        // refresh token rotation).
+        auto del = prepare(db_, "DELETE FROM refresh_tokens WHERE family_id = ?");
+        bind_text(del.get(), 1, current->family_id);
+        sqlite3_step(del.get());
+        txn.commit();
+        return RotateResult::Reused;
+    }
+
+    const auto now = now_seconds();
+    if (current->expires_at < now || current->family_expires_at < now) {
+        auto del = prepare(db_, "DELETE FROM refresh_tokens WHERE family_id = ?");
+        bind_text(del.get(), 1, current->family_id);
+        sqlite3_step(del.get());
+        txn.commit();
+        return RotateResult::Invalid;
+    }
+
+    {
+        auto upd = prepare(db_, "UPDATE refresh_tokens SET replaced_at = ? WHERE token = ? AND replaced_at = 0");
+        sqlite3_bind_int64(upd.get(), 1, now);
+        bind_text(upd.get(), 2, current->token); // already the stored hash
+        if (sqlite3_step(upd.get()) != SQLITE_DONE || sqlite3_changes(db_) == 0) {
+            return RotateResult::Invalid;
+        }
+    }
+
+    // The successor inherits the family and its absolute expiry whatever the
+    // caller filled in: rotation must not be able to extend a grant.
+    RefreshToken next = replacement;
+    next.family_id = current->family_id;
+    next.family_expires_at = current->family_expires_at;
+    next.created_at = current->created_at;
+    next.account_id = current->account_id;
+    next.client_id = current->client_id;
+    next.scope = current->scope;
+    if (next.expires_at > next.family_expires_at) next.expires_at = next.family_expires_at;
+    if (!insert_refresh_row(db_, next)) return RotateResult::Invalid;
+
+    txn.commit();
+    return RotateResult::Rotated;
+}
+
+void IdentityStore::revoke_refresh_token_family(const std::string& token) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "DELETE FROM refresh_tokens WHERE family_id = "
+        "(SELECT family_id FROM refresh_tokens WHERE token = ?)");
+    bind_text(stmt.get(), 1, hash_token(token));
+    sqlite3_step(stmt.get());
+}
+
+std::vector<RefreshToken> IdentityStore::list_refresh_tokens_for_account(const std::string& account_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, std::string(kRefreshColumns) +
+        "WHERE account_id = ? AND replaced_at = 0 AND expires_at >= ? ORDER BY created_at DESC");
+    bind_text(stmt.get(), 1, account_id);
+    sqlite3_bind_int64(stmt.get(), 2, now_seconds());
+    std::vector<RefreshToken> out;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) out.push_back(read_refresh_row(stmt.get()));
+    return out;
+}
+
+bool IdentityStore::delete_refresh_family(const std::string& account_id, const std::string& family_id) {
+    if (family_id.empty()) return false;
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "DELETE FROM refresh_tokens WHERE account_id = ? AND family_id = ?");
+    bind_text(stmt.get(), 1, account_id);
+    bind_text(stmt.get(), 2, family_id);
+    return sqlite3_step(stmt.get()) == SQLITE_DONE && sqlite3_changes(db_) > 0;
 }
 
 void IdentityStore::delete_expired_refresh_tokens() {
@@ -666,7 +994,7 @@ bool IdentityStore::create_session(const Session& session) {
     auto stmt = prepare(db_,
         "INSERT INTO sessions (session_id, account_id, created_at, expires_at, token_type, scope, client_id) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)");
-    bind_text(stmt.get(), 1, session.session_id);
+    bind_text(stmt.get(), 1, hash_token(session.session_id));
     bind_text(stmt.get(), 2, session.account_id);
     sqlite3_bind_int64(stmt.get(), 3, session.created_at);
     sqlite3_bind_int64(stmt.get(), 4, session.expires_at);
@@ -699,22 +1027,24 @@ constexpr const char* kSessionColumns =
 std::optional<Session> IdentityStore::get_session(const std::string& session_id) {
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_, std::string(kSessionColumns) + "WHERE session_id = ?");
-    bind_text(stmt.get(), 1, session_id);
+    bind_text(stmt.get(), 1, hash_token(session_id));
     return read_session_row(stmt.get());
 }
 
 std::optional<Session> IdentityStore::get_browser_session(const std::string& session_id) {
     std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_, std::string(kSessionColumns) + "WHERE session_id = ? AND token_type = ?");
-    bind_text(stmt.get(), 1, session_id);
+    auto stmt = prepare(db_, std::string(kSessionColumns) + "WHERE session_id = ? AND token_type = ?" +
+                                 account_enabled("sessions"));
+    bind_text(stmt.get(), 1, hash_token(session_id));
     bind_text(stmt.get(), 2, token_type::kBrowserSession);
     return read_session_row(stmt.get());
 }
 
 std::optional<Session> IdentityStore::get_oidc_access_token(const std::string& token) {
     std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_, std::string(kSessionColumns) + "WHERE session_id = ? AND token_type = ?");
-    bind_text(stmt.get(), 1, token);
+    auto stmt = prepare(db_, std::string(kSessionColumns) + "WHERE session_id = ? AND token_type = ?" +
+                                 account_enabled("sessions"));
+    bind_text(stmt.get(), 1, hash_token(token));
     bind_text(stmt.get(), 2, token_type::kOidcAccess);
     return read_session_row(stmt.get());
 }
@@ -722,8 +1052,16 @@ std::optional<Session> IdentityStore::get_oidc_access_token(const std::string& t
 void IdentityStore::delete_session(const std::string& session_id) {
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_, "DELETE FROM sessions WHERE session_id = ?");
-    sqlite3_bind_text(stmt.get(), 1, session_id.c_str(), -1, SQLITE_TRANSIENT);
+    bind_text(stmt.get(), 1, hash_token(session_id));
     sqlite3_step(stmt.get());
+}
+
+bool IdentityStore::delete_stored_session(const std::string& account_id, const std::string& stored_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "DELETE FROM sessions WHERE account_id = ? AND session_id = ?");
+    bind_text(stmt.get(), 1, account_id);
+    bind_text(stmt.get(), 2, stored_id);
+    return sqlite3_step(stmt.get()) == SQLITE_DONE && sqlite3_changes(db_) > 0;
 }
 
 void IdentityStore::delete_expired_sessions() {
@@ -788,6 +1126,16 @@ void IdentityStore::enable_totp(const std::string& account_id) {
     auto stmt = prepare(db_, "UPDATE user_totp SET enabled = 1 WHERE account_id = ?");
     sqlite3_bind_text(stmt.get(), 1, account_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(stmt.get());
+}
+
+bool IdentityStore::accept_totp_step(const std::string& account_id, uint64_t step) {
+    std::lock_guard lock(mutex_);
+    // Compare-and-set in one statement, so two logins racing with the same
+    // code cannot both see the old value.
+    auto stmt = prepare(db_, "UPDATE user_totp SET last_step = ?1 WHERE account_id = ?2 AND last_step < ?1");
+    sqlite3_bind_int64(stmt.get(), 1, static_cast<int64_t>(step));
+    bind_text(stmt.get(), 2, account_id);
+    return sqlite3_step(stmt.get()) == SQLITE_DONE && sqlite3_changes(db_) > 0;
 }
 
 void IdentityStore::disable_totp(const std::string& account_id) {
@@ -936,7 +1284,9 @@ bool IdentityStore::store_consent_request(const ConsentRequest& request) {
         "(token, session_id, account_id, client_id, redirect_uri, scope, state, code_challenge, expires_at, "
         "resource, nonce) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     bind_text(stmt.get(), 1, request.token);
-    bind_text(stmt.get(), 2, request.session_id);
+    // The browser session this prompt is bound to, hashed like the sessions
+    // table itself: the raw value would be a live session id at rest.
+    bind_text(stmt.get(), 2, hash_token(request.session_id));
     bind_text(stmt.get(), 3, request.account_id);
     bind_text(stmt.get(), 4, request.client_id);
     bind_text(stmt.get(), 5, request.redirect_uri);
@@ -964,7 +1314,7 @@ std::optional<ConsentRequest> IdentityStore::consume_consent_request(const std::
             "SELECT token, session_id, account_id, client_id, redirect_uri, scope, state, code_challenge, expires_at, "
             "resource, nonce FROM consent_requests WHERE token = ? AND session_id = ?");
         bind_text(stmt.get(), 1, token);
-        bind_text(stmt.get(), 2, session_id);
+        bind_text(stmt.get(), 2, hash_token(session_id));
         if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
             ConsentRequest r;
             r.token = col_text(stmt.get(), 0);
@@ -985,7 +1335,7 @@ std::optional<ConsentRequest> IdentityStore::consume_consent_request(const std::
     if (result) {
         auto del = prepare(db_, "DELETE FROM consent_requests WHERE token = ? AND session_id = ?");
         bind_text(del.get(), 1, token);
-        bind_text(del.get(), 2, session_id);
+        bind_text(del.get(), 2, hash_token(session_id));
         sqlite3_step(del.get());
         // Lost the race with a concurrent decision — do not issue a second code.
         if (sqlite3_changes(db_) == 0) result.reset();

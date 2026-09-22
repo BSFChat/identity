@@ -19,14 +19,17 @@ include(cmake/Dependencies.cmake)
 
 add_executable(bsfchat-id
     src/main.cpp
+    src/core/ClientAddress.cpp
     src/core/Config.cpp
     src/core/Logger.cpp
     src/core/IdentityServer.cpp
     src/core/RateLimiter.cpp
+    src/core/Username.cpp
     src/core/WebUtil.cpp
     src/http/HttpServer.cpp
     src/crypto/KeyManager.cpp
     src/crypto/PasswordHash.cpp
+    src/crypto/Secrets.cpp
     src/crypto/Totp.cpp
     src/store/IdentityStore.cpp
     src/api/AccountHandler.cpp

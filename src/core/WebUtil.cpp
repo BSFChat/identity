@@ -195,6 +195,33 @@ bool redirect_uri_matches(const std::string& registered, const std::string& pres
     return true;
 }
 
+std::string uri_origin(const ParsedUri& uri) {
+    if (!uri.valid || uri.scheme.empty() || uri.host.empty()) return "";
+    std::string origin = uri.scheme + "://";
+    origin += uri.host.find(':') != std::string::npos ? "[" + uri.host + "]" : uri.host;
+    const bool default_port = uri.port.empty() || (uri.scheme == "https" && uri.port == "443") ||
+                              (uri.scheme == "http" && uri.port == "80");
+    if (!default_port) origin += ":" + uri.port;
+    return origin;
+}
+
+bool is_json_content_type(const std::string& content_type) {
+    auto media = content_type.substr(0, content_type.find(';'));
+    return to_lower(trim(media)) == "application/json";
+}
+
+const std::vector<std::pair<std::string, std::string>>& default_security_headers() {
+    static const std::vector<std::pair<std::string, std::string>> headers = {
+        {"Content-Security-Policy",
+         "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+         "img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"},
+        {"X-Frame-Options", "DENY"},
+        {"X-Content-Type-Options", "nosniff"},
+        {"Referrer-Policy", "no-referrer"},
+    };
+    return headers;
+}
+
 std::optional<std::string> get_cookie(const std::string& cookie_header, const std::string& name) {
     std::istringstream ss(cookie_header);
     std::string pair;

@@ -3,6 +3,7 @@
 #include "api/AccountHandler.h"
 #include "api/OidcHandler.h"
 #include "api/AdminHandler.h"
+#include "core/WebUtil.h"
 
 #include <chrono>
 #include <filesystem>
@@ -105,6 +106,16 @@ void IdentityServer::register_routes() {
         return httplib::Server::HandlerResponse::Unhandled;
     });
 
+    // Security headers on every response, static pages included (security
+    // audit L7): login.html, profile.html and admin.html could be framed and
+    // had no CSP. A handler's own value wins — the consent page sets a
+    // stricter frame policy of its own. See default_security_headers().
+    svr.set_post_routing_handler([](const httplib::Request&, httplib::Response& res) {
+        for (const auto& [name, value] : default_security_headers()) {
+            if (!res.has_header(name)) res.set_header(name, value);
+        }
+    });
+
     // Handle CORS preflight
     svr.Options(R"(.*)", [](const httplib::Request&, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");
@@ -155,6 +166,10 @@ void IdentityServer::register_routes() {
             [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_list_sessions(req, res); });
     svr.Delete(R"(/api/user/sessions/(.+))",
                [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_revoke_session(req, res); });
+    svr.Get("/api/user/apps",
+            [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_list_apps(req, res); });
+    svr.Delete(R"(/api/user/apps/([0-9a-f]+))",
+               [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_revoke_app(req, res); });
 
     // 2FA endpoints
     svr.Get("/api/user/2fa/status",
@@ -180,6 +195,8 @@ void IdentityServer::register_routes() {
             [h = admin_handler](const httplib::Request& req, httplib::Response& res) { h->handle_list_users(req, res); });
     svr.Post(R"(/api/admin/users/([^/]+)/disable)",
              [h = admin_handler](const httplib::Request& req, httplib::Response& res) { h->handle_disable_user(req, res); });
+    svr.Post(R"(/api/admin/users/([^/]+)/enable)",
+             [h = admin_handler](const httplib::Request& req, httplib::Response& res) { h->handle_enable_user(req, res); });
     svr.Get("/api/admin/clients",
             [h = admin_handler](const httplib::Request& req, httplib::Response& res) { h->handle_list_clients(req, res); });
     svr.Post("/api/admin/clients",
