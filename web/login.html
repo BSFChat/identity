@@ -67,7 +67,7 @@
             const params = new URLSearchParams(window.location.search);
             const redirect = params.get('redirect');
             if (!redirect) return null;
-            return '/authorize?' + new URLSearchParams({
+            const query = new URLSearchParams({
                 client_id: params.get('client_id') || '',
                 redirect_uri: redirect,
                 response_type: params.get('response_type') || 'code',
@@ -75,7 +75,14 @@
                 state: params.get('state') || '',
                 code_challenge: params.get('code_challenge') || '',
                 code_challenge_method: params.get('code_challenge_method') || ''
-            }).toString();
+            });
+            // Only when present: an empty resource= is refused by /authorize
+            // (it names no server), and dropping a real one would turn a
+            // server-bound sign-in back into a legacy one.
+            for (const key of ['resource', 'nonce']) {
+                if (params.has(key)) query.set(key, params.get(key));
+            }
+            return '/authorize?' + query.toString();
         }
 
         function onLoginComplete() {

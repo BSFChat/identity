@@ -80,6 +80,20 @@ std::string extract_bearer_token(const httplib::Request& req) {
 // session control, 2FA and admin remain browser-session only.
 constexpr const char* kServersScope = "openid";
 
+// ...and the only OAuth client whose access token may reach it (identity
+// audit 2026-09, M5). The scope bar above is one every relying party clears,
+// so any registered client — a bot dashboard, a third-party web app — could
+// rewrite the list of servers the desktop app auto-connects to and signs in
+// to. That list is the desktop app's own state; nobody else has a reason to
+// write it. Seeded in IdentityServer.cpp. A browser session (the portal's
+// own profile page) is unaffected.
+constexpr const char* kServerListClientId = "bsfchat-desktop";
+
+bool may_use_server_list(const AuthContext& ctx) {
+    return ctx.authenticated() &&
+           (ctx.is_browser_session() || ctx.client_id == kServerListClientId);
+}
+
 // Bounds on a server-membership row. The desktop client walks this list on
 // login and connects to each entry, so a hostile value here is a hostile
 // value in somebody's client, and the token that can write it only has to
@@ -201,6 +215,7 @@ AuthContext AccountHandler::authenticate(const httplib::Request& req, const std:
             ctx.token_type = token_type::kOidcAccess;
             ctx.credential_id = token;
             ctx.scope = access->scope;
+            ctx.client_id = access->client_id;
         }
     }
 
@@ -803,6 +818,10 @@ void AccountHandler::handle_list_servers(const httplib::Request& req, httplib::R
         json_error(res, 401, "Not authenticated");
         return;
     }
+    if (!may_use_server_list(ctx)) {
+        json_error(res, 403, "This client may not access the server list");
+        return;
+    }
     const auto& account_id = ctx.account_id;
 
     auto servers = store_.list_server_memberships(account_id);
@@ -822,6 +841,10 @@ void AccountHandler::handle_add_server(const httplib::Request& req, httplib::Res
     auto ctx = authenticate(req, kServersScope);
     if (!ctx.authenticated()) {
         json_error(res, 401, "Not authenticated");
+        return;
+    }
+    if (!may_use_server_list(ctx)) {
+        json_error(res, 403, "This client may not access the server list");
         return;
     }
     const auto& account_id = ctx.account_id;
@@ -864,6 +887,10 @@ void AccountHandler::handle_remove_server(const httplib::Request& req, httplib::
     auto ctx = authenticate(req, kServersScope);
     if (!ctx.authenticated()) {
         json_error(res, 401, "Not authenticated");
+        return;
+    }
+    if (!may_use_server_list(ctx)) {
+        json_error(res, 403, "This client may not access the server list");
         return;
     }
     const auto& account_id = ctx.account_id;

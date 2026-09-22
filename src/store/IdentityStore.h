@@ -40,6 +40,11 @@ struct AuthCode {
     std::string scope;
     std::string code_challenge;
     int64_t expires_at = 0;
+    // Canonical URL of the chat server the grant is for (RFC 8707 `resource`),
+    // or empty for a request that named none. Becomes the id_token's `aud`.
+    std::string resource;
+    // OIDC nonce from the authorization request, echoed into the id_token.
+    std::string nonce;
 };
 
 struct RefreshToken {
@@ -85,6 +90,8 @@ struct ConsentRequest {
     std::string state;
     std::string code_challenge;
     int64_t expires_at = 0;
+    std::string resource;     // see AuthCode::resource
+    std::string nonce;
 };
 
 struct TotpInfo {

@@ -23,7 +23,13 @@ public:
     void handle_revoke(const httplib::Request& req, httplib::Response& res);
 
 private:
-    std::string create_id_token(const Account& account, const std::string& client_id);
+    // `scope` gates which profile claims are released (M4). `resource` is the
+    // canonical URL of the chat server the grant names and becomes `aud`;
+    // empty means the request named none and the token gets the legacy
+    // client_id audience, which upgraded chat servers refuse (C1).
+    std::string create_id_token(const Account& account, const std::string& client_id,
+                                const std::string& scope, const std::string& resource,
+                                const std::string& nonce);
     std::string create_access_token();
 
     // Outcome of authenticating the caller of /token.
@@ -44,7 +50,8 @@ private:
     // Renders the consent page for a validated authorization request.
     void render_consent_page(httplib::Response& res, const OAuthClient& client,
                              const Account& account, const std::string& scope,
-                             const std::string& consent_token, const std::string& redirect_uri);
+                             const std::string& consent_token, const std::string& redirect_uri,
+                             const std::string& resource);
 
     IdentityStore& store_;
     KeyManager& key_manager_;
