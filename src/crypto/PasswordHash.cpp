@@ -95,8 +95,16 @@ ParsedHash parse_stored(const std::string& stored) {
 
     if (out.legacy) {
         // Legacy field is a log2 cost; 2^cost iterations.
-        if (parsed < 1 || parsed > 31) return out;
-        out.iterations = 1 << static_cast<int>(parsed);
+        //
+        // Capped at 25, not 31, for two reasons. `1 << 31` on a signed int is
+        // implementation-defined and yields a NEGATIVE iteration count on the
+        // compilers we build with. And 2^30 is over a billion iterations -- the
+        // very CPU burn the modern branch below refuses with its 50,000,000
+        // cap, which a hostile or corrupt legacy row could otherwise demand.
+        // 2^25 (33,554,432) is the largest power of two under that cap, and
+        // real legacy costs sit far lower (the server writes 12 to 19).
+        if (parsed < 1 || parsed > 25) return out;
+        out.iterations = static_cast<int>(1u << static_cast<unsigned>(parsed));
     } else {
         // Guard against a hostile/corrupt row asking us to burn CPU forever.
         if (parsed < 1 || parsed > 50000000) return out;
