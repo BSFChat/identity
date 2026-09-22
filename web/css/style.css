@@ -513,3 +513,8 @@ pre {
         padding: 8px 6px;
     }
 }
+
+/* Muted helper text, used by the page scripts instead of inline styles. */
+.muted {
+    color: var(--text-muted);
+}
