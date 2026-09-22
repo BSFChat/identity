@@ -120,8 +120,8 @@
                         <div class="code-input">
                             <input type="text" id="2fa-verify-code" maxlength="6"
                                    placeholder="000000" autocomplete="off">
-                            <button class="btn btn-primary btn-small" onclick="verify2FA()">Verify</button>
-                            <button class="btn btn-secondary btn-small" onclick="cancel2FASetup()">Cancel</button>
+                            <button class="btn btn-primary btn-small" id="2fa-verify-btn">Verify</button>
+                            <button class="btn btn-secondary btn-small" id="2fa-cancel-btn">Cancel</button>
                         </div>
                     </div>
                 </div>
@@ -137,6 +137,27 @@
                 <div id="sessions-list">
                     <p style="color: var(--text-muted);">Loading...</p>
                 </div>
+
+                <hr>
+
+                <div class="section-title">Signed-in Apps</div>
+                <div class="section-desc">
+                    Apps such as the BSFChat desktop client stay signed in with a long-lived
+                    token. Revoke any you no longer use; the app will ask you to sign in again.
+                </div>
+                <div id="apps-list">
+                    <p style="color: var(--text-muted);">Loading...</p>
+                </div>
+
+                <hr>
+
+                <div class="section-title">Sign Out Everywhere</div>
+                <div class="section-desc">
+                    Ends every session and signs out every app, including this browser.
+                    Changing your password or two-factor settings also signs out everything
+                    except this browser.
+                </div>
+                <button class="btn btn-danger btn-small" id="signout-everywhere-btn">Sign out everywhere</button>
             </div>
 
             <!-- ====== Servers Tab ====== -->
@@ -164,275 +185,14 @@
                         <input type="text" id="new-server-name" placeholder="BSFChat">
                     </div>
                     <button class="btn btn-primary btn-small" style="margin-bottom:0; height:42px;"
-                            onclick="addServer()">Add</button>
+                            id="add-server-btn">Add</button>
                 </div>
             </div>
         </div>
     </div>
 
     <script src="/js/app.js"></script>
-    <script src="/js/qrcode.min.js" defer></script>
-    <script>
-        // ---- Tab switching ----
-        document.querySelectorAll('.tab-btn').forEach(btn => {
-            btn.addEventListener('click', () => {
-                document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-                document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
-                btn.classList.add('active');
-                document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
-                // Lazy-load tab data
-                if (btn.dataset.tab === 'sessions') loadSessions();
-                if (btn.dataset.tab === 'security') load2FAStatus();
-                if (btn.dataset.tab === 'servers') loadServers();
-            });
-        });
-
-        // ---- Profile tab ----
-        async function loadProfile() {
-            try {
-                const profile = await apiGet('/api/profile');
-                document.getElementById('username').value = profile.username;
-                document.getElementById('display_name').value = profile.display_name || '';
-                document.getElementById('email').value = profile.email || '';
-                document.getElementById('avatar_url').value = profile.avatar_url || '';
-                if (profile.is_admin) {
-                    document.getElementById('admin-link').classList.remove('hidden');
-                }
-            } catch (err) {
-                window.location.href = '/login.html';
-            }
-        }
-
-        document.getElementById('profile-form').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            try {
-                await apiPut('/api/profile', {
-                    display_name: document.getElementById('display_name').value,
-                    email: document.getElementById('email').value,
-                    avatar_url: document.getElementById('avatar_url').value
-                });
-                showSuccess('Profile updated successfully');
-            } catch (err) {
-                showError(err.message);
-            }
-        });
-
-        // ---- Security tab: password ----
-        document.getElementById('password-form').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            try {
-                await apiPut('/api/profile', {
-                    old_password: document.getElementById('old_password').value,
-                    new_password: document.getElementById('new_password').value
-                });
-                showSuccess('Password changed successfully');
-                document.getElementById('old_password').value = '';
-                document.getElementById('new_password').value = '';
-            } catch (err) {
-                showError(err.message);
-            }
-        });
-
-        // ---- Security tab: 2FA ----
-        let pending2FASecret = null;
-
-        async function load2FAStatus() {
-            const area = document.getElementById('2fa-status-area');
-            try {
-                const data = await apiGet('/api/user/2fa/status');
-                if (data.enabled) {
-                    area.innerHTML = `
-                        <div style="display:flex; align-items:center; justify-content:space-between;">
-                            <span class="status-badge enabled">\u2713 Enabled</span>
-                            <button class="btn btn-danger btn-small" onclick="disable2FA()">Disable 2FA</button>
-                        </div>`;
-                } else {
-                    area.innerHTML = `
-                        <div style="display:flex; align-items:center; justify-content:space-between;">
-                            <span class="status-badge disabled">Not enabled</span>
-                            <button class="btn btn-primary btn-small" onclick="setup2FA()">Enable 2FA</button>
-                        </div>`;
-                }
-            } catch (err) {
-                area.innerHTML = '<p style="color:var(--text-muted);">Could not load 2FA status.</p>';
-            }
-        }
-
-        async function setup2FA() {
-            try {
-                const data = await apiPost('/api/user/2fa/setup', {});
-                pending2FASecret = data.secret;
-
-                // Show setup area
-                document.getElementById('2fa-status-area').classList.add('hidden');
-                document.getElementById('2fa-setup-area').classList.remove('hidden');
-
-                // Secret for manual entry
-                document.getElementById('2fa-secret-display').textContent = data.secret;
-
-                // QR code (uses qrcode.min.js)
-                const qrTarget = document.getElementById('qr-target');
-                qrTarget.innerHTML = '';
-                if (typeof QRCode !== 'undefined') {
-                    new QRCode(qrTarget, {
-                        text: data.provisioning_uri,
-                        width: 160,
-                        height: 160,
-                        colorDark: '#000',
-                        colorLight: '#fff',
-                        correctLevel: QRCode.CorrectLevel.M
-                    });
-                } else {
-                    qrTarget.textContent = data.provisioning_uri;
-                }
-
-                // Backup codes
-                const grid = document.getElementById('backup-codes-grid');
-                grid.innerHTML = '';
-                (data.backup_codes || []).forEach(code => {
-                    const el = document.createElement('code');
-                    el.textContent = code;
-                    grid.appendChild(el);
-                });
-            } catch (err) {
-                showError(err.message);
-            }
-        }
-
-        async function verify2FA() {
-            const code = document.getElementById('2fa-verify-code').value.trim();
-            if (code.length !== 6) { showError('Enter a 6-digit code'); return; }
-            try {
-                await apiPost('/api/user/2fa/verify', { code });
-                showSuccess('Two-factor authentication enabled!');
-                cancel2FASetup();
-                load2FAStatus();
-            } catch (err) {
-                showError(err.message);
-            }
-        }
-
-        function cancel2FASetup() {
-            document.getElementById('2fa-setup-area').classList.add('hidden');
-            document.getElementById('2fa-status-area').classList.remove('hidden');
-            document.getElementById('2fa-verify-code').value = '';
-            pending2FASecret = null;
-        }
-
-        async function disable2FA() {
-            const password = prompt('Enter your password to disable 2FA:');
-            if (!password) return;
-            try {
-                await apiPost('/api/user/2fa/disable', { password });
-                showSuccess('Two-factor authentication disabled');
-                load2FAStatus();
-            } catch (err) {
-                showError(err.message);
-            }
-        }
-
-        // ---- Sessions tab ----
-        async function loadSessions() {
-            const container = document.getElementById('sessions-list');
-            try {
-                const sessions = await apiGet('/api/user/sessions');
-                if (sessions.length === 0) {
-                    container.innerHTML = '<p style="color:var(--text-muted);">No active sessions.</p>';
-                    return;
-                }
-                container.innerHTML = '';
-                sessions.forEach(s => {
-                    const created = new Date(s.created_at * 1000).toLocaleString();
-                    const expires = new Date(s.expires_at * 1000).toLocaleString();
-                    const row = document.createElement('div');
-                    row.className = 'session-row' + (s.is_current ? ' current' : '');
-                    row.innerHTML = `
-                        <div class="session-info">
-                            <div class="session-id">${escapeHtml(s.session_id)}${s.is_current ? '<span class="session-badge">Current</span>' : ''}</div>
-                            <div class="session-time">Created ${created} \u2022 Expires ${expires}</div>
-                        </div>
-                        ${!s.is_current ? `<button class="btn btn-danger btn-small" onclick="revokeSession('${escapeHtml(s.full_id)}')">Revoke</button>` : ''}
-                    `;
-                    container.appendChild(row);
-                });
-            } catch (err) {
-                container.innerHTML = '<p style="color:var(--text-muted);">Could not load sessions.</p>';
-            }
-        }
-
-        async function revokeSession(sessionId) {
-            try {
-                await apiDelete('/api/user/sessions/' + encodeURIComponent(sessionId));
-                showSuccess('Session revoked');
-                loadSessions();
-            } catch (err) {
-                showError(err.message);
-            }
-        }
-
-        // ---- Servers tab ----
-        async function loadServers() {
-            const container = document.getElementById('servers-list');
-            try {
-                const servers = await apiGet('/api/servers');
-                if (servers.length === 0) {
-                    container.innerHTML = '<p style="color:var(--text-muted);">No servers registered yet. Add one below or connect via the BSFChat client.</p>';
-                    return;
-                }
-                container.innerHTML = '';
-                servers.forEach(s => {
-                    const joined = new Date(s.joined_at * 1000).toLocaleDateString();
-                    const row = document.createElement('div');
-                    row.className = 'session-row';
-                    row.innerHTML = `
-                        <div class="session-info">
-                            <div style="font-weight:600; color:var(--text-primary);">${escapeHtml(s.server_name || s.server_url)}</div>
-                            <div class="session-time">${escapeHtml(s.server_url)} &bull; Joined ${joined}</div>
-                        </div>
-                        <button class="btn btn-danger btn-small" onclick="removeServer('${escapeHtml(s.server_url)}')">Remove</button>
-                    `;
-                    container.appendChild(row);
-                });
-            } catch (err) {
-                container.innerHTML = '<p style="color:var(--text-muted);">Could not load servers.</p>';
-            }
-        }
-
-        async function addServer() {
-            const url = document.getElementById('new-server-url').value.trim();
-            if (!url) { showError('Enter a server URL'); return; }
-            const name = document.getElementById('new-server-name').value.trim();
-            try {
-                await apiPost('/api/servers', { server_url: url, server_name: name });
-                showSuccess('Server added');
-                document.getElementById('new-server-url').value = '';
-                document.getElementById('new-server-name').value = '';
-                loadServers();
-            } catch (err) {
-                showError(err.message);
-            }
-        }
-
-        async function removeServer(serverUrl) {
-            if (!confirm('Remove this server from your account?')) return;
-            try {
-                await apiPost('/api/servers/remove', { server_url: serverUrl });
-                showSuccess('Server removed');
-                loadServers();
-            } catch (err) {
-                showError(err.message);
-            }
-        }
-
-        // ---- Logout ----
-        document.getElementById('logout-btn').addEventListener('click', async (e) => {
-            e.preventDefault();
-            try { await apiPost('/api/logout', {}); } catch (err) { /* ignore */ }
-            window.location.href = '/login.html';
-        });
-
-        // ---- Init ----
-        loadProfile();
-    </script>
+    <script src="/js/qrcode.min.js"></script>
+    <script src="/js/profile.js"></script>
 </body>
 </html>

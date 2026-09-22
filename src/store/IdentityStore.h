@@ -22,10 +22,19 @@ struct Account {
     bool is_admin = false;
     int64_t created_at = 0;
     int64_t updated_at = 0;
+    // Non-zero once an admin has disabled the account (security audit H1).
+    // Disabling used to blank password_hash and nothing else; the flag is
+    // what every credential lookup now checks, and it is reversible.
+    int64_t disabled_at = 0;
+
+    bool disabled() const { return disabled_at != 0; }
 };
 
 struct OAuthClient {
     std::string client_id;
+    // Plaintext when handed to create_oauth_client(); the store keeps only
+    // "sha256$<hex>" (crypto/Secrets.h), and that is what reads return. Empty
+    // means a public client.
     std::string client_secret;
     std::string name;
     std::string redirect_uris; // JSON array stored as text
@@ -48,11 +57,30 @@ struct AuthCode {
 };
 
 struct RefreshToken {
+    // The bearer value on write and lookup; SHA-256 of it at rest, and in
+    // anything read back from the store.
     std::string token;
     std::string client_id;
     std::string account_id;
     std::string scope;
     int64_t expires_at = 0;
+    // Every token rotated out of one authorization-code grant shares a family
+    // (security audit H4 / L4). The family is what the user sees and revokes
+    // in the portal, what a replayed token kills, and what carries the
+    // absolute expiry that rotation cannot extend.
+    std::string family_id;
+    int64_t family_expires_at = 0;
+    int64_t created_at = 0;
+    // Non-zero once this token has been exchanged for its successor. The row
+    // is kept until it expires so a second presentation is recognised as a
+    // replay rather than as an unknown token.
+    int64_t replaced_at = 0;
+};
+
+enum class RotateResult {
+    Rotated,  // old token retired, replacement stored
+    Reused,   // old token had already been rotated: the family was revoked
+    Invalid,  // unknown, expired, or its account is disabled
 };
 
 // Credential kinds stored in the `sessions` table. Browser session cookies and
@@ -64,6 +92,8 @@ inline constexpr const char* kOidcAccess = "oidc_access";
 } // namespace token_type
 
 struct Session {
+    // The bearer value on write and lookup. The table stores SHA-256 of it
+    // (security audit L5), so rows read back carry the hash, not the token.
     std::string session_id;
     std::string account_id;
     int64_t created_at = 0;
@@ -117,7 +147,25 @@ public:
     bool update_account(const Account& account);
     bool update_password_hash(const std::string& id, const std::string& password_hash);
     std::vector<Account> list_accounts(int limit = 100, int offset = 0);
+    // Marks the account disabled and, in the same transaction, deletes every
+    // credential it holds: browser sessions, access tokens, refresh tokens,
+    // pending auth codes, consent requests and 2FA login tokens. False when
+    // the account does not exist.
     bool disable_account(const std::string& id);
+    bool enable_account(const std::string& id);
+    // Account id whose username_skeleton equals `skeleton`, if any.
+    std::optional<std::string> find_account_by_username_skeleton(const std::string& skeleton);
+    // True when another account (not `except_account_id`) already uses `email`.
+    bool email_in_use(const std::string& email, const std::string& except_account_id = "");
+
+    // Ends everything an account is signed in with except the browser session
+    // `keep_session_id` (raw value; may be empty to keep nothing): sessions,
+    // access tokens, refresh tokens, auth codes, consent requests and login
+    // tokens. Returns the number of browser sessions and refresh-token
+    // families ended. Used on password change, 2FA changes and "sign out
+    // everywhere" (security audit H4).
+    int revoke_account_credentials(const std::string& account_id,
+                                   const std::string& keep_session_id = "");
 
     // OAuth clients
     bool create_oauth_client(const OAuthClient& client);
@@ -136,8 +184,20 @@ public:
 
     // Refresh tokens
     bool store_refresh_token(const RefreshToken& token);
+    // Includes rotated-out rows (replaced_at != 0) so the caller can see a
+    // replay; excludes tokens whose account is disabled.
     std::optional<RefreshToken> get_refresh_token(const std::string& token);
     void delete_refresh_token(const std::string& token);
+    // Retires `old_token` and stores `replacement` in one transaction, so two
+    // concurrent refreshes of one token cannot both succeed and fork it
+    // (security audit L4). Presenting a token that was already rotated
+    // revokes its whole family: one of the two presenters is not the client.
+    RotateResult rotate_refresh_token(const std::string& old_token, const RefreshToken& replacement);
+    // Deletes the family `token` belongs to (RFC 7009 revocation).
+    void revoke_refresh_token_family(const std::string& token);
+    // The live token of each family, newest first.
+    std::vector<RefreshToken> list_refresh_tokens_for_account(const std::string& account_id);
+    bool delete_refresh_family(const std::string& account_id, const std::string& family_id);
 
     // Sessions / access tokens
     bool create_session(const Session& session);
@@ -149,6 +209,9 @@ public:
     // OIDC access tokens only — never valid as a portal credential.
     std::optional<Session> get_oidc_access_token(const std::string& token);
     void delete_session(const std::string& session_id);
+    // Deletes by the value stored in the table (the hash, as returned by
+    // list_sessions_for_account), scoped to the owning account.
+    bool delete_stored_session(const std::string& account_id, const std::string& stored_id);
     void delete_expired_sessions();
     // Browser sessions only; access tokens are not user-visible "sessions".
     std::vector<Session> list_sessions_for_account(const std::string& account_id);
@@ -161,6 +224,10 @@ public:
     std::optional<TotpInfo> get_totp(const std::string& account_id);
     void enable_totp(const std::string& account_id);
     void disable_totp(const std::string& account_id);
+    // Records `step` as the account's last accepted TOTP time-step, only if
+    // it is later than the one already recorded. False means the step (or a
+    // later one) was already used: the code is a replay (security audit M2).
+    bool accept_totp_step(const std::string& account_id, uint64_t step);
     // Verifies and consumes a single backup code atomically (one transaction),
     // so the same code cannot be redeemed twice by concurrent requests.
     bool consume_backup_code(const std::string& account_id, const std::string& code);
@@ -209,6 +276,7 @@ private:
     // install. Must be called with mutex_ held.
     void migrate_locked();
     bool has_column_locked(const std::string& table, const std::string& column);
+    int revoke_credentials_locked(const std::string& account_id, const std::string& keep_hash);
 
     sqlite3* db_ = nullptr;
     std::mutex mutex_;

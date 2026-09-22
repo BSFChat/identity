@@ -515,3 +515,44 @@ TEST_F(TokenAudienceTest, M5_OtherClientsCannotRewriteTheServerList) {
         EXPECT_NE(s.server_url, "https://evil.example");
     }
 }
+
+// ---------------------------------------------------------------------------
+// M5 + H3, once both were on one branch: the writes on /api/servers take the
+// same JSON/cross-site check as every other state-changing endpoint. A cookie
+// is the credential a third-party page can make the browser attach, so the
+// browser-session half of M5's rule needs it; the desktop client (bearer,
+// JSON, no Origin, no Sec-Fetch-Site) is unaffected.
+// ---------------------------------------------------------------------------
+TEST_F(TokenAudienceTest, ServerListWritesRefuseCrossSiteBrowserRequests) {
+    auto post = [&](const std::string& content_type, const Params& headers,
+                    bool remove = false, const std::string& bearer = "") {
+        httplib::Request req;
+        req.method = "POST";
+        req.remote_addr = "10.0.0.1";
+        if (bearer.empty()) req.set_header("Cookie", "session=" + browser_session);
+        else req.set_header("Authorization", "Bearer " + bearer);
+        req.set_header("Content-Type", content_type);
+        for (const auto& [k, v] : headers) req.set_header(k, v);
+        req.body = json{{"server_url", "https://planted.example"}}.dump();
+        httplib::Response res;
+        if (remove) accounts->handle_remove_server(req, res);
+        else accounts->handle_add_server(req, res);
+        return status_of(res);
+    };
+
+    EXPECT_EQ(post("application/json", {{"Sec-Fetch-Site", "cross-site"}}), 403);
+    EXPECT_EQ(post("application/json", {{"Origin", "https://evil.example"}}), 403);
+    EXPECT_EQ(post("text/plain", {}), 415);  // a simple-request form post
+    EXPECT_TRUE(store->list_server_memberships("acct-1").empty());
+
+    // The portal itself, same-origin.
+    EXPECT_EQ(post("application/json", {{"Sec-Fetch-Site", "same-origin"}}), 200);
+    EXPECT_EQ(post("application/json", {{"Origin", "https://id.example"}, {"Sec-Fetch-Site", "cross-site"}},
+                   /*remove=*/true), 403);
+    ASSERT_EQ(store->list_server_memberships("acct-1").size(), 1u);
+
+    // The desktop client, exactly as IdentityApiClient sends it.
+    auto desktop_token = desktop_login()["access_token"].get<std::string>();
+    EXPECT_EQ(post("application/json", {}, /*remove=*/true, desktop_token), 200);
+    EXPECT_TRUE(store->list_server_memberships("acct-1").empty());
+}

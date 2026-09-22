@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -14,6 +15,12 @@ std::string compute_totp(const std::string& base32_secret, uint64_t time_step);
 
 // Verify a TOTP code against the current time with a +/- window tolerance.
 bool verify_totp(const std::string& base32_secret, const std::string& code, int window = 1);
+
+// As verify_totp, but returns the time-step the code matched, so the caller
+// can refuse a step it has already accepted (a code is otherwise replayable
+// for as long as the window lasts, about 90 seconds).
+std::optional<uint64_t> verify_totp_step(const std::string& base32_secret, const std::string& code,
+                                         int window = 1);
 
 // Build an otpauth:// provisioning URI for QR code generation.
 std::string totp_provisioning_uri(const std::string& secret, const std::string& username, const std::string& issuer);

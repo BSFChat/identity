@@ -2,13 +2,14 @@
 #include "core/Version.h"
 #include "core/Logger.h"
 #include "core/WebUtil.h"
+#include "crypto/Secrets.h"
 
 #include <bsfchat/Identifiers.h>
 #include <bsfchat/JwtUtils.h>
 #include <nlohmann/json.hpp>
-#include <openssl/rand.h>
 #include <openssl/sha.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <iomanip>
@@ -26,13 +27,10 @@ int64_t now_seconds() {
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+// Checked CSPRNG (crypto/Secrets.h): an unchecked RAND_bytes failure used to
+// leave the zero-initialised buffer as the token (security audit L3).
 std::string random_hex(int bytes) {
-    std::vector<unsigned char> buf(bytes);
-    RAND_bytes(buf.data(), bytes);
-    std::ostringstream ss;
-    ss << std::hex << std::setfill('0');
-    for (auto b : buf) ss << std::setw(2) << static_cast<int>(b);
-    return ss.str();
+    return secure_random_hex(static_cast<size_t>(bytes));
 }
 
 std::string base64url_encode_local(const unsigned char* data, size_t len) {
@@ -557,7 +555,8 @@ OidcHandler::ClientAuthResult OidcHandler::authenticate_client(const std::string
         result.description = "Client authentication required";
         return result;
     }
-    if (!constant_time_equals(client->client_secret, presented_secret)) {
+    // The store keeps only a digest of the secret (security audit L5).
+    if (!client_secret_matches(client->client_secret, presented_secret)) {
         result.error = "invalid_client";
         result.description = "Client authentication failed";
         return result;
@@ -719,7 +718,7 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
 
         // Get account
         auto account = store_.get_account_by_id(auth_code->account_id);
-        if (!account) {
+        if (!account || account->disabled()) {
             oauth_error(res, 400, "invalid_grant", "Account no longer exists");
             return;
         }
@@ -744,13 +743,18 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
         access_session.client_id = auth_code->client_id;
         store_.create_session(access_session);
 
-        // Store refresh token
+        // Store refresh token: the first of a new family, whose absolute
+        // expiry no later rotation can move (security audit H4).
         RefreshToken rt;
         rt.token = refresh_token;
         rt.client_id = auth_code->client_id;
         rt.account_id = account->id;
         rt.scope = auth_code->scope;
-        rt.expires_at = now + 86400 * 30; // 30 days
+        rt.family_id = random_hex(16);
+        rt.family_expires_at = now + int64_t{86400} * config_.refresh_token_max_lifetime_days;
+        rt.expires_at = std::min(now + int64_t{86400} * config_.refresh_token_idle_days,
+                                 rt.family_expires_at);
+        rt.created_at = now;
         store_.store_refresh_token(rt);
 
         json response = {
@@ -771,6 +775,7 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
             return;
         }
 
+        // A disabled account's tokens are filtered out by the store (H1).
         auto rt = store_.get_refresh_token(refresh_token_str);
         if (!rt) {
             oauth_error(res, 400, "invalid_grant", "Invalid refresh token");
@@ -790,33 +795,49 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
             return;
         }
 
-        if (rt->expires_at < now_seconds()) {
-            store_.delete_refresh_token(refresh_token_str);
-            oauth_error(res, 400, "invalid_grant", "Refresh token expired");
-            return;
-        }
-
         auto account = store_.get_account_by_id(rt->account_id);
-        if (!account) {
+        if (!account || account->disabled()) {
             store_.delete_refresh_token(refresh_token_str);
             oauth_error(res, 400, "invalid_grant", "Account no longer exists");
             return;
         }
 
+        // Rotate first, atomically (security audit L4): the old token is
+        // retired and its successor stored in one transaction, and nothing is
+        // minted unless that succeeded. Expiry (idle and absolute) and replay
+        // of an already-rotated token are decided inside the same transaction.
+        auto new_refresh_token = random_hex(32);
+        auto now = now_seconds();
+        RefreshToken new_rt;
+        new_rt.token = new_refresh_token;
+        new_rt.expires_at = now + int64_t{86400} * config_.refresh_token_idle_days;
+        switch (store_.rotate_refresh_token(refresh_token_str, new_rt)) {
+            case RotateResult::Rotated:
+                break;
+            case RotateResult::Reused:
+                log->warn("Refresh token replayed for account {} (client {}); its grant was revoked",
+                          rt->account_id, rt->client_id);
+                oauth_error(res, 400, "invalid_grant", "Refresh token already used");
+                return;
+            case RotateResult::Invalid:
+                oauth_error(res, 400, "invalid_grant", "Refresh token expired");
+                return;
+        }
+
         // Generate new tokens.
         //
         // The id_token minted here names no chat server: a refresh token is
-        // not bound to one (it would take a schema change to the refresh
-        // token rows, and the desktop client never uses this path for a
+        // not bound to one (the refresh token rows carry a family, not a
+        // resource, and the desktop client never uses this path for a
         // sign-in — it runs a fresh authorization per server). So it gets the
         // legacy client_id audience, which no upgraded chat server accepts.
         // A refresh token therefore cannot be turned into a sign-in anywhere
         // that has the C1 fix, which is the safe direction to be wrong in.
+        // Claims still follow the scope the grant was given (M4), and there
+        // is no nonce: that belongs to an authorization request, and a
+        // refresh is not one.
         auto access_token = create_access_token();
         auto id_token = create_id_token(*account, rt->client_id, rt->scope, "", "");
-        auto new_refresh_token = random_hex(32);
-
-        auto now = now_seconds();
 
         Session access_session;
         access_session.session_id = access_token;
@@ -827,16 +848,6 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
         access_session.scope = rt->scope;
         access_session.client_id = rt->client_id;
         store_.create_session(access_session);
-
-        // Rotate refresh token
-        store_.delete_refresh_token(refresh_token_str);
-        RefreshToken new_rt;
-        new_rt.token = new_refresh_token;
-        new_rt.client_id = rt->client_id;
-        new_rt.account_id = rt->account_id;
-        new_rt.scope = rt->scope;
-        new_rt.expires_at = now + 86400 * 30;
-        store_.store_refresh_token(new_rt);
 
         json response = {
             {"access_token", access_token},
@@ -932,8 +943,9 @@ void OidcHandler::handle_revoke(const httplib::Request& req, httplib::Response& 
         return;
     }
 
-    // Try to delete as refresh token.
-    store_.delete_refresh_token(token);
+    // Try to delete as refresh token — with every token rotated out of the
+    // same grant, so revoking the current one cannot leave a sibling alive.
+    store_.revoke_refresh_token_family(token);
     // Also try to delete as an OIDC access token. Restricted to that credential
     // kind so this unauthenticated endpoint cannot be used to destroy browser
     // sessions.

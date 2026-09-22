@@ -10,6 +10,7 @@
 #include "core/Config.h"
 #include "core/WebUtil.h"
 #include "crypto/PasswordHash.h"
+#include "crypto/Secrets.h"
 #include "crypto/Totp.h"
 #include "store/IdentityStore.h"
 #include "TempPaths.h"
@@ -769,7 +770,8 @@ TEST_F(TokenSeparationTest, AccessTokensAreNotListedAsBrowserSessions) {
     mint_access_token();
     auto sessions = store->list_sessions_for_account("acct-1");
     ASSERT_EQ(sessions.size(), 1u);
-    EXPECT_EQ(sessions[0].session_id, browser_session);
+    // Rows carry the stored digest, not the bearer value (security audit L5).
+    EXPECT_EQ(sessions[0].session_id, hash_token(browser_session));
 }
 
 TEST_F(AuthFlowTest, CookieParsingIsAnchoredToTheName) {
@@ -1064,7 +1066,7 @@ TEST(SchemaMigrationTest, UpgradesAPreExistingDatabaseInPlace) {
         // Only the browser session is listed to the user.
         auto sessions = store.list_sessions_for_account("old-1");
         ASSERT_EQ(sessions.size(), 1u);
-        EXPECT_EQ(sessions[0].session_id, "old-browser");
+        EXPECT_EQ(sessions[0].session_id, hash_token("old-browser"));
 
         // Backup codes were hashed in place but still redeem.
         auto totp = store.get_totp("old-1");

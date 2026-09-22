@@ -26,11 +26,51 @@ password_hash_iterations = 600000
 cookie_secure = true
 
 # Anti-bruteforce controls for /api/login and /api/login/2fa.
-login_rate_limit = 10        # requests per window, per source address
+#
+# "Per client" below means the address resolved through trusted_proxies. There
+# is no per-address LOCKOUT: failures lock out one (client, username) pair, and
+# an account locks for everyone only after 4 x login_max_failures failures from
+# several addresses, or login_max_failures wrong second-factor codes (which
+# only someone with the password can cause).
+login_rate_limit = 10        # requests per window, per client
 login_rate_window = 300      # seconds
-login_max_failures = 8       # consecutive failures before a temporary lockout
+login_max_failures = 8       # failures per (client, username) before a lockout
 login_lockout_seconds = 900
 totp_max_attempts = 5        # wrong 2FA codes before the login token is burned
+
+# Reverse proxies whose X-Forwarded-For is believed. Same meaning as the chat
+# server's [auth] trusted_proxies.
+#
+# Behind a proxy the TCP peer is the proxy for EVERY request. With this unset,
+# the header is ignored and every user shares one rate-limit bucket: the
+# service logs "carry X-Forwarded-For, but that network is not in [auth]
+# trusted_proxies" once a minute to tell you. It never believes the header
+# from a peer that is not listed here.
+#
+# The default is empty: trust nothing, not even loopback.
+#
+# Behind the shipped deploy (nginx on the host, the service in Docker), the
+# peer is the Docker bridge gateway, so list the bridge range:
+#
+#   trusted_proxies = ["172.16.0.0/12"]
+#
+# With a CDN in front of nginx, resolve the real client IN NGINX (the
+# set_real_ip_from / real_ip_header CF-Connecting-IP block in the deploy
+# repo's nginx template) and keep this list at the bridge range. Only if you
+# cannot do that, list the CDN's published ranges under trusted_public_proxies
+# with a reason; public ranges anywhere else draw a startup warning, because
+# every client inside a trusted range chooses its own rate-limit identity.
+#
+# trusted_proxies = []
+# trusted_public_proxies = []
+# trusted_public_proxies_reason = ""
+
+# OAuth refresh tokens (the desktop client's "stay signed in"). Each use
+# rotates the token and extends it by the idle lifetime, but never past the
+# absolute lifetime of the original sign-in, after which the app must sign in
+# again.
+refresh_token_idle_days = 30
+refresh_token_max_lifetime_days = 90
 
 [housekeeping]
 # How often expired sessions, auth codes, login tokens, consent requests and

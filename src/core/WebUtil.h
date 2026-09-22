@@ -2,6 +2,8 @@
 
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace bsfchat::id {
 
@@ -55,6 +57,34 @@ bool is_loopback_host(const std::string& host);
 //     the same scheme, a loopback host, the same path and query, and ANY port.
 // Everything else is rejected. Fragments are never allowed on a presented URI.
 bool redirect_uri_matches(const std::string& registered, const std::string& presented);
+
+// "scheme://host[:port]" as a browser would send it in an Origin header:
+// lowercased, IPv6 bracketed, and the port dropped when it is the scheme's
+// default. Empty for an invalid URI.
+std::string uri_origin(const ParsedUri& uri);
+
+// ---------------------------------------------------------------------------
+// Request hygiene
+// ---------------------------------------------------------------------------
+
+// True when a Content-Type header value names application/json (parameters
+// such as charset are ignored, case is not significant).
+bool is_json_content_type(const std::string& content_type);
+
+// Headers every response carries (security audit L7), applied by the server's
+// post-routing handler without overwriting anything a handler set itself —
+// the consent page sets its own CSP.
+//
+// script-src is 'self' with no 'unsafe-inline': the pages no longer contain
+// inline script or inline event handlers, so an injected <script> or
+// onclick= (M1) does not run even if some future escaping mistake lets one
+// through. style-src keeps 'unsafe-inline' because the pages use style=""
+// attributes; injected CSS is a far smaller risk and not worth rewriting
+// every page for. img-src allows data: for the 2FA QR code, which
+// qrcode.min.js renders into a data: URL. form-action is deliberately NOT
+// set: browsers apply it to the redirect after a form POST, which would break
+// the consent page's redirect to the desktop client's loopback URI.
+const std::vector<std::pair<std::string, std::string>>& default_security_headers();
 
 // ---------------------------------------------------------------------------
 // Cookies
