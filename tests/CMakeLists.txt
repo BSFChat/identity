@@ -74,3 +74,38 @@ else()
     message(STATUS "python3 not found - skipping the channel_tags test "
                    "(CI always has it; this only affects local ctest runs)")
 endif()
+
+# --- security audit proof tests ----------------------------------------------
+#
+# docs/security-audit-2026-09.md. Each test asserts the behaviour the service
+# should have and FAILS on the audited revision; the failure is the proof.
+# Deliberately NOT registered with ctest (no gtest_discover_tests), so the
+# regular suite and CI stay green while the findings are open. Run by hand:
+#   ./build/tests/identity_security_audit_tests
+add_executable(identity_security_audit_tests
+    test_security_audit.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/Logger.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/Config.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/RateLimiter.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/WebUtil.cpp
+    ${CMAKE_SOURCE_DIR}/src/crypto/KeyManager.cpp
+    ${CMAKE_SOURCE_DIR}/src/crypto/PasswordHash.cpp
+    ${CMAKE_SOURCE_DIR}/src/crypto/Totp.cpp
+    ${CMAKE_SOURCE_DIR}/src/store/IdentityStore.cpp
+    ${CMAKE_SOURCE_DIR}/src/api/AccountHandler.cpp
+    ${CMAKE_SOURCE_DIR}/src/api/OidcHandler.cpp
+)
+target_include_directories(identity_security_audit_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(identity_security_audit_tests PRIVATE
+    bsfchat_protocol
+    httplib::httplib
+    spdlog::spdlog
+    tomlplusplus::tomlplusplus
+    SQLite::SQLite3
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    GTest::gtest_main
+)
