@@ -16,6 +16,7 @@ struct AuthContext {
     std::string credential_id;
     std::string token_type;
     std::string scope;
+    std::string client_id;    // OAuth client an access token was issued to; empty for a browser session
 
     bool authenticated() const { return !account_id.empty(); }
     bool is_browser_session() const { return token_type == token_type::kBrowserSession; }

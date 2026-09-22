@@ -15,6 +15,7 @@ add_executable(identity_tests
     test_oidc.cpp
     test_accounts.cpp
     test_auth_flows.cpp
+    test_token_audience.cpp
     test_version.cpp
 )
 

@@ -12,7 +12,7 @@ namespace bsfchat::id {
 namespace {
 
 // Bump when a new migration step is appended to migrate_locked().
-constexpr int kSchemaVersion = 1;
+constexpr int kSchemaVersion = 2;
 
 // Backup codes carry ~47 bits of entropy and are checked one at a time against
 // at most a handful of stored hashes, so a lighter KDF than the password one is
@@ -143,7 +143,9 @@ void IdentityStore::initialize() {
             redirect_uri TEXT NOT NULL,
             scope TEXT,
             code_challenge TEXT,
-            expires_at INTEGER NOT NULL
+            expires_at INTEGER NOT NULL,
+            resource TEXT NOT NULL DEFAULT '',
+            nonce TEXT NOT NULL DEFAULT ''
         )
     )");
 
@@ -208,7 +210,9 @@ void IdentityStore::initialize() {
             scope          TEXT NOT NULL DEFAULT '',
             state          TEXT NOT NULL DEFAULT '',
             code_challenge TEXT NOT NULL DEFAULT '',
-            expires_at     INTEGER NOT NULL
+            expires_at     INTEGER NOT NULL,
+            resource       TEXT NOT NULL DEFAULT '',
+            nonce          TEXT NOT NULL DEFAULT ''
         )
     )");
 
@@ -243,7 +247,7 @@ void IdentityStore::migrate_locked() {
     // converges instead of throwing from prepare() on a missing column.
 
     // --- v1: separate credential kinds, and count 2FA attempts -------------
-    if (version < kSchemaVersion) {
+    if (version < 1) {
         if (!has_column_locked("sessions", "token_type")) {
             exec("ALTER TABLE sessions ADD COLUMN token_type TEXT NOT NULL DEFAULT 'session'");
             // Pre-existing rows are indistinguishable by name, but not by
@@ -298,7 +302,32 @@ void IdentityStore::migrate_locked() {
             sqlite3_step(upd.get());
             log->info("Schema migration: hashed backup codes for account {}", account_id);
         }
+    }
 
+    // --- v2: bind a grant to the chat server it is for, and carry a nonce ---
+    //
+    // Identity audit 2026-09, finding C1: every id_token was audienced to the
+    // desktop client_id, so one token signed its holder in at EVERY chat
+    // server. The authorization request now names the server (RFC 8707
+    // `resource`) and the id_token is audienced to it; both rows that carry
+    // a grant from /authorize to /token have to carry that, and the nonce.
+    // Both tables hold rows that live five minutes, so nothing is backfilled:
+    // a pending grant from before the upgrade simply has no resource, and
+    // gets the legacy audience that upgraded chat servers refuse.
+    if (version < 2) {
+        for (const char* table : {"auth_codes", "consent_requests"}) {
+            if (!has_column_locked(table, "resource")) {
+                exec(std::string("ALTER TABLE ") + table +
+                     " ADD COLUMN resource TEXT NOT NULL DEFAULT ''");
+            }
+            if (!has_column_locked(table, "nonce")) {
+                exec(std::string("ALTER TABLE ") + table +
+                     " ADD COLUMN nonce TEXT NOT NULL DEFAULT ''");
+            }
+        }
+    }
+
+    if (version < kSchemaVersion) {
         exec("PRAGMA user_version = " + std::to_string(kSchemaVersion));
         log->info("Identity database schema migrated to version {}", kSchemaVersion);
     }
@@ -495,8 +524,8 @@ bool IdentityStore::update_oauth_client_redirect_uris(const std::string& client_
 bool IdentityStore::store_auth_code(const AuthCode& code) {
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_,
-        "INSERT INTO auth_codes (code, client_id, account_id, redirect_uri, scope, code_challenge, expires_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)");
+        "INSERT INTO auth_codes (code, client_id, account_id, redirect_uri, scope, code_challenge, expires_at, "
+        "resource, nonce) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
     sqlite3_bind_text(stmt.get(), 1, code.code.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 2, code.client_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 3, code.account_id.c_str(), -1, SQLITE_TRANSIENT);
@@ -504,14 +533,16 @@ bool IdentityStore::store_auth_code(const AuthCode& code) {
     sqlite3_bind_text(stmt.get(), 5, code.scope.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 6, code.code_challenge.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt.get(), 7, code.expires_at);
+    bind_text(stmt.get(), 8, code.resource);
+    bind_text(stmt.get(), 9, code.nonce);
     return sqlite3_step(stmt.get()) == SQLITE_DONE;
 }
 
 std::optional<AuthCode> IdentityStore::get_auth_code(const std::string& code) {
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_,
-        "SELECT code, client_id, account_id, redirect_uri, scope, code_challenge, expires_at "
-        "FROM auth_codes WHERE code = ?");
+        "SELECT code, client_id, account_id, redirect_uri, scope, code_challenge, expires_at, "
+        "resource, nonce FROM auth_codes WHERE code = ?");
     sqlite3_bind_text(stmt.get(), 1, code.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
         AuthCode ac;
@@ -522,6 +553,8 @@ std::optional<AuthCode> IdentityStore::get_auth_code(const std::string& code) {
         ac.scope = col_text(stmt.get(), 4);
         ac.code_challenge = col_text(stmt.get(), 5);
         ac.expires_at = sqlite3_column_int64(stmt.get(), 6);
+        ac.resource = col_text(stmt.get(), 7);
+        ac.nonce = col_text(stmt.get(), 8);
         return ac;
     }
     return std::nullopt;
@@ -541,8 +574,8 @@ std::optional<AuthCode> IdentityStore::consume_auth_code(const std::string& code
     std::optional<AuthCode> result;
     {
         auto stmt = prepare(db_,
-            "SELECT code, client_id, account_id, redirect_uri, scope, code_challenge, expires_at "
-            "FROM auth_codes WHERE code = ?");
+            "SELECT code, client_id, account_id, redirect_uri, scope, code_challenge, expires_at, "
+            "resource, nonce FROM auth_codes WHERE code = ?");
         bind_text(stmt.get(), 1, code);
         if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
             AuthCode ac;
@@ -553,6 +586,8 @@ std::optional<AuthCode> IdentityStore::consume_auth_code(const std::string& code
             ac.scope = col_text(stmt.get(), 4);
             ac.code_challenge = col_text(stmt.get(), 5);
             ac.expires_at = sqlite3_column_int64(stmt.get(), 6);
+        ac.resource = col_text(stmt.get(), 7);
+        ac.nonce = col_text(stmt.get(), 8);
             result = std::move(ac);
         }
     }
@@ -898,8 +933,8 @@ bool IdentityStore::store_consent_request(const ConsentRequest& request) {
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_,
         "INSERT INTO consent_requests "
-        "(token, session_id, account_id, client_id, redirect_uri, scope, state, code_challenge, expires_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        "(token, session_id, account_id, client_id, redirect_uri, scope, state, code_challenge, expires_at, "
+        "resource, nonce) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     bind_text(stmt.get(), 1, request.token);
     bind_text(stmt.get(), 2, request.session_id);
     bind_text(stmt.get(), 3, request.account_id);
@@ -909,6 +944,8 @@ bool IdentityStore::store_consent_request(const ConsentRequest& request) {
     bind_text(stmt.get(), 7, request.state);
     bind_text(stmt.get(), 8, request.code_challenge);
     sqlite3_bind_int64(stmt.get(), 9, request.expires_at);
+    bind_text(stmt.get(), 10, request.resource);
+    bind_text(stmt.get(), 11, request.nonce);
     return sqlite3_step(stmt.get()) == SQLITE_DONE;
 }
 
@@ -924,8 +961,8 @@ std::optional<ConsentRequest> IdentityStore::consume_consent_request(const std::
         // Matching the session in SQL means a decision posted from any other
         // session simply finds nothing, and deletes nothing.
         auto stmt = prepare(db_,
-            "SELECT token, session_id, account_id, client_id, redirect_uri, scope, state, code_challenge, expires_at "
-            "FROM consent_requests WHERE token = ? AND session_id = ?");
+            "SELECT token, session_id, account_id, client_id, redirect_uri, scope, state, code_challenge, expires_at, "
+            "resource, nonce FROM consent_requests WHERE token = ? AND session_id = ?");
         bind_text(stmt.get(), 1, token);
         bind_text(stmt.get(), 2, session_id);
         if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
@@ -939,6 +976,8 @@ std::optional<ConsentRequest> IdentityStore::consume_consent_request(const std::
             r.state = col_text(stmt.get(), 6);
             r.code_challenge = col_text(stmt.get(), 7);
             r.expires_at = sqlite3_column_int64(stmt.get(), 8);
+            r.resource = col_text(stmt.get(), 9);
+            r.nonce = col_text(stmt.get(), 10);
             result = std::move(r);
         }
     }

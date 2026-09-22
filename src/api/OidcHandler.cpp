@@ -4,6 +4,7 @@
 #include "core/WebUtil.h"
 
 #include <bsfchat/Identifiers.h>
+#include <bsfchat/JwtUtils.h>
 #include <nlohmann/json.hpp>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
@@ -144,6 +145,35 @@ void redirect_with_error(httplib::Response& res, const std::string& redirect_uri
     res.set_redirect(location);
 }
 
+// id_token lifetime. The token is presented exactly once, to the chat server
+// named in its `aud`, seconds after it is minted; an hour of validity was an
+// hour in which a copy of it was a sign-in credential. Five minutes covers
+// clock skew and a slow sign-in without leaving a long replay window.
+constexpr int64_t kIdTokenLifetimeSeconds = 300;
+
+// OIDC nonce bounds. It is opaque to us, but it is echoed into a signed token
+// and round-tripped through the login page's query string, so it is held to
+// printable ASCII and a length no honest client needs to exceed.
+constexpr size_t kMaxNonceLength = 256;
+
+bool nonce_acceptable(const std::string& nonce) {
+    if (nonce.size() > kMaxNonceLength) return false;
+    for (char c : nonce) {
+        if (c < 0x21 || c > 0x7e) return false;
+    }
+    return true;
+}
+
+// The host (and port, if not the default) of a canonical audience URL, for
+// the consent page. The full URL is shown underneath; this is the part a
+// person can recognise at a glance.
+std::string audience_display_host(const std::string& canonical) {
+    auto start = canonical.find("://");
+    if (start == std::string::npos) return canonical;
+    start += 3;
+    return canonical.substr(start, canonical.find('/', start) - start);
+}
+
 } // namespace
 
 OidcHandler::OidcHandler(IdentityStore& store, KeyManager& key_manager,
@@ -193,6 +223,7 @@ void OidcHandler::handle_authorize(const httplib::Request& req, httplib::Respons
     auto state = req.get_param_value("state");
     auto code_challenge = req.get_param_value("code_challenge");
     auto code_challenge_method = req.get_param_value("code_challenge_method");
+    auto nonce = req.get_param_value("nonce");
 
     if (client_id.empty() || redirect_uri.empty()) {
         json_error(res, 400, "client_id and redirect_uri are required");
@@ -256,6 +287,47 @@ void OidcHandler::handle_authorize(const httplib::Request& req, httplib::Respons
         return;
     }
 
+    // RFC 8707 resource indicator: the chat server this sign-in is for.
+    //
+    // Identity audit 2026-09, finding C1. Every id_token used to carry
+    // aud=<client_id>, and every chat server checked for that same value, so a
+    // token handed to one server signed its holder in at all of them. A
+    // hostile server received each user's token at sign-in and could replay
+    // it against chat.bsfchat.com — and, through link_identity, attach the
+    // victim's identity to the attacker's account there permanently.
+    //
+    // The client now names the server it is connecting to, we put exactly
+    // that into `aud`, and each server accepts only its own URL. The CLIENT
+    // decides this value from the address it will post the token to; nothing
+    // a chat server says reaches it, so a hostile server cannot ask for a
+    // token audienced to somebody else's.
+    //
+    // One resource, no more. RFC 8707 allows several, but a token good at two
+    // servers is the bug this closes. Canonicalised with the same function
+    // the chat server applies to its own URL, and held to https (or http on
+    // loopback, for development): an http audience would be a credential
+    // that crosses the network in clear text on every sign-in.
+    //
+    // Absent: the token gets the legacy client_id audience, as before. Old
+    // clients keep working against old servers, and upgraded servers refuse
+    // that audience, which is the point — see create_id_token.
+    std::string resource;
+    if (req.has_param("resource")) {
+        auto canonical = req.get_param_value_count("resource") == 1
+            ? bsfchat::canonical_audience_url(req.get_param_value("resource"))
+            : std::nullopt;
+        if (!canonical || !bsfchat::audience_url_is_secure(*canonical)) {
+            redirect_with_error(res, redirect_uri, "invalid_target", state);
+            return;
+        }
+        resource = *canonical;
+    }
+
+    if (!nonce_acceptable(nonce)) {
+        redirect_with_error(res, redirect_uri, "invalid_request", state);
+        return;
+    }
+
     // Check if user is logged in (has session cookie)
     auto account_id = account_handler_.get_session_account(req);
     if (account_id.empty()) {
@@ -272,6 +344,10 @@ void OidcHandler::handle_authorize(const httplib::Request& req, httplib::Respons
             append_query_param(login_url, "code_challenge", code_challenge);
             append_query_param(login_url, "code_challenge_method", "S256");
         }
+        // Dropping either of these on the way through the login page would
+        // quietly turn a server-bound sign-in back into a legacy one.
+        if (!resource.empty()) append_query_param(login_url, "resource", resource);
+        if (!nonce.empty()) append_query_param(login_url, "nonce", nonce);
         res.set_redirect(login_url);
         return;
     }
@@ -300,19 +376,22 @@ void OidcHandler::handle_authorize(const httplib::Request& req, httplib::Respons
     consent.state = state;
     consent.code_challenge = code_challenge;
     consent.expires_at = now_seconds() + 300; // 5 minutes
+    consent.resource = resource;
+    consent.nonce = nonce;
 
     if (consent.session_id.empty() || !store_.store_consent_request(consent)) {
         json_error(res, 500, "Failed to start authorization");
         return;
     }
 
-    render_consent_page(res, *client, *account, scope, consent_token, redirect_uri);
+    render_consent_page(res, *client, *account, scope, consent_token, redirect_uri, resource);
 }
 
 void OidcHandler::render_consent_page(httplib::Response& res, const OAuthClient& client,
                                       const Account& account, const std::string& scope,
                                       const std::string& consent_token,
-                                      const std::string& redirect_uri) {
+                                      const std::string& redirect_uri,
+                                      const std::string& resource) {
     std::ostringstream scopes_html;
     std::istringstream scope_stream(scope);
     std::string token;
@@ -327,6 +406,22 @@ void OidcHandler::render_consent_page(httplib::Response& res, const OAuthClient&
         scopes_html << "<li>Confirm your identity</li>";
     }
 
+    // Name the chat server. Before C1 was fixed this page could not say which
+    // server a sign-in was for, because nothing in the request said so; now
+    // that the token is only good at one server, the person approving it
+    // should see which. Host first, in bold, because that is what they will
+    // recognise; the full URL underneath for anyone who wants to check.
+    std::ostringstream target_html;
+    if (!resource.empty()) {
+        target_html << " to <strong>" << html_escape(audience_display_host(resource))
+                    << "</strong>";
+    }
+    std::ostringstream server_html;
+    if (!resource.empty()) {
+        server_html << "<p style=\"color:var(--text-muted);font-size:13px;word-break:break-all;\">"
+                    << "Chat server: " << html_escape(resource) << "</p>";
+    }
+
     std::ostringstream html;
     html << "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
          << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
@@ -336,9 +431,10 @@ void OidcHandler::render_consent_page(httplib::Response& res, const OAuthClient&
          << "<div class=\"logo\"><h1>BSFChat ID</h1>"
          << "<p class=\"subtitle\">Authorize application</p></div>"
          << "<p><strong>" << html_escape(client.name.empty() ? client.client_id : client.name)
-         << "</strong> wants to sign you in as <strong>"
+         << "</strong> wants to sign you in" << target_html.str() << " as <strong>"
          << html_escape(account.username) << "</strong> and access:</p>"
          << "<ul>" << scopes_html.str() << "</ul>"
+         << server_html.str()
          << "<p style=\"color:var(--text-muted);font-size:13px;word-break:break-all;\">"
          << "You will be returned to " << html_escape(redirect_uri) << "</p>"
          << "<form method=\"POST\" action=\"/authorize/decision\">"
@@ -404,6 +500,8 @@ void OidcHandler::handle_authorize_decision(const httplib::Request& req, httplib
     auth_code.scope = consent->scope;
     auth_code.code_challenge = consent->code_challenge;
     auth_code.expires_at = now_seconds() + 300; // 5 minutes
+    auth_code.resource = consent->resource;
+    auth_code.nonce = consent->nonce;
 
     if (!store_.store_auth_code(auth_code)) {
         json_error(res, 500, "Failed to issue authorization code");
@@ -474,6 +572,7 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
 
     // Parse either form-encoded or JSON body
     std::string grant_type, code, redirect_uri, client_id, client_secret, refresh_token_str, code_verifier;
+    std::string resource;
     bool secret_presented = false;
 
     if (req.get_header_value("Content-Type").find("application/x-www-form-urlencoded") != std::string::npos) {
@@ -484,6 +583,7 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
         client_id = params["client_id"];
         refresh_token_str = params["refresh_token"];
         code_verifier = params["code_verifier"];
+        resource = params["resource"];
         if (params.count("client_secret")) {
             client_secret = params["client_secret"];
             secret_presented = true;
@@ -500,6 +600,9 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
         client_id = body.value("client_id", "");
         refresh_token_str = body.value("refresh_token", "");
         code_verifier = body.value("code_verifier", "");
+        if (body.contains("resource") && body["resource"].is_string()) {
+            resource = body["resource"].get<std::string>();
+        }
         if (body.contains("client_secret") && body["client_secret"].is_string()) {
             client_secret = body["client_secret"].get<std::string>();
             secret_presented = true;
@@ -600,6 +703,20 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
             }
         }
 
+        // RFC 8707 2.2: a resource repeated at the token endpoint must be one
+        // the grant covers. Ours covers exactly the one named at /authorize,
+        // so anything else — including naming a server when the grant named
+        // none — is refused rather than silently ignored. The audience always
+        // comes from the code, never from this parameter.
+        if (!resource.empty()) {
+            auto canonical = bsfchat::canonical_audience_url(resource);
+            if (!canonical || *canonical != auth_code->resource) {
+                oauth_error(res, 400, "invalid_target",
+                            "resource does not match the authorization request");
+                return;
+            }
+        }
+
         // Get account
         auto account = store_.get_account_by_id(auth_code->account_id);
         if (!account) {
@@ -609,7 +726,8 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
 
         // Generate tokens
         auto access_token = create_access_token();
-        auto id_token = create_id_token(*account, auth_code->client_id);
+        auto id_token = create_id_token(*account, auth_code->client_id, auth_code->scope,
+                                        auth_code->resource, auth_code->nonce);
         auto refresh_token = random_hex(32);
 
         auto now = now_seconds();
@@ -685,9 +803,17 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
             return;
         }
 
-        // Generate new tokens
+        // Generate new tokens.
+        //
+        // The id_token minted here names no chat server: a refresh token is
+        // not bound to one (it would take a schema change to the refresh
+        // token rows, and the desktop client never uses this path for a
+        // sign-in — it runs a fresh authorization per server). So it gets the
+        // legacy client_id audience, which no upgraded chat server accepts.
+        // A refresh token therefore cannot be turned into a sign-in anywhere
+        // that has the C1 fix, which is the safe direction to be wrong in.
         auto access_token = create_access_token();
-        auto id_token = create_id_token(*account, rt->client_id);
+        auto id_token = create_id_token(*account, rt->client_id, rt->scope, "", "");
         auto new_refresh_token = random_hex(32);
 
         auto now = now_seconds();
@@ -819,17 +945,40 @@ void OidcHandler::handle_revoke(const httplib::Request& req, httplib::Response& 
     res.set_content(json{{"success", true}}.dump(), "application/json");
 }
 
-std::string OidcHandler::create_id_token(const Account& account, const std::string& client_id) {
+std::string OidcHandler::create_id_token(const Account& account, const std::string& client_id,
+                                         const std::string& scope, const std::string& resource,
+                                         const std::string& nonce) {
     auto now = now_seconds();
     bsfchat::JwtClaims claims;
     claims.sub = account.id;
     claims.iss = config_.issuer_url;
-    claims.aud = client_id;
+    // C1. With a resource, the token is audienced to that one chat server and
+    // to nothing else — deliberately NOT [resource, client_id]. OIDC Core
+    // expects the client_id in `aud`, but every chat server that has not yet
+    // been upgraded checks for exactly that value, so including it would keep
+    // a token minted for a hostile server replayable against every
+    // un-upgraded one, indefinitely. `azp` names the client instead.
+    //
+    // Without a resource (an old client, the desktop app's server-list sync,
+    // a refresh), the legacy audience is kept so old clients still sign in to
+    // old servers. Upgraded servers refuse it: it is the vulnerable one.
+    claims.aud = resource.empty() ? client_id : resource;
+    claims.azp = client_id;
     claims.iat = now;
-    claims.exp = now + 3600; // 1 hour
-    claims.name = account.display_name;
-    claims.email = account.email.empty() ? std::nullopt : std::optional<std::string>(account.email);
-    claims.picture = account.avatar_url.empty() ? std::nullopt : std::optional<std::string>(account.avatar_url);
+    claims.exp = now + kIdTokenLifetimeSeconds;
+    if (!nonce.empty()) claims.nonce = nonce;
+
+    // M4: claims follow the granted scope, as /userinfo already did. The
+    // id_token is what every chat server receives, so an email address in it
+    // went to every chat server operator whatever the user had agreed to.
+    if (scope_contains(scope, "profile")) {
+        claims.name = account.display_name;
+        claims.picture = account.avatar_url.empty() ? std::nullopt
+                                                    : std::optional<std::string>(account.avatar_url);
+    }
+    if (scope_contains(scope, "email") && !account.email.empty()) {
+        claims.email = account.email;
+    }
 
     return key_manager_.sign_token(claims);
 }
