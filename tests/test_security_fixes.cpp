@@ -887,9 +887,11 @@ TEST(SchemaMigrationV3Test, AudienceV2DatabaseIsHashedOnceAndKeepsC1Columns) {
         IdentityStore store(path);
         store.initialize();
         auto consent = store.consume_consent_request("ct", "raw-session");
-        ASSERT_TRUE(consent.has_value()) << "consent binding lost or hashed twice";
-        EXPECT_EQ(consent->resource, "https://chat.example");
-        EXPECT_EQ(consent->nonce, "n-1");
+        ASSERT_EQ(consent.outcome, ConsentOutcome::Granted)
+            << "consent binding lost or hashed twice";
+        ASSERT_TRUE(consent.request.has_value());
+        EXPECT_EQ(consent.request->resource, "https://chat.example");
+        EXPECT_EQ(consent.request->nonce, "n-1");
     }
     remove_db(db_path);
 }

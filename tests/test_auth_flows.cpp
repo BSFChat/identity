@@ -475,12 +475,19 @@ TEST_F(AuthFlowTest, ConsentTokenIsSingleUse) {
     oidc->handle_authorize_decision(first, fres);
     EXPECT_EQ(status_of(fres), 302);
 
+    // Resubmitting the same form — the browser's back button, a double tap, a
+    // tab Android restored — issues NO second code and steers the browser
+    // nowhere. It is reported as what it is rather than as a CSRF attempt:
+    // this exact response used to be the 403 "does not belong to this session"
+    // that made a failed mobile sign-in unreadable and unrecoverable.
     auto second = form_request({{"consent_token", token}, {"approve", "true"}});
     second.set_header("Cookie", "session=" + browser_session);
     httplib::Response sres;
     oidc->handle_authorize_decision(second, sres);
-    EXPECT_EQ(status_of(sres), 403);
+    EXPECT_EQ(status_of(sres), 409);
     EXPECT_TRUE(extract_location(sres).empty());
+    EXPECT_EQ(sres.body.find("code="), std::string::npos);
+    EXPECT_NE(sres.body.find("Already approved"), std::string::npos);
 }
 
 TEST_F(AuthFlowTest, DenyingConsentReturnsAccessDenied) {

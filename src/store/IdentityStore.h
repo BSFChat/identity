@@ -122,6 +122,35 @@ struct ConsentRequest {
     int64_t expires_at = 0;
     std::string resource;     // see AuthCode::resource
     std::string nonce;
+    // When the prompt was answered, or 0 while it is still pending. An
+    // answered prompt is kept, not deleted, until it expires: see
+    // ConsentDecision below for why.
+    int64_t consumed_at = 0;
+};
+
+// Why a consent POST was not turned into an authorization code.
+//
+// These used to be one outcome — "consume_consent_request returned nothing" —
+// and therefore one 403 saying "Authorization request does not belong to this
+// session". Three quite different things reach that line, only one of them is
+// an attack, and the person who hit it could not act on any of the advice the
+// message implied. Telling them apart costs nothing and is the difference
+// between a dead end and a recoverable sign-in.
+enum class ConsentOutcome {
+    Granted,         // the prompt was pending, and is now this caller's to spend
+    Unknown,         // no such token: forged, or swept after expiring long ago
+    SessionMismatch, // a real prompt, but not this browser session's — the CSRF case
+    AlreadyAnswered, // this session's prompt, answered already (a resubmitted form)
+    Expired,         // this session's prompt, but it sat unanswered too long
+};
+
+// The verdict plus, when the caller is the session the prompt was issued to,
+// the request itself. Deliberately NOT populated for Unknown or
+// SessionMismatch: a caller who cannot prove it owns the prompt learns
+// nothing about it, not even the client or the redirect it names.
+struct ConsentDecision {
+    ConsentOutcome outcome = ConsentOutcome::Unknown;
+    std::optional<ConsentRequest> request;
 };
 
 struct TotpInfo {
@@ -242,12 +271,23 @@ public:
     void delete_expired_login_tokens();
 
     // Consent requests (bound to a browser session, single use).
-    // The row is deleted only when `session_id` matches the session the prompt
+    // The row is spent only when `session_id` matches the session the prompt
     // was issued to, so a rejected (e.g. cross-site) decision cannot burn a
     // pending request belonging to a legitimate user.
     bool store_consent_request(const ConsentRequest& request);
-    std::optional<ConsentRequest> consume_consent_request(const std::string& token,
-                                                          const std::string& session_id);
+
+    // Spends the prompt, or says precisely why it could not be spent.
+    //
+    // Answering a prompt marks it (consumed_at) rather than deleting it, and
+    // the row is carried until it expires like any other. That is what makes
+    // AlreadyAnswered distinguishable from Unknown at all: a deleted row and a
+    // never-existing row look identical, which is why a resubmitted consent
+    // form used to be reported as a CSRF attempt. The single-use property is
+    // unchanged — only a row with consumed_at = 0 can be spent, and the update
+    // that spends it is conditional on that, so two concurrent POSTs still
+    // yield exactly one code.
+    ConsentDecision consume_consent_request(const std::string& token,
+                                            const std::string& session_id);
     void delete_expired_consent_requests();
 
     // Refresh token housekeeping

@@ -16,6 +16,7 @@ add_executable(identity_tests
     test_accounts.cpp
     test_auth_flows.cpp
     test_token_audience.cpp
+    test_mobile_second_signin.cpp
     test_security_fixes.cpp
     test_version.cpp
 )
