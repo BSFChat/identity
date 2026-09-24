@@ -1315,7 +1315,8 @@ bool IdentityStore::store_consent_request(const ConsentRequest& request) {
 }
 
 ConsentDecision IdentityStore::consume_consent_request(const std::string& token,
-                                                      const std::string& session_id) {
+                                                      const std::string& session_id,
+                                                      const std::string& session_account_id) {
     ConsentDecision decision;
     if (token.empty() || session_id.empty()) return decision; // Unknown
 
@@ -1359,6 +1360,23 @@ ConsentDecision IdentityStore::consume_consent_request(const std::string& token,
     // Constant-time is not the point here (the token, not the session, is the
     // unguessable half), but the comparison must be exact.
     if (row.session_id != presented) {
+        // Not spendable either way — a prompt belongs to the session it was
+        // shown to, full stop. The only question is whether we can say
+        // something useful about WHY, and we can when the caller is signed in
+        // as the account the prompt was issued for: that is a browser that
+        // signed in again, not a stranger.
+        if (row.consumed_at == 0 && !session_account_id.empty()
+            && session_account_id == row.account_id) {
+            // Left PENDING, deliberately. "A decision this store refuses does
+            // not burn the prompt" is an invariant worth keeping literally —
+            // it is what stops any rejected POST becoming a way to cancel
+            // somebody's sign-in — and burning it buys nothing here, because
+            // the caller is about to be re-prompted with a brand-new one.
+            // Nothing loops: the re-prompt is a GET that renders a page.
+            decision.outcome = ConsentOutcome::SessionSuperseded;
+            decision.request = std::move(row);
+            return decision;
+        }
         decision.outcome = ConsentOutcome::SessionMismatch;
         return decision;
     }

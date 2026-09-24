@@ -363,9 +363,94 @@ TEST_F(MobileSecondSignInTest, AnExpiredPromptSendsTheUserBackToTheApp) {
     EXPECT_TRUE(query_param(location, "code").empty());
 }
 
-// The CSRF guard is unchanged, and must stay unchanged: a decision posted from
-// any other session is refused, tells the poster nothing about the prompt, and
+// The mechanism traced on the device, 2026-09-24, verbatim:
+//
+//   19:22:40.762  Login successful: account fe982c22…
+//   19:22:41.814  Login successful: account fe982c22…   <- 1.05s later
+//   19:22:42.515  Rejected consent decision that did not match the issuing session
+//
+// A client opening two authorization flows drove two logins; the second one
+// established a new browser session and replaced the cookie under the consent
+// page the user was looking at. The prompt is not honoured — it belongs to the
+// session it was shown to — but the user is not dead-ended either: the same
+// authorization request is put again and one more tap finishes it.
+TEST_F(MobileSecondSignInTest, ASecondLoginRePutsThePromptRatherThanDeadEnding) {
+    const auto challenge = s256_challenge(kVerifier);
+
+    auto shown = authorize(challenge, "state-2", "nonce-2", kUat);
+    ASSERT_EQ(status_of(shown), 200);
+    const auto token = consent_token_from(shown.body);
+    ASSERT_FALSE(token.empty());
+
+    // The second flow's login. Same account, same browser — a new session and
+    // a new cookie, exactly as start_session() issues one per login.
+    httplib::Request relogin;
+    relogin.method = "POST";
+    relogin.remote_addr = "10.0.0.1";
+    relogin.set_header("Content-Type", "application/json");
+    relogin.body = json{{"username", "appreview"},
+                        {"password", "correct horse battery"}}.dump();
+    httplib::Response lres;
+    accounts->handle_login(relogin, lres);
+    ASSERT_EQ(status_of(lres), 200) << lres.body;
+    const auto set_cookie = header_of(lres, "Set-Cookie");
+    const auto semi = set_cookie.find(';');
+    const auto newer = set_cookie.substr(0, semi);
+    ASSERT_NE(newer, cookie) << "the second login must establish a new session";
+    cookie = newer;
+
+    // The user taps Allow on the page that is still on screen.
+    auto res = decide(token);
+
+    // No code. The prompt belonged to the previous session and that is not
+    // negotiable.
+    ASSERT_EQ(status_of(res), 302) << res.body;
+    const auto location = header_of(res, "Location");
+    EXPECT_TRUE(query_param(location, "code").empty()) << location;
+
+    // Instead, the same request is put again — with everything that decides
+    // WHICH server the token will be good for still attached (identity audit
+    // C1), because losing `resource` here would silently downgrade a
+    // server-bound sign-in to a legacy one.
+    EXPECT_EQ(location.rfind("/authorize?", 0), 0u) << location;
+    EXPECT_EQ(query_param(location, "resource"), kUat);
+    EXPECT_EQ(query_param(location, "nonce"), "nonce-2");
+    EXPECT_EQ(query_param(location, "state"), "state-2");
+    EXPECT_EQ(query_param(location, "client_id"), "bsfchat-desktop");
+    EXPECT_EQ(query_param(location, "redirect_uri"), kNativeRedirect);
+    EXPECT_EQ(query_param(location, "code_challenge"), challenge);
+    EXPECT_EQ(query_param(location, "code_challenge_method"), "S256");
+
+    // ...and following it finishes the sign-in with one more tap.
+    auto again = authorize(challenge, "state-2", "nonce-2", kUat);
+    ASSERT_EQ(status_of(again), 200);
+    const auto fresh = consent_token_from(again.body);
+    ASSERT_FALSE(fresh.empty());
+    EXPECT_NE(fresh, token);
+
+    auto granted = decide(fresh);
+    EXPECT_EQ(status_of(granted), 302) << granted.body;
+    EXPECT_FALSE(query_param(header_of(granted, "Location"), "code").empty());
+
+    // Re-presenting the superseded token is idempotent and harmless: another
+    // re-prompt, never a code. It is left pending rather than burned, because
+    // "a decision this endpoint refuses does not burn the prompt" is the
+    // invariant that stops a rejected POST becoming a way to cancel somebody
+    // else's sign-in. Nothing loops — a re-prompt is a GET that renders a
+    // page.
+    auto stale_again = decide(token);
+    EXPECT_EQ(status_of(stale_again), 302) << stale_again.body;
+    EXPECT_TRUE(query_param(header_of(stale_again, "Location"), "code").empty());
+}
+
+// The CSRF guard is unchanged, and must stay unchanged: a decision posted by
+// SOMEBODY ELSE is refused, tells the poster nothing about the prompt, and
 // leaves it pending for the session it belongs to.
+//
+// A different account, deliberately. The re-prompt above is reached only when
+// the caller is signed in as the very account the prompt was issued for; a
+// stranger holding a consent token gets this, learns nothing, and steers the
+// browser nowhere.
 TEST_F(MobileSecondSignInTest, AForeignSessionLearnsNothingAndBurnsNothing) {
     const auto challenge = s256_challenge(kVerifier);
     auto shown = authorize(challenge, "state-2", "nonce-2", kUat);
@@ -374,9 +459,18 @@ TEST_F(MobileSecondSignInTest, AForeignSessionLearnsNothingAndBurnsNothing) {
     ASSERT_FALSE(token.empty());
 
     auto now = now_seconds();
+    Account stranger;
+    stranger.id = "acct-stranger";
+    stranger.username = "stranger";
+    stranger.email = "stranger@example.com";
+    stranger.password_hash = hash_password("hunter2hunter2", config.password_hash_iterations);
+    stranger.created_at = now;
+    stranger.updated_at = now;
+    ASSERT_TRUE(store->create_account(stranger));
+
     Session other;
     other.session_id = "someone-elses-session";
-    other.account_id = "acct-review";
+    other.account_id = "acct-stranger";
     other.created_at = now;
     other.expires_at = now + 3600;
     other.token_type = token_type::kBrowserSession;

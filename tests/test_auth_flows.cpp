@@ -425,7 +425,11 @@ TEST_F(AuthFlowTest, ConsentDecisionFromAnotherSessionIsRejected) {
     EXPECT_TRUE(extract_location(ares).empty());
 
     // (b) A different, perfectly valid browser session must not be able to
-    // approve a prompt it was never shown.
+    // approve a prompt it was never shown. This one belongs to the SAME
+    // account — the shape a re-login produces, and the one the mobile 403 of
+    // 2026-09-24 turned out to be — so it is answered by putting the
+    // authorization request again rather than by a dead end. No code either
+    // way: that is the property, and it is unchanged.
     auto now = now_seconds();
     Session other;
     other.session_id = "another-browser-session";
@@ -439,8 +443,36 @@ TEST_F(AuthFlowTest, ConsentDecisionFromAnotherSessionIsRejected) {
     foreign.set_header("Cookie", "session=another-browser-session");
     httplib::Response fres;
     oidc->handle_authorize_decision(foreign, fres);
-    EXPECT_EQ(status_of(fres), 403);
-    EXPECT_TRUE(extract_location(fres).empty());
+    EXPECT_EQ(status_of(fres), 302);
+    EXPECT_EQ(extract_location(fres).rfind("/authorize?", 0), 0u) << extract_location(fres);
+    EXPECT_TRUE(query_param(extract_location(fres), "code").empty());
+
+    // (b2) A STRANGER's session is the actual CSRF case, and gets the opaque
+    // refusal: no code, no redirect, and nothing said about the prompt — not
+    // the client, not the redirect_uri it names.
+    Account stranger;
+    stranger.id = "acct-2";
+    stranger.username = "mallory";
+    stranger.email = "mallory@example.com";
+    stranger.password_hash = hash_password("hunter2hunter2", config.password_hash_iterations);
+    stranger.created_at = now;
+    stranger.updated_at = now;
+    ASSERT_TRUE(store->create_account(stranger));
+    Session theirs;
+    theirs.session_id = "a-strangers-session";
+    theirs.account_id = "acct-2";
+    theirs.created_at = now;
+    theirs.expires_at = now + 3600;
+    theirs.token_type = token_type::kBrowserSession;
+    ASSERT_TRUE(store->create_session(theirs));
+
+    auto stranger_post = form_request({{"consent_token", token}, {"approve", "true"}});
+    stranger_post.set_header("Cookie", "session=a-strangers-session");
+    httplib::Response sres;
+    oidc->handle_authorize_decision(stranger_post, sres);
+    EXPECT_EQ(status_of(sres), 403);
+    EXPECT_TRUE(extract_location(sres).empty());
+    EXPECT_EQ(sres.body.find("localhost:41234"), std::string::npos);
 
     // (c) The rejected attempts must not have burned the pending request — the
     // rightful session can still complete it.
