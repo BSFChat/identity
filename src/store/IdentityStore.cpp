@@ -214,7 +214,11 @@ void IdentityStore::initialize() {
             code_challenge TEXT NOT NULL DEFAULT '',
             expires_at     INTEGER NOT NULL,
             resource       TEXT NOT NULL DEFAULT '',
-            nonce          TEXT NOT NULL DEFAULT ''
+            nonce          TEXT NOT NULL DEFAULT '',
+            -- 0 while pending. An answered prompt is kept until it expires so
+            -- that a resubmitted consent form can be told apart from a forged
+            -- one; see consume_consent_request().
+            consumed_at    INTEGER NOT NULL DEFAULT 0
         )
     )");
 
@@ -341,6 +345,17 @@ void IdentityStore::migrate_locked() {
             exec("PRAGMA user_version = 2");
             log->info("Identity database schema migrated to version 2");
         }
+    }
+
+    // --- consent_requests.consumed_at ---------------------------------------
+    //
+    // Guarded by the column rather than by user_version, for exactly the
+    // reason spelled out above: the version numbers on this table have been
+    // reused across branches once already. Cheap, additive, and every row it
+    // touches lives five minutes, so no backfill is needed — a prompt pending
+    // across the upgrade simply starts life unanswered, which it is.
+    if (!has_column_locked("consent_requests", "consumed_at")) {
+        exec("ALTER TABLE consent_requests ADD COLUMN consumed_at INTEGER NOT NULL DEFAULT 0");
     }
 
     // --- v3: security audit 2026-09 ------------------------------------------
@@ -1299,50 +1314,109 @@ bool IdentityStore::store_consent_request(const ConsentRequest& request) {
     return sqlite3_step(stmt.get()) == SQLITE_DONE;
 }
 
-std::optional<ConsentRequest> IdentityStore::consume_consent_request(const std::string& token,
-                                                                     const std::string& session_id) {
-    if (token.empty() || session_id.empty()) return std::nullopt;
+ConsentDecision IdentityStore::consume_consent_request(const std::string& token,
+                                                      const std::string& session_id,
+                                                      const std::string& session_account_id) {
+    ConsentDecision decision;
+    if (token.empty() || session_id.empty()) return decision; // Unknown
 
     std::lock_guard lock(mutex_);
     Transaction txn(db_);
 
-    std::optional<ConsentRequest> result;
+    const auto presented = hash_token(session_id);
+
+    ConsentRequest row;
+    bool found = false;
     {
-        // Matching the session in SQL means a decision posted from any other
-        // session simply finds nothing, and deletes nothing.
+        // Looked up by token alone so the three failure modes can be told
+        // apart. The session is compared HERE, in C++, and a mismatch returns
+        // nothing about the row — the SQL-side match this replaces gave the
+        // same guarantee and this keeps it.
         auto stmt = prepare(db_,
             "SELECT token, session_id, account_id, client_id, redirect_uri, scope, state, code_challenge, expires_at, "
-            "resource, nonce FROM consent_requests WHERE token = ? AND session_id = ?");
+            "resource, nonce, consumed_at FROM consent_requests WHERE token = ?");
         bind_text(stmt.get(), 1, token);
-        bind_text(stmt.get(), 2, hash_token(session_id));
         if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
-            ConsentRequest r;
-            r.token = col_text(stmt.get(), 0);
-            r.session_id = col_text(stmt.get(), 1);
-            r.account_id = col_text(stmt.get(), 2);
-            r.client_id = col_text(stmt.get(), 3);
-            r.redirect_uri = col_text(stmt.get(), 4);
-            r.scope = col_text(stmt.get(), 5);
-            r.state = col_text(stmt.get(), 6);
-            r.code_challenge = col_text(stmt.get(), 7);
-            r.expires_at = sqlite3_column_int64(stmt.get(), 8);
-            r.resource = col_text(stmt.get(), 9);
-            r.nonce = col_text(stmt.get(), 10);
-            result = std::move(r);
+            row.token = col_text(stmt.get(), 0);
+            row.session_id = col_text(stmt.get(), 1);
+            row.account_id = col_text(stmt.get(), 2);
+            row.client_id = col_text(stmt.get(), 3);
+            row.redirect_uri = col_text(stmt.get(), 4);
+            row.scope = col_text(stmt.get(), 5);
+            row.state = col_text(stmt.get(), 6);
+            row.code_challenge = col_text(stmt.get(), 7);
+            row.expires_at = sqlite3_column_int64(stmt.get(), 8);
+            row.resource = col_text(stmt.get(), 9);
+            row.nonce = col_text(stmt.get(), 10);
+            row.consumed_at = sqlite3_column_int64(stmt.get(), 11);
+            found = true;
         }
     }
 
-    if (result) {
-        auto del = prepare(db_, "DELETE FROM consent_requests WHERE token = ? AND session_id = ?");
-        bind_text(del.get(), 1, token);
-        bind_text(del.get(), 2, hash_token(session_id));
-        sqlite3_step(del.get());
-        // Lost the race with a concurrent decision — do not issue a second code.
-        if (sqlite3_changes(db_) == 0) result.reset();
+    if (!found) {
+        decision.outcome = ConsentOutcome::Unknown;
+        return decision;
+    }
+    // Constant-time is not the point here (the token, not the session, is the
+    // unguessable half), but the comparison must be exact.
+    if (row.session_id != presented) {
+        // Not spendable either way — a prompt belongs to the session it was
+        // shown to, full stop. The only question is whether we can say
+        // something useful about WHY, and we can when the caller is signed in
+        // as the account the prompt was issued for: that is a browser that
+        // signed in again, not a stranger.
+        if (row.consumed_at == 0 && !session_account_id.empty()
+            && session_account_id == row.account_id) {
+            // Left PENDING, deliberately. "A decision this store refuses does
+            // not burn the prompt" is an invariant worth keeping literally —
+            // it is what stops any rejected POST becoming a way to cancel
+            // somebody's sign-in — and burning it buys nothing here, because
+            // the caller is about to be re-prompted with a brand-new one.
+            // Nothing loops: the re-prompt is a GET that renders a page.
+            decision.outcome = ConsentOutcome::SessionSuperseded;
+            decision.request = std::move(row);
+            return decision;
+        }
+        decision.outcome = ConsentOutcome::SessionMismatch;
+        return decision;
+    }
+    if (row.consumed_at != 0) {
+        decision.outcome = ConsentOutcome::AlreadyAnswered;
+        decision.request = std::move(row);
+        return decision;
+    }
+    if (row.expires_at < now_seconds()) {
+        decision.outcome = ConsentOutcome::Expired;
+        decision.request = std::move(row);
+        return decision;
     }
 
+    {
+        // Conditional on consumed_at = 0, which is what keeps this single-use:
+        // two POSTs racing each other both read a pending row, and exactly one
+        // of the updates changes anything.
+        auto upd = prepare(db_,
+            "UPDATE consent_requests SET consumed_at = ? "
+            "WHERE token = ? AND session_id = ? AND consumed_at = 0");
+        sqlite3_bind_int64(upd.get(), 1, now_seconds());
+        bind_text(upd.get(), 2, token);
+        bind_text(upd.get(), 3, presented);
+        sqlite3_step(upd.get());
+        if (sqlite3_changes(db_) == 0) {
+            // Lost the race — do not issue a second code for one prompt.
+            decision.outcome = ConsentOutcome::AlreadyAnswered;
+            decision.request = std::move(row);
+            txn.commit();
+            return decision;
+        }
+    }
+
+    row.consumed_at = now_seconds();
+    decision.outcome = ConsentOutcome::Granted;
+    decision.request = std::move(row);
+
     txn.commit();
-    return result;
+    return decision;
 }
 
 void IdentityStore::delete_expired_consent_requests() {

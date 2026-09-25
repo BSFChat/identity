@@ -47,6 +47,16 @@ private:
                                          const std::string& presented_secret,
                                          bool secret_was_presented);
 
+    // Is `redirect_uri` one of the URIs registered for `client_id`?
+    //
+    // Checked at /authorize before anything is stored, and again before any
+    // later response steers the browser at it. The second check is not
+    // redundant paranoia: a registration can be edited between the two, and
+    // "we validated this five minutes ago" is not a reason to send a user
+    // agent somewhere now.
+    bool redirect_uri_is_registered(const std::string& client_id,
+                                    const std::string& redirect_uri);
+
     // Renders the consent page for a validated authorization request.
     void render_consent_page(httplib::Response& res, const OAuthClient& client,
                              const Account& account, const std::string& scope,

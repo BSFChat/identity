@@ -162,6 +162,36 @@ bool nonce_acceptable(const std::string& nonce) {
     return true;
 }
 
+// A plain page for the end of a sign-in that did not produce a code.
+//
+// This exists because the alternative — what this endpoint used to do — was to
+// answer a person standing in a browser with `{"error":"Authorization request
+// does not belong to this session"}`. Whatever went wrong, the reader is a
+// human halfway through signing in on a phone, and the only useful thing to
+// tell them is what to do next. Styled with the same stylesheet as the consent
+// page so it does not look like a crash.
+void render_notice_page(httplib::Response& res, int status, const std::string& title,
+                        const std::string& detail, const std::string& next_step) {
+    std::ostringstream html;
+    html << "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
+         << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
+         << "<title>" << html_escape(title) << " - BSFChat ID</title>"
+         << "<link rel=\"stylesheet\" href=\"/css/style.css\"></head><body>"
+         << "<div class=\"container\"><div class=\"card\">"
+         << "<div class=\"logo\"><h1>BSFChat ID</h1>"
+         << "<p class=\"subtitle\">" << html_escape(title) << "</p></div>"
+         << "<p>" << html_escape(detail) << "</p>"
+         << "<p style=\"color:var(--text-muted);font-size:14px;\">"
+         << html_escape(next_step) << "</p>"
+         << "</div></div></body></html>";
+
+    res.status = status;
+    res.set_header("Cache-Control", "no-store");
+    res.set_header("X-Frame-Options", "DENY");
+    res.set_header("Content-Security-Policy", "frame-ancestors 'none'");
+    res.set_content(html.str(), "text/html");
+}
+
 // The host (and port, if not the default) of a canonical audience URL, for
 // the consent page. The full URL is shown underneath; this is the part a
 // person can recognise at a glance.
@@ -213,6 +243,21 @@ void OidcHandler::handle_discovery(const httplib::Request&, httplib::Response& r
     res.set_content(discovery.dump(), "application/json");
 }
 
+bool OidcHandler::redirect_uri_is_registered(const std::string& client_id,
+                                             const std::string& redirect_uri) {
+    if (client_id.empty() || redirect_uri.empty()) return false;
+    auto client = store_.get_oauth_client(client_id);
+    if (!client) return false;
+
+    auto uris = json::parse(client->redirect_uris, nullptr, false);
+    if (uris.is_discarded() || !uris.is_array()) return false;
+    for (const auto& registered : uris) {
+        if (!registered.is_string()) continue;
+        if (redirect_uri_matches(registered.get<std::string>(), redirect_uri)) return true;
+    }
+    return false;
+}
+
 void OidcHandler::handle_authorize(const httplib::Request& req, httplib::Response& res) {
     auto client_id = req.get_param_value("client_id");
     auto redirect_uri = req.get_param_value("redirect_uri");
@@ -246,23 +291,10 @@ void OidcHandler::handle_authorize(const httplib::Request& req, httplib::Respons
     // "http://localhost:1234@attacker.example/" satisfies while actually
     // pointing at attacker.example. redirect_uri_matches() parses both URIs and
     // only relaxes the *port* for genuine loopback registrations.
-    {
-        bool uri_valid = false;
-        auto uris = json::parse(client->redirect_uris, nullptr, false);
-        if (!uris.is_discarded() && uris.is_array()) {
-            for (const auto& registered : uris) {
-                if (!registered.is_string()) continue;
-                if (redirect_uri_matches(registered.get<std::string>(), redirect_uri)) {
-                    uri_valid = true;
-                    break;
-                }
-            }
-        }
-        if (!uri_valid) {
-            // Never redirect to an unvalidated URI — report in-band instead.
-            json_error(res, 400, "Invalid redirect_uri for this client");
-            return;
-        }
+    if (!redirect_uri_is_registered(client_id, redirect_uri)) {
+        // Never redirect to an unvalidated URI — report in-band instead.
+        json_error(res, 400, "Invalid redirect_uri for this client");
+        return;
     }
 
     // A client with no registered secret is a public client. Public clients get
@@ -473,14 +505,137 @@ void OidcHandler::handle_authorize_decision(const httplib::Request& req, httplib
 
     // Consumption is conditional on that binding, so a rejected decision leaves
     // the pending request intact for its rightful owner.
-    auto consent = store_.consume_consent_request(consent_token, ctx.credential_id);
-    if (!consent) {
+    //
+    // The ways this can fail are answered differently, and that is the whole
+    // point of telling them apart. Every one of them used to be the same 403
+    // saying the request belonged to another session, which is true of exactly
+    // one of them and is unactionable advice for the rest: the mobile sign-in
+    // that provoked this change died here with the app waiting silently behind
+    // a browser tab showing a line of JSON.
+    //
+    // ctx.account_id is passed so that "this browser signed in again" can be
+    // told from "this is not your prompt". It buys no authority — see
+    // consume_consent_request.
+    auto decision = store_.consume_consent_request(consent_token, ctx.credential_id,
+                                                   ctx.account_id);
+    switch (decision.outcome) {
+    case ConsentOutcome::Unknown:
+    case ConsentOutcome::SessionMismatch:
+        // Nothing is disclosed and nothing is redirected: a caller who cannot
+        // prove it owns the prompt does not get to learn where the prompt
+        // pointed, nor to steer the browser there. This is the CSRF case and
+        // it is answered exactly as before, only legibly.
         log->warn("Rejected consent decision that did not match the issuing session");
-        json_error(res, 403, "Authorization request does not belong to this session");
+        render_notice_page(res, 403, "Sign-in request not recognised",
+                           "This sign-in request is not one this browser started, or it is "
+                           "no longer valid.",
+                           "Go back to BSFChat and start signing in again.");
+        return;
+
+    case ConsentOutcome::AlreadyAnswered:
+        // A resubmitted consent form — the browser's back button, a double
+        // tap, a restored tab. The app already has its answer, so the one
+        // thing NOT to do is fire a second callback at it: a late
+        // `error=` redirect would land on whatever sign-in is in flight now
+        // and fail that one's state check. Say so and stop.
+        log->info("Consent decision resubmitted for a prompt this session had already answered "
+                  "(client {})", decision.request->client_id);
+        render_notice_page(res, 409, "Already approved",
+                           "You have already approved this sign-in.",
+                           "Switch back to the BSFChat app to carry on. If it is still waiting, "
+                           "start signing in again from there.");
+        return;
+
+    case ConsentOutcome::Expired:
+        // The app IS still waiting on this one, so hand it a real answer
+        // instead of leaving it to time out five minutes later. The
+        // redirect_uri was validated when the prompt was issued and is
+        // re-checked below; `state` is the client's own value coming back to
+        // it, which is what lets it match the error to this attempt.
+        log->info("Consent decision arrived after the prompt expired (client {})",
+                  decision.request->client_id);
+        if (redirect_uri_is_registered(decision.request->client_id,
+                                       decision.request->redirect_uri)) {
+            redirect_with_error(res, decision.request->redirect_uri, "access_denied",
+                                decision.request->state);
+        } else {
+            render_notice_page(res, 400, "Sign-in timed out",
+                               "This sign-in request sat unanswered for too long.",
+                               "Go back to BSFChat and start signing in again.");
+        }
+        return;
+
+    case ConsentOutcome::SessionSuperseded: {
+        // The browser signed in again while this page sat open, so the cookie
+        // now names a different session than the one the prompt was issued
+        // to. Observed on a Pixel on 2026-09-24: a client opening two
+        // authorization flows drove two logins 1.05 s apart, and the second
+        // replaced the cookie under the consent page the user was looking at.
+        // The client is being fixed; this is what the provider owes anybody
+        // who hits it for an honest reason — a session that expired in
+        // another tab, a re-login — instead of a 403 and no way forward.
+        //
+        // NOT honoured, and no code is issued: only the session that was
+        // shown a page may approve it, and nothing here changes that. The
+        // prompt is left pending rather than burned — a decision this
+        // endpoint refuses has never been allowed to cancel somebody's
+        // pending sign-in, and this is not the place to start. What happens
+        // instead is that the SAME
+        // authorization request is put again, from its stored parameters, so
+        // the user gets a fresh consent page bound to the session they now
+        // have and one more tap finishes the sign-in. /authorize re-validates
+        // every one of those parameters from scratch, and it renders a page —
+        // it cannot mint a code without another POST.
+        //
+        // This is reached only when the caller is authenticated as the very
+        // account the prompt belongs to, so it hands out no capability and no
+        // information a stranger could use: someone in that position could
+        // put the same authorization request themselves by typing it. A
+        // stranger's session takes the SessionMismatch arm above and is told
+        // nothing at all.
+        log->info("Consent decision arrived after this browser signed in again; "
+                  "re-putting the authorization request (client {})",
+                  decision.request->client_id);
+        if (!redirect_uri_is_registered(decision.request->client_id,
+                                        decision.request->redirect_uri)) {
+            render_notice_page(res, 400, "Sign-in could not be completed",
+                               "You signed in again while this page was open.",
+                               "Go back to BSFChat and start signing in again.");
+            return;
+        }
+        std::string again = "/authorize";
+        append_query_param(again, "client_id", decision.request->client_id);
+        append_query_param(again, "redirect_uri", decision.request->redirect_uri);
+        append_query_param(again, "response_type", "code");
+        append_query_param(again, "scope", decision.request->scope);
+        if (!decision.request->state.empty())
+            append_query_param(again, "state", decision.request->state);
+        if (!decision.request->code_challenge.empty()) {
+            append_query_param(again, "code_challenge", decision.request->code_challenge);
+            append_query_param(again, "code_challenge_method", "S256");
+        }
+        // Dropping either of these would quietly turn a server-bound sign-in
+        // into a legacy one — the same trap the login-page round trip has.
+        if (!decision.request->resource.empty())
+            append_query_param(again, "resource", decision.request->resource);
+        if (!decision.request->nonce.empty())
+            append_query_param(again, "nonce", decision.request->nonce);
+        res.set_redirect(again);
         return;
     }
-    if (consent->expires_at < now_seconds() || ctx.account_id != consent->account_id) {
-        json_error(res, 400, "Authorization request expired — please try again");
+
+    case ConsentOutcome::Granted:
+        break;
+    }
+
+    const auto& consent = decision.request;
+    if (ctx.account_id != consent->account_id) {
+        // The session matched the prompt, so this cannot happen without the
+        // session having been rebound underneath us. Refuse rather than guess.
+        log->warn("Consent decision's session no longer belongs to the account it was issued to");
+        render_notice_page(res, 400, "Sign-in could not be completed",
+                           "Your sign-in session changed while this page was open.",
+                           "Go back to BSFChat and start signing in again.");
         return;
     }
 
