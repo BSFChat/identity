@@ -166,6 +166,8 @@ protected:
         desktop.redirect_uris = first_party_redirect_uris();
         desktop.created_at = now;
         ASSERT_TRUE(store->create_oauth_client(desktop));
+        // And the mobile client, as production seeds it (the native tests).
+        ensure_first_party_client(*store, config);
 
         // Some other relying party an admin registered: a bot dashboard, a
         // web app. Confidential, so no PKCE needed.
@@ -564,18 +566,18 @@ TEST_F(TokenAudienceTest, ServerListWritesRefuseCrossSiteBrowserRequests) {
 // ---------------------------------------------------------------------------
 // The iOS transport does not touch any of this.
 //
-// iOS signs in through ASWebAuthenticationSession with a private-use URI
-// scheme callback, because the desktop loopback redirect cannot work there —
+// Mobile signs in as bsfchat-mobile through a claimed https callback, because
+// the desktop loopback redirect cannot work there —
 // the browser hand-off suspends the app and the callback is never accepted.
 // What changed is where the redirect lands. What must NOT change is the
 // audience binding C1 exists for, the nonce, azp, or the token's lifetime.
 // ---------------------------------------------------------------------------
 
 TEST_F(TokenAudienceTest, TheNativeCallbackKeepsTheAudienceBinding) {
-    const std::string kNative = "bsfchat://oauth/callback";
+    const std::string kNative = "https://bsfchat.com/oauth/callback";
 
     auto req = cookie_request();
-    req.params.emplace("client_id", "bsfchat-desktop");
+    req.params.emplace("client_id", "bsfchat-mobile");
     req.params.emplace("redirect_uri", kNative);
     req.params.emplace("response_type", "code");
     req.params.emplace("scope", "openid profile");
@@ -592,12 +594,12 @@ TEST_F(TokenAudienceTest, TheNativeCallbackKeepsTheAudienceBinding) {
     auto code = approve(res);
     ASSERT_FALSE(code.empty());
 
-    auto tres = redeem(code, {{"redirect_uri", kNative}, {"resource", kChat}});
+    auto tres = redeem(code, {{"client_id", "bsfchat-mobile"}, {"redirect_uri", kNative}, {"resource", kChat}});
     ASSERT_EQ(status_of(tres), 200) << tres.body;
 
     auto claims = jwt_payload(json::parse(tres.body)["id_token"].get<std::string>());
     EXPECT_EQ(claims["aud"], kChat);              // C1: the chat server, not the client
-    EXPECT_EQ(claims.value("azp", ""), "bsfchat-desktop");
+    EXPECT_EQ(claims.value("azp", ""), "bsfchat-mobile");
     EXPECT_EQ(claims.value("nonce", ""), "n-from-ios");
     EXPECT_LE(claims["exp"].get<int64_t>() - claims["iat"].get<int64_t>(), 300);
 }
@@ -605,10 +607,10 @@ TEST_F(TokenAudienceTest, TheNativeCallbackKeepsTheAudienceBinding) {
 TEST_F(TokenAudienceTest, TheNativeCallbackCannotBorrowAnotherServersToken) {
     // The C1 proof, over the iOS transport: a code issued for one chat server
     // cannot be redeemed naming another.
-    const std::string kNative = "bsfchat://oauth/callback";
+    const std::string kNative = "https://bsfchat.com/oauth/callback";
 
     auto req = cookie_request();
-    req.params.emplace("client_id", "bsfchat-desktop");
+    req.params.emplace("client_id", "bsfchat-mobile");
     req.params.emplace("redirect_uri", kNative);
     req.params.emplace("response_type", "code");
     req.params.emplace("scope", "openid profile");
@@ -623,7 +625,7 @@ TEST_F(TokenAudienceTest, TheNativeCallbackCannotBorrowAnotherServersToken) {
     auto code = approve(res);
     ASSERT_FALSE(code.empty());
 
-    auto tres = redeem(code, {{"redirect_uri", kNative},
+    auto tres = redeem(code, {{"client_id", "bsfchat-mobile"}, {"redirect_uri", kNative},
                               {"resource", "https://evil.example"}});
     EXPECT_NE(status_of(tres), 200) << tres.body;
 }

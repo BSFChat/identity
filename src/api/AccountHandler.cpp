@@ -1,4 +1,5 @@
 #include "api/AccountHandler.h"
+#include "core/ClientRegistration.h"
 #include "crypto/PasswordHash.h"
 #include "crypto/Secrets.h"
 #include "crypto/Totp.h"
@@ -84,11 +85,11 @@ constexpr const char* kServersScope = "openid";
 // to. That list is the desktop app's own state; nobody else has a reason to
 // write it. Seeded in IdentityServer.cpp. A browser session (the portal's
 // own profile page) is unaffected.
-constexpr const char* kServerListClientId = "bsfchat-desktop";
-
+//
+// Both first-party apps qualify: desktop and mobile restore the same list.
 bool may_use_server_list(const AuthContext& ctx) {
     return ctx.authenticated() &&
-           (ctx.is_browser_session() || ctx.client_id == kServerListClientId);
+           (ctx.is_browser_session() || is_first_party_client(ctx.client_id));
 }
 
 // Bounds on a server-membership row. The desktop client walks this list on

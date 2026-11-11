@@ -20,7 +20,7 @@ IdentityServer::IdentityServer(Config config)
     store_ = std::make_unique<IdentityStore>(config_.database_path);
     store_->initialize();
 
-    ensure_first_party_client(*store_);
+    ensure_first_party_client(*store_, config_);
 
     key_manager_ = std::make_unique<KeyManager>(config_.keys_path);
     http_server_ = std::make_unique<HttpServer>(config_);

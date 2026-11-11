@@ -67,6 +67,19 @@ struct Config {
     // Housekeeping
     int session_sweep_interval = 3600; // seconds between expiry sweeps
 
+    // First-party apps ([apps]). The mobile app signs in as its own public
+    // client, "bsfchat-mobile", whose only redirect is an https URL the OS
+    // hands to the verified app alone (Android App Links / iOS associated
+    // domains). The default is the project's own domain because the official
+    // app's verified domains are fixed at build time; change it only if you
+    // ship your own build with your own domain.
+    std::string mobile_redirect_uri = "https://bsfchat.com/oauth/callback";
+    // Re-admits bsfchat://oauth/callback on bsfchat-desktop for mobile builds
+    // from before bsfchat-mobile existed. Any app can claim a custom scheme,
+    // so with this on, an app can sign in AS BSFChat with one tap of Allow.
+    // Off by default; turn on only for a transition and say so to users.
+    bool allow_legacy_mobile_scheme = false;
+
     // NOTE: TLS is intentionally not handled here. The service speaks plain
     // HTTP and expects TLS termination at the reverse proxy in front of it.
 

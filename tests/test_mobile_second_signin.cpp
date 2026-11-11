@@ -64,7 +64,7 @@ std::string s256_challenge(const std::string& verifier) {
 
 const std::string kVerifier = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG";
 // What the phone actually asks for (oidc::kNativeRedirectUri).
-const std::string kNativeRedirect = "bsfchat://oauth/callback";
+const std::string kNativeRedirect = "https://bsfchat.com/oauth/callback";
 const std::string kUat = "https://uat.bsfchat.com";
 
 std::string form_encode(const std::map<std::string, std::string>& params) {
@@ -141,13 +141,9 @@ protected:
         account.updated_at = now;
         ASSERT_TRUE(store->create_account(account));
 
-        OAuthClient desktop;
-        desktop.client_id = "bsfchat-desktop";
-        desktop.client_secret = "";
-        desktop.name = "BSFChat";
-        desktop.redirect_uris = first_party_redirect_uris();
-        desktop.created_at = now;
-        ASSERT_TRUE(store->create_oauth_client(desktop));
+        // Both first-party clients, exactly as IdentityServer seeds them; the
+        // phone signs in as bsfchat-mobile through the claimed https redirect.
+        ensure_first_party_client(*store, config);
 
         // The one server this account belongs to — the reviewer's shape.
         store->add_server_membership("acct-review", kUat, "BSFChat UAT");
@@ -182,7 +178,7 @@ protected:
         req.method = "GET";
         req.remote_addr = "10.0.0.1";
         req.set_header("Cookie", cookie);
-        req.params.emplace("client_id", "bsfchat-desktop");
+        req.params.emplace("client_id", "bsfchat-mobile");
         req.params.emplace("redirect_uri", kNativeRedirect);
         req.params.emplace("response_type", "code");
         req.params.emplace("scope", "openid profile");
@@ -210,7 +206,7 @@ protected:
             {"grant_type", "authorization_code"},
             {"code", code},
             {"redirect_uri", kNativeRedirect},
-            {"client_id", "bsfchat-desktop"},
+            {"client_id", "bsfchat-mobile"},
             {"code_verifier", kVerifier},
         };
         if (!resource.empty()) body["resource"] = resource;
@@ -344,7 +340,7 @@ TEST_F(MobileSecondSignInTest, AnExpiredPromptSendsTheUserBackToTheApp) {
     stale.token = "stale-consent-token";
     stale.session_id = session_id;       // hashed by the store
     stale.account_id = "acct-review";
-    stale.client_id = "bsfchat-desktop";
+    stale.client_id = "bsfchat-mobile";
     stale.redirect_uri = kNativeRedirect;
     stale.scope = "openid profile";
     stale.state = "state-waiting";
@@ -416,7 +412,7 @@ TEST_F(MobileSecondSignInTest, ASecondLoginRePutsThePromptRatherThanDeadEnding) 
     EXPECT_EQ(query_param(location, "resource"), kUat);
     EXPECT_EQ(query_param(location, "nonce"), "nonce-2");
     EXPECT_EQ(query_param(location, "state"), "state-2");
-    EXPECT_EQ(query_param(location, "client_id"), "bsfchat-desktop");
+    EXPECT_EQ(query_param(location, "client_id"), "bsfchat-mobile");
     EXPECT_EQ(query_param(location, "redirect_uri"), kNativeRedirect);
     EXPECT_EQ(query_param(location, "code_challenge"), challenge);
     EXPECT_EQ(query_param(location, "code_challenge_method"), "S256");
