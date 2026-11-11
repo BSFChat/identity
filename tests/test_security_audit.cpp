@@ -525,3 +525,45 @@ TEST_F(SecurityAudit, Lenum_TakenEmailIsNotDistinguishableAsServerError) {
     accounts->handle_register(req, res);
     EXPECT_NE(status_of(res), 500) << res.body;
 }
+
+// ---------------------------------------------------------------------------
+// The password RE-checks — PUT /api/profile {old_password} and
+// POST /api/user/2fa/disable {password} — had no limiter and no failure
+// counter, unlike /api/login. Holding a session cookie (stolen, or a shared
+// browser) therefore bought unlimited password guesses with a clear 403 oracle,
+// and with the password, 2FA off and every other session signed out. Each
+// wrong guess is also a full PBKDF2 nobody metered.
+// ---------------------------------------------------------------------------
+TEST_F(SecurityAudit, PasswordRecheckIsLockedPerAccount) {
+    auto attempt_disable = [&](const std::string& password) {
+        auto req = json_request(json{{"password", password}});
+        req.set_header("Cookie", "session=" + browser_session);
+        httplib::Response res;
+        accounts->handle_2fa_disable(req, res);
+        return status_of(res);
+    };
+    int first_429 = -1;
+    for (int i = 0; i < 64 && first_429 < 0; ++i) {
+        if (attempt_disable("wrong guess " + std::to_string(i)) == 429) first_429 = i;
+    }
+    ASSERT_GE(first_429, 0) << "64 wrong passwords through /2fa/disable and no lockout";
+
+    // Locked means locked: the right password is refused too, or the lock is an
+    // oracle (429 for wrong, 200 for right).
+    EXPECT_EQ(attempt_disable(kPassword), 429);
+
+    // The same lock covers the profile route.
+    auto req = json_request(json{{"old_password", kPassword}, {"new_password", "another new one"}});
+    req.method = "PUT";
+    req.set_header("Cookie", "session=" + browser_session);
+    httplib::Response res;
+    accounts->handle_update_profile(req, res);
+    EXPECT_EQ(status_of(res), 429) << res.body;
+
+    // And it is not a way to lock the owner out of signing in.
+    httplib::Response lres;
+    accounts->handle_login(json_request(json{{"username", "alice"}, {"password", kPassword}},
+                                        "10.7.7.7"),
+                           lres);
+    EXPECT_EQ(status_of(lres), 200) << lres.body;
+}

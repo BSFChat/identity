@@ -100,6 +100,15 @@ private:
     // A PBKDF2 hash of nothing in particular, at the configured cost, so an
     // unknown username costs the same as a wrong password (security audit L2).
     const std::string& dummy_password_hash();
+    // Re-verifies the signed-in account's password for a sensitive change
+    // (password change, 2FA disable). Throttled per address and locked per
+    // account like /api/login, so a stolen session cookie is not an unlimited
+    // password oracle and a loop of wrong guesses is not unmetered PBKDF2.
+    // Returns true when the password is right; otherwise it has written a 429
+    // or a 403 carrying `wrong_message`.
+    bool recheck_password(const httplib::Request& req, httplib::Response& res,
+                          const Account& account, const std::string& password,
+                          const char* wrong_message);
 
     IdentityStore& store_;
     const Config& config_;

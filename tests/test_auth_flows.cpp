@@ -1364,3 +1364,30 @@ TEST(WebUtilTest, ScopeMatchingIsTokenwise) {
     EXPECT_FALSE(scope_contains("openid profile", "email"));
     EXPECT_FALSE(scope_contains("openidx", "openid"));
 }
+
+// server_name was cut with resize(128) — at a BYTE. 43 CJK characters are 129
+// bytes, so the cut split the last one, invalid UTF-8 was stored, and from then
+// on GET /api/servers threw in json::dump() and answered 500 for that account:
+// the desktop client could not restore its servers, and the bad row could not
+// be removed because the list that offers "remove" never rendered.
+TEST_F(TokenSeparationTest, ALongMultibyteServerNameDoesNotBreakTheList) {
+    auto token = mint_access_token();
+    std::string name;
+    for (int i = 0; i < 43; ++i) name += "\xE6\x97\xA5"; // U+65E5, 3 bytes each
+    ASSERT_EQ(name.size(), 129u);
+
+    auto req = json_request(json{{"server_url", "https://cjk.example"}, {"server_name", name}});
+    req.set_header("Authorization", "Bearer " + token);
+    httplib::Response add_res;
+    accounts->handle_add_server(req, add_res);
+    ASSERT_EQ(status_of(add_res), 200) << add_res.body;
+
+    httplib::Response list_res;
+    accounts->handle_list_servers(bearer_request(token), list_res);
+    ASSERT_EQ(status_of(list_res), 200) << list_res.body;
+    auto list = json::parse(list_res.body);
+    ASSERT_EQ(list.size(), 1u);
+    // Truncated to whole characters: 42 of them, 126 bytes.
+    EXPECT_EQ(list[0].value("server_name", list[0].value("name", "")), name.substr(0, 126))
+        << list_res.body;
+}

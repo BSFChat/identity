@@ -142,7 +142,8 @@ foreach(proof
         M2_TotpCodeCannotBeReplayed
         M2b_SecondFactorGuessingIsLimitedPerAccount
         M3_SessionsCanBeRevokedFromTheList
-        Lenum_TakenEmailIsNotDistinguishableAsServerError)
+        Lenum_TakenEmailIsNotDistinguishableAsServerError
+        PasswordRecheckIsLockedPerAccount)
     add_test(NAME SecurityAudit.${proof}
              COMMAND identity_security_audit_tests --gtest_filter=SecurityAudit.${proof})
 endforeach()
