@@ -1497,6 +1497,42 @@ void IdentityStore::add_server_membership(const std::string& account_id,
     sqlite3_step(stmt.get());
 }
 
+bool IdentityStore::record_server_signin(const std::string& account_id,
+                                         const std::string& server_url,
+                                         const std::string& server_name,
+                                         size_t max_memberships) {
+    std::lock_guard lock(mutex_);
+    Transaction txn(db_);
+    {
+        auto have = prepare(db_,
+            "SELECT 1 FROM server_memberships WHERE account_id = ? AND server_url = ?");
+        bind_text(have.get(), 1, account_id);
+        bind_text(have.get(), 2, server_url);
+        if (sqlite3_step(have.get()) == SQLITE_ROW) {
+            txn.commit();
+            return true; // already listed; a name the user chose is kept
+        }
+    }
+    {
+        auto count = prepare(db_, "SELECT COUNT(*) FROM server_memberships WHERE account_id = ?");
+        bind_text(count.get(), 1, account_id);
+        if (sqlite3_step(count.get()) == SQLITE_ROW &&
+            static_cast<size_t>(sqlite3_column_int64(count.get(), 0)) >= max_memberships) {
+            txn.commit();
+            return false;
+        }
+    }
+    auto ins = prepare(db_,
+        "INSERT INTO server_memberships (account_id, server_url, server_name, joined_at) "
+        "VALUES (?, ?, ?, strftime('%s','now'))");
+    bind_text(ins.get(), 1, account_id);
+    bind_text(ins.get(), 2, server_url);
+    bind_text(ins.get(), 3, server_name);
+    const bool ok = sqlite3_step(ins.get()) == SQLITE_DONE;
+    txn.commit();
+    return ok;
+}
+
 void IdentityStore::remove_server_membership(const std::string& account_id,
                                               const std::string& server_url) {
     std::lock_guard lock(mutex_);

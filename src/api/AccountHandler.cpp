@@ -98,7 +98,6 @@ bool may_use_server_list(const AuthContext& ctx) {
 // carry the "openid" scope that every relying party asks for.
 constexpr size_t kMaxServerUrlLength = 512;
 constexpr size_t kMaxServerNameLength = 128;
-constexpr size_t kMaxServerMemberships = 100;
 
 // Characters a homeserver or avatar URL never needs, and which are exactly the
 // ones that break out of an HTML attribute or a JS string: security audit M1

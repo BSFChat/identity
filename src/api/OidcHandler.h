@@ -23,6 +23,12 @@ public:
     void handle_revoke(const httplib::Request& req, httplib::Response& res);
 
 private:
+    // When a first-party app signs in to a chat server, add that server to
+    // the account's list (insert-if-missing), so every device restores it
+    // without the user re-adding it by hand. No-op for any other client.
+    void record_first_party_signin(const std::string& account_id, const std::string& client_id,
+                                   const std::string& server_url);
+
     // `scope` gates which profile claims are released (M4). `resource` is the
     // canonical URL of the chat server the grant names and becomes `aud`;
     // empty means the request named none and the token gets the legacy
