@@ -330,16 +330,28 @@ public:
         std::string server_url;
         std::string server_name; // human-readable, optional
         int64_t joined_at = 0;
+        // Non-zero once the user approved a first-party sign-in to this
+        // server on the consent page (audit I-1); see server_signin_consented().
+        int64_t consented_at = 0;
     };
+    // Adds or renames a row. Keeps consented_at: re-adding a server from the
+    // app or the portal neither grants nor withdraws a consent.
     void add_server_membership(const std::string& account_id, const std::string& server_url,
                                 const std::string& server_name = "");
     // Adds a server to the account's list when one of the first-party apps
-    // signs in to it, so every device restores it. Insert-if-missing: a name
-    // the user set is never overwritten. False when the list is full.
+    // signs in to it through the consent page (an authorization-code grant),
+    // so every device restores it, and marks the row consented. Never
+    // overwrites a name the user set. False when the list is full.
     bool record_server_signin(const std::string& account_id, const std::string& server_url,
                               const std::string& server_name, size_t max_memberships);
     void remove_server_membership(const std::string& account_id, const std::string& server_url);
     std::vector<ServerMembership> list_server_memberships(const std::string& account_id);
+    // Audit I-1: may a refresh token of this account mint a sign-in token
+    // for `server_url` (canonical)? Only when the server is on the account's
+    // list AND the row was written or confirmed by a consented sign-in. A row
+    // the app or portal merely added does not count: any first-party access
+    // token can write the list, and a refresh token can mint one.
+    bool server_signin_consented(const std::string& account_id, const std::string& server_url);
 
 private:
     void exec(const std::string& sql);

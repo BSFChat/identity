@@ -1110,13 +1110,21 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
         }
 
         // A chat-server token on refresh (RFC 8707 resource on the refresh
-        // grant). This is what lets a signed-in BSFChat app join another
-        // server without a browser trip: the id_token is audienced to exactly
-        // the server named here — so C1 holds, a token for one server is
-        // still refused by every other — and only the app holding this
-        // refresh token can ask. Only the first-party apps may: for them,
-        // the user picking a server in the app is the consent; for a third
-        // party it would be a silent grant to servers the user never saw.
+        // grant). This is what lets a signed-in BSFChat app reconnect to its
+        // servers, on any device, without a browser trip: the id_token is
+        // audienced to exactly the server named here — so C1 holds, a token
+        // for one server is still refused by every other. Only the
+        // first-party apps may ask.
+        //
+        // And only for a server the user has approved on the consent page
+        // (audit I-1): one whose row in the account's server list was
+        // written or confirmed by an authorization-code sign-in. Otherwise a
+        // refresh token — 90 days, and any copy of it — would be a sign-in
+        // credential for every chat server there is, while the consent
+        // screen only ever named one. A server merely added to the list by
+        // the app or the portal does not count (any first-party access token
+        // can write the list, and a refresh token mints those). For a new
+        // server the app gets invalid_target and runs /authorize once.
         //
         // Checked BEFORE rotation, so a bad request costs nothing: rotating
         // first and then refusing would burn the token and sign the app out.
@@ -1137,6 +1145,12 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
             if (nonce.empty() || !nonce_acceptable(nonce)) {
                 oauth_error(res, 400, "invalid_request",
                             "nonce is required with resource on refresh");
+                return;
+            }
+            if (!store_.server_signin_consented(account->id, *canonical)) {
+                log->info("Refused a server token on refresh for account {} to {}: not consented",
+                          account->id, *canonical);
+                oauth_error(res, 400, "invalid_target", "consent required for this server");
                 return;
             }
             server_audience = *canonical;
@@ -1179,8 +1193,9 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
         // would have.
         auto id_token = create_id_token(*account, rt->client_id, rt->scope, server_audience,
                                         server_audience.empty() ? "" : nonce);
+        // Not recorded in the server list: it is already there (checked
+        // above), and a refresh must never add a server to it.
         if (!server_audience.empty()) {
-            record_first_party_signin(account->id, rt->client_id, server_audience);
             log->info("Issued a server token on refresh for account {} to {}", account->id,
                       server_audience);
         }

@@ -23,9 +23,11 @@ public:
     void handle_revoke(const httplib::Request& req, httplib::Response& res);
 
 private:
-    // When a first-party app signs in to a chat server, add that server to
-    // the account's list (insert-if-missing), so every device restores it
-    // without the user re-adding it by hand. No-op for any other client.
+    // When a first-party app signs in to a chat server through the consent
+    // page (an authorization-code grant), add that server to the account's
+    // list (insert-if-missing) and mark it consented, so every device
+    // restores it and may later get tokens for it on refresh (audit I-1).
+    // No-op for any other client. Never called from the refresh grant.
     void record_first_party_signin(const std::string& account_id, const std::string& client_id,
                                    const std::string& server_url);
 

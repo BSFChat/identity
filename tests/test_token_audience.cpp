@@ -636,8 +636,10 @@ TEST_F(TokenAudienceTest, TheNativeCallbackCannotBorrowAnotherServersToken) {
 // The refresh grant takes a `resource` (RFC 8707) and a nonce from a
 // first-party app and returns an id_token for exactly that server. The C1
 // binding holds — one token, one server — and only the holder of the refresh
-// token can ask. Every server a first-party app signs in to is added to the
-// account's list, so the next device restores it with no web-console visit.
+// token can ask, and only for a server the user approved on the consent page
+// (audit I-1). Every server a first-party app signs in to through the consent
+// page is added to the account's list, so the next device restores it with
+// no web-console visit.
 // ---------------------------------------------------------------------------
 namespace {
 const std::string kChat2 = "https://second.example";
@@ -666,6 +668,7 @@ protected:
 };
 
 TEST_F(AuthFirstTest, RefreshNamesOneServerAndEchoesTheNonce) {
+    desktop_login({{"resource", kChat2}}); // consented once, on another grant
     auto first = desktop_login({{"resource", kChat}});
     auto res = refresh_for(first["refresh_token"].get<std::string>(),
                            {{"resource", kChat2}, {"nonce", "n-join-2"}});
@@ -692,8 +695,11 @@ TEST_F(AuthFirstTest, ABadServerRequestDoesNotBurnTheRefreshToken) {
     EXPECT_EQ(json::parse(insecure.body)["error"], "invalid_target");
     // A nonce with nothing to bind it to.
     EXPECT_EQ(status_of(refresh_for(rt, {{"nonce", "n1"}})), 400);
-    // And after all three refusals the token still works: nothing was rotated.
-    EXPECT_EQ(status_of(refresh_for(rt, {{"resource", kChat2}, {"nonce", "n2"}})), 200);
+    // A server the user never approved (I-1).
+    auto unconsented = refresh_for(rt, {{"resource", kChat2}, {"nonce", "n1"}});
+    EXPECT_EQ(status_of(unconsented), 400);
+    // And after all four refusals the token still works: nothing was rotated.
+    EXPECT_EQ(status_of(refresh_for(rt, {{"resource", kChat}, {"nonce", "n2"}})), 200);
 }
 
 TEST_F(AuthFirstTest, AThirdPartyClientCannotMintServerTokensOnRefresh) {
@@ -730,12 +736,42 @@ TEST_F(AuthFirstTest, AThirdPartyClientCannotMintServerTokensOnRefresh) {
 }
 
 TEST_F(AuthFirstTest, EveryServerAFirstPartyAppSignsInToIsListed) {
-    auto first = desktop_login({{"resource", kChat}});
+    desktop_login({{"resource", kChat}});
     EXPECT_TRUE(listed(kChat)) << "a browser sign-in to a server did not record it";
-    ASSERT_EQ(status_of(refresh_for(first["refresh_token"].get<std::string>(),
-                                    {{"resource", kChat2}, {"nonce", "n-2"}})),
-              200);
-    EXPECT_TRUE(listed(kChat2)) << "a joined server did not record it";
+}
+
+// Audit I-1. The consent screen named one server; the refresh token must not
+// become a sign-in credential for every other one.
+TEST_F(AuthFirstTest, I1_RefreshForAServerNeverConsentedToIsRefused) {
+    const auto rt = desktop_login({{"resource", kChat}})["refresh_token"].get<std::string>();
+    auto res = refresh_for(rt, {{"resource", kChat2}, {"nonce", "n-2"}});
+    ASSERT_EQ(status_of(res), 400) << res.body;
+    auto body = json::parse(res.body);
+    EXPECT_EQ(body["error"], "invalid_target");
+    EXPECT_EQ(body.value("error_description", ""), "consent required for this server");
+    EXPECT_FALSE(listed(kChat2)) << "a refused refresh added the server to the list";
+    // The app falls back to /authorize, the user approves, and from then on
+    // the refresh grant may mint for it — from any of the account's grants.
+    desktop_login({{"resource", kChat2}});
+    auto again = refresh_for(rt, {{"resource", kChat2}, {"nonce", "n-3"}});
+    ASSERT_EQ(status_of(again), 200) << again.body;
+    EXPECT_EQ(jwt_payload(json::parse(again.body)["id_token"].get<std::string>())["aud"], kChat2);
+}
+
+// Any first-party access token can write the list, and a refresh token mints
+// those, so a row added through POST /api/servers is not consent.
+TEST_F(AuthFirstTest, I1_AServerAddedToTheListByHandIsNotConsent) {
+    const auto rt = desktop_login({{"resource", kChat}})["refresh_token"].get<std::string>();
+    store->add_server_membership("acct-1", kChat2, "Added by the app");
+    EXPECT_FALSE(store->server_signin_consented("acct-1", kChat2));
+    EXPECT_EQ(status_of(refresh_for(rt, {{"resource", kChat2}, {"nonce", "n-2"}})), 400);
+    // Re-adding a consented server (a rename) keeps its consent.
+    store->add_server_membership("acct-1", kChat, "Renamed");
+    EXPECT_TRUE(store->server_signin_consented("acct-1", kChat));
+    // Removing it from the list withdraws it.
+    store->remove_server_membership("acct-1", kChat);
+    EXPECT_EQ(status_of(refresh_for(rt, {{"resource", kChat}, {"nonce", "n-3"}})), 400);
+    EXPECT_FALSE(listed(kChat));
 }
 
 TEST_F(AuthFirstTest, RecordingNeverOverwritesANameTheUserChose) {

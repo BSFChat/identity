@@ -538,6 +538,46 @@ void IdentityStore::migrate_locked() {
         }
         txn.commit();
     }
+
+    // --- audit 2026-11-15: I-1, I-9, I-16, I-12 -----------------------------
+    // Additive columns, guarded by the column like consumed_at above, so no
+    // user_version bump is needed and a re-run is a no-op.
+    //
+    // server_memberships.consented_at (I-1): non-zero once the user approved
+    // a first-party sign-in to that server on the consent page. Only such
+    // rows let a refresh token mint a token for the server. Not backfilled:
+    // an existing row may have been written by any first-party access token,
+    // so it proves nothing; the first sign-in to it after the upgrade goes
+    // through the browser once, as every sign-in did before.
+    if (!has_column_locked("server_memberships", "consented_at")) {
+        exec("ALTER TABLE server_memberships ADD COLUMN consented_at INTEGER NOT NULL DEFAULT 0");
+    }
+    // auth_codes.redeemed_at / family_id / access_token (I-9): a redeemed
+    // code is kept until it expires, with what it was exchanged for, so a
+    // replay can revoke those tokens (RFC 6749 4.1.2).
+    if (!has_column_locked("auth_codes", "redeemed_at")) {
+        exec("ALTER TABLE auth_codes ADD COLUMN redeemed_at INTEGER NOT NULL DEFAULT 0");
+    }
+    if (!has_column_locked("auth_codes", "family_id")) {
+        exec("ALTER TABLE auth_codes ADD COLUMN family_id TEXT NOT NULL DEFAULT ''");
+    }
+    if (!has_column_locked("auth_codes", "access_token")) {
+        exec("ALTER TABLE auth_codes ADD COLUMN access_token TEXT NOT NULL DEFAULT ''");
+    }
+    // refresh_tokens.replaced_by / grace_used (I-16): which token replaced
+    // this one, so a retry inside the grace window can be told apart from a
+    // replay of an older generation, and whether the retry was already used.
+    if (!has_column_locked("refresh_tokens", "replaced_by")) {
+        exec("ALTER TABLE refresh_tokens ADD COLUMN replaced_by TEXT NOT NULL DEFAULT ''");
+    }
+    if (!has_column_locked("refresh_tokens", "grace_used")) {
+        exec("ALTER TABLE refresh_tokens ADD COLUMN grace_used INTEGER NOT NULL DEFAULT 0");
+    }
+    // accounts.deleted_at (I-12): a deleted account's tombstone. See
+    // delete_account().
+    if (!has_column_locked("accounts", "deleted_at")) {
+        exec("ALTER TABLE accounts ADD COLUMN deleted_at INTEGER NOT NULL DEFAULT 0");
+    }
 }
 
 // Accounts
@@ -1488,12 +1528,16 @@ void IdentityStore::add_server_membership(const std::string& account_id,
                                            const std::string& server_url,
                                            const std::string& server_name) {
     std::lock_guard lock(mutex_);
+    // An upsert rather than INSERT OR REPLACE, which would drop the row and
+    // with it consented_at.
     auto stmt = prepare(db_,
-        "INSERT OR REPLACE INTO server_memberships (account_id, server_url, server_name, joined_at) "
-        "VALUES (?, ?, ?, strftime('%s','now'))");
-    sqlite3_bind_text(stmt.get(), 1, account_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 2, server_url.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 3, server_name.c_str(), -1, SQLITE_TRANSIENT);
+        "INSERT INTO server_memberships (account_id, server_url, server_name, joined_at) "
+        "VALUES (?, ?, ?, strftime('%s','now')) "
+        "ON CONFLICT(account_id, server_url) DO UPDATE SET server_name = excluded.server_name, "
+        "joined_at = excluded.joined_at");
+    bind_text(stmt.get(), 1, account_id);
+    bind_text(stmt.get(), 2, server_url);
+    bind_text(stmt.get(), 3, server_name);
     sqlite3_step(stmt.get());
 }
 
@@ -1509,8 +1553,17 @@ bool IdentityStore::record_server_signin(const std::string& account_id,
         bind_text(have.get(), 1, account_id);
         bind_text(have.get(), 2, server_url);
         if (sqlite3_step(have.get()) == SQLITE_ROW) {
+            // Already listed; a name the user chose is kept. The sign-in
+            // went through the consent page, so the row now counts as
+            // consented (I-1) even if it was first added by hand.
+            auto mark = prepare(db_,
+                "UPDATE server_memberships SET consented_at = strftime('%s','now') "
+                "WHERE account_id = ? AND server_url = ?");
+            bind_text(mark.get(), 1, account_id);
+            bind_text(mark.get(), 2, server_url);
+            sqlite3_step(mark.get());
             txn.commit();
-            return true; // already listed; a name the user chose is kept
+            return true;
         }
     }
     {
@@ -1523,8 +1576,8 @@ bool IdentityStore::record_server_signin(const std::string& account_id,
         }
     }
     auto ins = prepare(db_,
-        "INSERT INTO server_memberships (account_id, server_url, server_name, joined_at) "
-        "VALUES (?, ?, ?, strftime('%s','now'))");
+        "INSERT INTO server_memberships (account_id, server_url, server_name, joined_at, "
+        "consented_at) VALUES (?, ?, ?, strftime('%s','now'), strftime('%s','now'))");
     bind_text(ins.get(), 1, account_id);
     bind_text(ins.get(), 2, server_url);
     bind_text(ins.get(), 3, server_name);
@@ -1547,7 +1600,7 @@ std::vector<IdentityStore::ServerMembership>
 IdentityStore::list_server_memberships(const std::string& account_id) {
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_,
-        "SELECT id, server_url, server_name, joined_at "
+        "SELECT id, server_url, server_name, joined_at, consented_at "
         "FROM server_memberships WHERE account_id = ? ORDER BY joined_at ASC");
     sqlite3_bind_text(stmt.get(), 1, account_id.c_str(), -1, SQLITE_TRANSIENT);
     std::vector<ServerMembership> out;
@@ -1557,9 +1610,22 @@ IdentityStore::list_server_memberships(const std::string& account_id) {
         m.server_url = col_text(stmt.get(), 1);
         m.server_name = col_text(stmt.get(), 2);
         m.joined_at = sqlite3_column_int64(stmt.get(), 3);
+        m.consented_at = sqlite3_column_int64(stmt.get(), 4);
         out.push_back(std::move(m));
     }
     return out;
+}
+
+bool IdentityStore::server_signin_consented(const std::string& account_id,
+                                            const std::string& server_url) {
+    if (server_url.empty()) return false;
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "SELECT 1 FROM server_memberships WHERE account_id = ? AND server_url = ? "
+        "AND consented_at != 0");
+    bind_text(stmt.get(), 1, account_id);
+    bind_text(stmt.get(), 2, server_url);
+    return sqlite3_step(stmt.get()) == SQLITE_ROW;
 }
 
 } // namespace bsfchat::id
