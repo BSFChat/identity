@@ -17,6 +17,46 @@ async function apiRequest(method, url, body) {
     return data;
 }
 
+// ---- Authorization request round trip ----
+//
+// /authorize sends a signed-out browser to /login.html with the request in
+// the query string (redirect_uri renamed to `redirect`). The login and
+// register pages pass that query string to each other unchanged, and both
+// finish through continueAfterSignIn(), so signing up from the app resumes
+// the app's sign-in exactly as signing in does.
+
+// Rebuild the /authorize request this page was sent from, if any.
+//
+// Every parameter is forwarded as it arrived (only `redirect` is renamed back
+// to `redirect_uri`), so a parameter /authorize learns later — nonce,
+// resource — survives the trip through these pages without this file having
+// to know about it. It can only ever navigate to /authorize on this origin,
+// which validates everything, so this is not an open redirect.
+function getOidcRedirectUrl() {
+    const params = new URLSearchParams(window.location.search);
+    const redirect = params.get('redirect');
+    if (!redirect) return null;
+    const forward = new URLSearchParams();
+    for (const [key, value] of params) {
+        forward.append(key === 'redirect' ? 'redirect_uri' : key, value);
+    }
+    if (!forward.has('response_type')) forward.set('response_type', 'code');
+    if (!forward.has('scope')) forward.set('scope', 'openid');
+    return '/authorize?' + forward.toString();
+}
+
+// `path` with this page's query string, so a link between the sign-in pages
+// keeps the authorization request. Only ever a same-origin path.
+function withAuthRequest(path) {
+    return path + window.location.search;
+}
+
+// Where to go once this browser has a session: back into the app's
+// authorization request when there is one, otherwise the account page.
+function continueAfterSignIn() {
+    window.location.href = getOidcRedirectUrl() || '/profile.html';
+}
+
 function apiGet(url) {
     return apiRequest('GET', url);
 }
