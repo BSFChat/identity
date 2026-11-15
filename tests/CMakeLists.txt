@@ -19,6 +19,7 @@ add_executable(identity_tests
     test_mobile_second_signin.cpp
     test_security_fixes.cpp
     test_version.cpp
+    test_signin_ux.cpp
 )
 
 target_include_directories(identity_tests PRIVATE

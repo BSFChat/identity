@@ -4,10 +4,38 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>BSFChat ID</title>
-    <!-- A meta refresh rather than inline script: the CSP allows no inline script. -->
-    <meta http-equiv="refresh" content="0; url=/profile.html">
+    <link rel="stylesheet" href="/css/style.css">
 </head>
 <body>
-    <p>Redirecting to <a href="/login.html">login</a>...</p>
+    <div class="container">
+        <div class="card">
+            <div class="logo">
+                <h1>BSFChat ID</h1>
+                <p class="subtitle">One account for BSFChat</p>
+            </div>
+
+            <p class="lead">
+                BSFChat ID is the account you sign in to BSFChat with. The BSFChat apps
+                send you here to sign in, and every chat server that trusts this BSFChat ID
+                knows you by the same name.
+            </p>
+            <p class="lead">
+                Here you can manage your profile, password, two-factor authentication and the
+                devices and apps signed in to your account.
+            </p>
+
+            <div class="btn-stack">
+                <a href="/login.html" id="primary-action" class="btn btn-primary">Sign in</a>
+                <a href="/register.html" class="btn btn-secondary" data-requires-registration>Create account</a>
+            </div>
+
+            <div class="card-footer">
+                <p>New to BSFChat? Find out more at <a href="https://bsfchat.com">bsfchat.com</a></p>
+            </div>
+        </div>
+    </div>
+
+    <script src="/js/app.js"></script>
+    <script src="/js/index.js"></script>
 </body>
 </html>

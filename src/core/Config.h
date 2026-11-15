@@ -11,6 +11,12 @@ struct Config {
     std::string bind_address = "0.0.0.0";
     int port = 8480;
     std::string issuer_url = "http://localhost:8480";
+    // Who a user should contact when they cannot sign in (a forgotten
+    // password, a lost authenticator): an email address or an https:// URL.
+    // Shown on the forgot-password page. Optional; empty shows only the
+    // generic advice. This service sends no email, so password recovery is
+    // the operator running `--reset-password` (see main.cpp).
+    std::string support_contact;
 
     // Database
     std::string database_path = "./data/identity.db";

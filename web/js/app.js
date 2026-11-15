@@ -57,6 +57,33 @@ function continueAfterSignIn() {
     window.location.href = getOidcRedirectUrl() || '/profile.html';
 }
 
+// Public facts about this deployment (GET /api/instance): whether sign-up
+// is open and who to contact for help. Fetched once per page. A failure
+// resolves to "registration open, no contact" — the server still refuses a
+// sign-up it does not allow, so guessing open only risks showing a link.
+let instanceInfoPromise = null;
+function loadInstanceInfo() {
+    if (!instanceInfoPromise) {
+        instanceInfoPromise = apiGet('/api/instance').catch(() => ({
+            registration_enabled: true,
+            support_contact: ''
+        }));
+    }
+    return instanceInfoPromise;
+}
+
+// Hides every element marked data-requires-registration when sign-up is
+// closed on this deployment.
+function applyRegistrationVisibility() {
+    return loadInstanceInfo().then(info => {
+        if (info.registration_enabled === false) {
+            document.querySelectorAll('[data-requires-registration]')
+                .forEach(node => node.classList.add('hidden'));
+        }
+        return info;
+    });
+}
+
 function apiGet(url) {
     return apiRequest('GET', url);
 }

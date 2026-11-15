@@ -208,6 +208,23 @@ body {
     width: 100%;
 }
 
+a.btn {
+    display: block;
+    text-decoration: none;
+}
+
+.btn-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    margin-top: 24px;
+}
+
+.lead {
+    color: var(--text-secondary);
+    margin-bottom: 12px;
+}
+
 .btn:active {
     transform: scale(0.98);
 }

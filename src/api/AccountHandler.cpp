@@ -656,6 +656,15 @@ void AccountHandler::handle_logout(const httplib::Request& req, httplib::Respons
     res.set_content(json{{"success", true}, {"ended", ended}}.dump(), "application/json");
 }
 
+void AccountHandler::handle_instance_info(const httplib::Request&, httplib::Response& res) {
+    json response = {
+        {"registration_enabled", config_.registration_enabled},
+        {"support_contact", config_.support_contact}
+    };
+    res.set_header("Cache-Control", "no-cache");
+    res.set_content(response.dump(), "application/json");
+}
+
 void AccountHandler::handle_get_profile(const httplib::Request& req, httplib::Response& res) {
     auto account_id = get_session_account(req);
     if (account_id.empty()) {

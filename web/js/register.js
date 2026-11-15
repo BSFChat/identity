@@ -3,6 +3,15 @@
 // Back to sign-in without losing the authorization request (see app.js).
 document.getElementById('login-link').href = withAuthRequest('/login.html');
 
+// Say so up front on a deployment with sign-up closed, instead of letting
+// someone fill the form in only to be refused.
+loadInstanceInfo().then(info => {
+    if (info.registration_enabled === false) {
+        document.getElementById('register-form').classList.add('hidden');
+        document.getElementById('registration-closed').classList.remove('hidden');
+    }
+});
+
 document.getElementById('register-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const username = document.getElementById('username').value;

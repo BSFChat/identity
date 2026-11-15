@@ -4,6 +4,13 @@ bind_address = "0.0.0.0"
 port = 8480
 issuer_url = "http://localhost:8480"
 
+# Who users should contact when they cannot sign in: an email address or an
+# https:// URL, shown on the "Forgot password?" page. This service sends no
+# email, so a forgotten password is reset by the operator with
+#   bsfchat-id --config <this file> --reset-password <username>
+# (see the [auth] notes below). Optional; leave empty to show generic advice.
+# support_contact = "support@example.com"
+
 [database]
 path = "./data/identity.db"
 

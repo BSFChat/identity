@@ -8,6 +8,7 @@ let pendingLoginToken = null;
 // Carry the authorization request (if any) over to the sign-up page, so
 // "Create one" from the app's sign-in does not strand the app.
 document.getElementById('register-link').href = withAuthRequest('/register.html');
+applyRegistrationVisibility();
 
 // Step 1: password
 document.getElementById('login-form').addEventListener('submit', async (e) => {

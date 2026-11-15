@@ -125,6 +125,8 @@ void IdentityServer::register_routes() {
              [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_login_2fa(req, res); });
     svr.Post("/api/logout",
              [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_logout(req, res); });
+    svr.Get("/api/instance",
+            [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_instance_info(req, res); });
     svr.Get("/api/profile",
             [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_get_profile(req, res); });
     svr.Put("/api/profile",
