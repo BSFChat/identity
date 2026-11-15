@@ -333,7 +333,7 @@ TEST_F(MobileSecondSignInTest, AStalePromptIsStillTheUsersToApproveOnce) {
     auto again = decide(shown_token);
     EXPECT_EQ(status_of(again), 409) << again.body;
     EXPECT_TRUE(header_of(again, "Location").empty());
-    EXPECT_NE(again.body.find("Already approved"), std::string::npos);
+    EXPECT_NE(again.body.find("already answered"), std::string::npos);
 }
 
 // A prompt left unanswered past its five minutes hands the app a real answer

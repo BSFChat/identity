@@ -33,6 +33,9 @@ public:
     void handle_register(const httplib::Request& req, httplib::Response& res);
     void handle_login(const httplib::Request& req, httplib::Response& res);
     void handle_logout(const httplib::Request& req, httplib::Response& res);
+    // Public facts about this deployment the static pages need before anyone
+    // signs in: whether sign-up is open, and who to contact for help.
+    void handle_instance_info(const httplib::Request& req, httplib::Response& res);
     void handle_get_profile(const httplib::Request& req, httplib::Response& res);
     void handle_update_profile(const httplib::Request& req, httplib::Response& res);
 

@@ -61,7 +61,7 @@ private:
     void render_consent_page(httplib::Response& res, const OAuthClient& client,
                              const Account& account, const std::string& scope,
                              const std::string& consent_token, const std::string& redirect_uri,
-                             const std::string& resource);
+                             const std::string& resource, const std::string& restart_url);
 
     IdentityStore& store_;
     KeyManager& key_manager_;

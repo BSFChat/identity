@@ -20,8 +20,8 @@
         <div class="card wide">
             <h2>Account Settings</h2>
 
-            <div id="error-msg" class="error hidden"></div>
-            <div id="success-msg" class="success hidden"></div>
+            <div id="error-msg" class="error hidden" role="alert" aria-live="assertive" tabindex="-1"></div>
+            <div id="success-msg" class="success hidden" role="status" aria-live="polite"></div>
 
             <!-- Tabs -->
             <div class="tabs">
@@ -71,6 +71,10 @@
                             <label for="new_password">New Password</label>
                             <input type="password" id="new_password" minlength="8" autocomplete="new-password">
                         </div>
+                        <div class="form-group">
+                            <label for="confirm_new_password">Confirm New Password</label>
+                            <input type="password" id="confirm_new_password" minlength="8" autocomplete="new-password">
+                        </div>
                         <button type="submit" class="btn btn-secondary">Change Password</button>
                     </form>
                 </div>
@@ -117,9 +121,11 @@
                         <div class="section-desc">
                             Enter a 6-digit code from your authenticator to finish setup.
                         </div>
+                        <label for="2fa-verify-code" class="visually-hidden">6-digit code from your authenticator</label>
                         <div class="code-input">
                             <input type="text" id="2fa-verify-code" maxlength="6"
-                                   placeholder="000000" autocomplete="off">
+                                   placeholder="000000" autocomplete="one-time-code" inputmode="numeric"
+                                   pattern="[0-9]*" autocapitalize="none" autocorrect="off" spellcheck="false">
                             <button class="btn btn-primary btn-small" id="2fa-verify-btn">Verify</button>
                             <button class="btn btn-secondary btn-small" id="2fa-cancel-btn">Cancel</button>
                         </div>

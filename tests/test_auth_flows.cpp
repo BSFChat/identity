@@ -519,7 +519,7 @@ TEST_F(AuthFlowTest, ConsentTokenIsSingleUse) {
     EXPECT_EQ(status_of(sres), 409);
     EXPECT_TRUE(extract_location(sres).empty());
     EXPECT_EQ(sres.body.find("code="), std::string::npos);
-    EXPECT_NE(sres.body.find("Already approved"), std::string::npos);
+    EXPECT_NE(sres.body.find("already answered"), std::string::npos);
 }
 
 TEST_F(AuthFlowTest, DenyingConsentReturnsAccessDenied) {

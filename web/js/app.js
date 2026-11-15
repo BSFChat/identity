@@ -1,20 +1,119 @@
 // BSFChat ID - Shared JavaScript
 
+// What to say when the answer is not this service's JSON: a reverse proxy's
+// own error page (nginx's 502 while the service restarts, 413 for a body
+// over its limit) or no answer at all. res.json() on those used to surface
+// as "Unexpected token '<'".
+function friendlyHttpError(status) {
+    if (status === 413) return 'That was too large to send.';
+    if (status === 429) return 'Too many attempts. Wait a minute and try again.';
+    if (status === 502 || status === 503 || status === 504) {
+        return 'BSFChat ID is not reachable right now. Try again in a moment.';
+    }
+    if (status >= 500) return `Something went wrong on our side (error ${status}). Try again in a moment.`;
+    return `The request could not be completed (error ${status}).`;
+}
+
 async function apiRequest(method, url, body) {
     const opts = {
         method,
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
         credentials: 'same-origin'
     };
     if (body && method !== 'GET') {
         opts.body = JSON.stringify(body);
     }
-    const res = await fetch(url, opts);
-    const data = await res.json();
+    let res;
+    try {
+        res = await fetch(url, opts);
+    } catch (networkError) {
+        throw new Error('Could not reach BSFChat ID. Check your connection and try again.');
+    }
+    let data = null;
+    const type = res.headers.get('Content-Type') || '';
+    if (type.includes('application/json')) {
+        try {
+            data = await res.json();
+        } catch (parseError) {
+            data = null;
+        }
+    }
     if (!res.ok) {
-        throw new Error(data.error || `Request failed (${res.status})`);
+        const err = new Error((data && data.error) || friendlyHttpError(res.status));
+        err.status = res.status;
+        throw err;
+    }
+    if (data === null) {
+        throw new Error('BSFChat ID sent an unexpected answer. Try again in a moment.');
     }
     return data;
+}
+
+// ---- Authorization request round trip ----
+//
+// /authorize sends a signed-out browser to /login.html with the request in
+// the query string (redirect_uri renamed to `redirect`). The login and
+// register pages pass that query string to each other unchanged, and both
+// finish through continueAfterSignIn(), so signing up from the app resumes
+// the app's sign-in exactly as signing in does.
+
+// Rebuild the /authorize request this page was sent from, if any.
+//
+// Every parameter is forwarded as it arrived (only `redirect` is renamed back
+// to `redirect_uri`), so a parameter /authorize learns later — nonce,
+// resource — survives the trip through these pages without this file having
+// to know about it. It can only ever navigate to /authorize on this origin,
+// which validates everything, so this is not an open redirect.
+function getOidcRedirectUrl() {
+    const params = new URLSearchParams(window.location.search);
+    const redirect = params.get('redirect');
+    if (!redirect) return null;
+    const forward = new URLSearchParams();
+    for (const [key, value] of params) {
+        forward.append(key === 'redirect' ? 'redirect_uri' : key, value);
+    }
+    if (!forward.has('response_type')) forward.set('response_type', 'code');
+    if (!forward.has('scope')) forward.set('scope', 'openid');
+    return '/authorize?' + forward.toString();
+}
+
+// `path` with this page's query string, so a link between the sign-in pages
+// keeps the authorization request. Only ever a same-origin path.
+function withAuthRequest(path) {
+    return path + window.location.search;
+}
+
+// Where to go once this browser has a session: back into the app's
+// authorization request when there is one, otherwise the account page.
+function continueAfterSignIn() {
+    window.location.href = getOidcRedirectUrl() || '/profile.html';
+}
+
+// Public facts about this deployment (GET /api/instance): whether sign-up
+// is open and who to contact for help. Fetched once per page. A failure
+// resolves to "registration open, no contact" — the server still refuses a
+// sign-up it does not allow, so guessing open only risks showing a link.
+let instanceInfoPromise = null;
+function loadInstanceInfo() {
+    if (!instanceInfoPromise) {
+        instanceInfoPromise = apiGet('/api/instance').catch(() => ({
+            registration_enabled: true,
+            support_contact: ''
+        }));
+    }
+    return instanceInfoPromise;
+}
+
+// Hides every element marked data-requires-registration when sign-up is
+// closed on this deployment.
+function applyRegistrationVisibility() {
+    return loadInstanceInfo().then(info => {
+        if (info.registration_enabled === false) {
+            document.querySelectorAll('[data-requires-registration]')
+                .forEach(node => node.classList.add('hidden'));
+        }
+        return info;
+    });
 }
 
 function apiGet(url) {
@@ -33,22 +132,43 @@ function apiDelete(url) {
     return apiRequest('DELETE', url);
 }
 
+// Banners. Both are live regions in the markup (role="alert" for errors,
+// role="status" for success), so a screen reader announces them. An error
+// stays until the next message replaces it — it used to vanish after five
+// seconds, often before it was read — and is scrolled into view, taking
+// focus only when focus is not in a field the user is typing in.
+let successTimer = null;
+
+function revealBanner(node) {
+    node.classList.remove('hidden');
+    node.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
 function showError(msg) {
-    const el = document.getElementById('error-msg');
-    if (el) {
-        el.textContent = msg;
-        el.classList.remove('hidden');
-        setTimeout(() => el.classList.add('hidden'), 5000);
-    }
+    const node = document.getElementById('error-msg');
+    if (!node) return;
+    const success = document.getElementById('success-msg');
+    if (success) success.classList.add('hidden');
+    node.textContent = msg;
+    revealBanner(node);
+    const active = document.activeElement;
+    const typing = active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA');
+    if (!typing) node.focus({ preventScroll: true });
+}
+
+function clearError() {
+    const node = document.getElementById('error-msg');
+    if (node) node.classList.add('hidden');
 }
 
 function showSuccess(msg) {
-    const el = document.getElementById('success-msg');
-    if (el) {
-        el.textContent = msg;
-        el.classList.remove('hidden');
-        setTimeout(() => el.classList.add('hidden'), 5000);
-    }
+    const node = document.getElementById('success-msg');
+    if (!node) return;
+    clearError();
+    node.textContent = msg;
+    revealBanner(node);
+    clearTimeout(successTimer);
+    successTimer = setTimeout(() => node.classList.add('hidden'), 8000);
 }
 
 // Escapes text for interpolation into HTML, attribute values included.

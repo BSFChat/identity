@@ -1,6 +1,8 @@
 #pragma once
 
+#include <optional>
 #include <string>
+#include <string_view>
 
 namespace bsfchat::id {
 
@@ -26,5 +28,12 @@ bool verify_password(const std::string& password, const std::string& stored_hash
 // True when the stored hash uses the legacy format or fewer iterations than the
 // target, i.e. it should be upgraded next time the plaintext is available.
 bool password_needs_rehash(const std::string& stored_hash, int target_iterations);
+
+// The password policy, in one place: registration, the password change and
+// the operator's --reset-password all apply it. nullopt when acceptable,
+// otherwise a sentence fit to show the user.
+inline constexpr size_t kMinPasswordLength = 8;
+inline constexpr size_t kMaxPasswordLength = 1024;
+std::optional<std::string> password_policy_error(std::string_view password);
 
 } // namespace bsfchat::id

@@ -45,7 +45,6 @@ std::string generate_session_id() {
 }
 
 constexpr int kSessionLifetimeSeconds = 86400 * 7;
-constexpr size_t kMaxPasswordLength = 1024;
 
 void json_error(httplib::Response& res, int status, const std::string& error) {
     res.status = status;
@@ -436,12 +435,8 @@ void AccountHandler::handle_register(const httplib::Request& req, httplib::Respo
         return;
     }
 
-    if (password.size() < 8) {
-        json_error(res, 400, "Password must be at least 8 characters");
-        return;
-    }
-    if (password.size() > kMaxPasswordLength) {
-        json_error(res, 400, "Password is too long");
+    if (auto err = password_policy_error(password)) {
+        json_error(res, 400, *err);
         return;
     }
 
@@ -524,8 +519,28 @@ void AccountHandler::handle_login(const httplib::Request& req, httplib::Response
         return;
     }
 
-    // Failure keys use the username as SUBMITTED, never whether it exists,
-    // so the lockout is not an existence oracle. They are never logged.
+    // Usernames are lowercase by grammar (core/Username.cpp), but phones
+    // capitalise the first letter of a text field, and "Alice" used to be a
+    // wrong password that counted toward the lockout (audit I-4). The exact
+    // name is still tried first, for any account created before the grammar
+    // refused uppercase; failing that, the ASCII-lowercased name. The folded
+    // name is what the failure keys below use, so "ALICE" and "alice" share
+    // one lockout instead of doubling the attempts a guesser gets.
+    auto account = store_.get_account_by_username(username);
+    if (!account) {
+        std::string folded = username;
+        std::transform(folded.begin(), folded.end(), folded.begin(), [](unsigned char c) {
+            return static_cast<char>(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
+        });
+        if (folded != username) {
+            username = std::move(folded);
+            account = store_.get_account_by_username(username);
+        }
+    }
+
+    // Failure keys use the username as submitted (after the fold above),
+    // never whether it exists, so the lockout is not an existence oracle.
+    // They are never logged.
     //
     // There is no per-address lockout any more (security audit H2): behind a
     // proxy that is not in trusted_proxies every user shares one address, and
@@ -533,8 +548,6 @@ void AccountHandler::handle_login(const httplib::Request& req, httplib::Response
     // VOLUME is still bounded by login_limiter_ above.
     const auto pair_key = ip_key.empty() ? std::string{} : "login:" + ip_key + "|" + username;
     const auto name_key = "login-user:" + username;
-
-    auto account = store_.get_account_by_username(username);
 
     // A second factor under attack locks its account for everybody, the
     // owner included (security audit M2). Only somebody holding the password
@@ -656,6 +669,15 @@ void AccountHandler::handle_logout(const httplib::Request& req, httplib::Respons
     res.set_content(json{{"success", true}, {"ended", ended}}.dump(), "application/json");
 }
 
+void AccountHandler::handle_instance_info(const httplib::Request&, httplib::Response& res) {
+    json response = {
+        {"registration_enabled", config_.registration_enabled},
+        {"support_contact", config_.support_contact}
+    };
+    res.set_header("Cache-Control", "no-cache");
+    res.set_content(response.dump(), "application/json");
+}
+
 void AccountHandler::handle_get_profile(const httplib::Request& req, httplib::Response& res) {
     auto account_id = get_session_account(req);
     if (account_id.empty()) {
@@ -750,12 +772,8 @@ void AccountHandler::handle_update_profile(const httplib::Request& req, httplib:
             return;
         }
         auto new_password = string_field(*body, "new_password");
-        if (new_password.size() < 8) {
-            json_error(res, 400, "New password must be at least 8 characters");
-            return;
-        }
-        if (new_password.size() > kMaxPasswordLength) {
-            json_error(res, 400, "New password is too long");
+        if (auto err = password_policy_error(new_password)) {
+            json_error(res, 400, "New p" + err->substr(1));
             return;
         }
         // update_account() does not write password_hash, so the change has to

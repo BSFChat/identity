@@ -14,12 +14,18 @@
                 <p class="subtitle">Create a new account</p>
             </div>
 
-            <div id="error-msg" class="error hidden"></div>
+            <div id="error-msg" class="error hidden" role="alert" aria-live="assertive" tabindex="-1"></div>
+
+            <div id="registration-closed" class="hidden">
+                <p>New accounts cannot be created here at the moment. If you already have an
+                   account, sign in instead.</p>
+            </div>
 
             <form id="register-form">
                 <div class="form-group">
                     <label for="username">Username</label>
                     <input type="text" id="username" name="username" required autocomplete="username" autofocus
+                           autocapitalize="none" autocorrect="off" spellcheck="false"
                            maxlength="64" pattern="[a-z0-9._\-]+"
                            title="Lowercase letters, digits, '.', '_' and '-'">
                 </div>
@@ -39,7 +45,7 @@
             </form>
 
             <div class="card-footer">
-                <p>Already have an account? <a href="/login.html">Sign in</a></p>
+                <p>Already have an account? <a href="/login.html" id="login-link">Sign in</a></p>
             </div>
         </div>
     </div>

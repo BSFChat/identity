@@ -170,26 +170,19 @@ bool nonce_acceptable(const std::string& nonce) {
 // human halfway through signing in on a phone, and the only useful thing to
 // tell them is what to do next. Styled with the same stylesheet as the consent
 // page so it does not look like a crash.
+//
+// `action_href`, when given, becomes a button under the advice — always a
+// same-origin path built by this file (a restarted /authorize), html-escaped.
 void render_notice_page(httplib::Response& res, int status, const std::string& title,
-                        const std::string& detail, const std::string& next_step) {
-    std::ostringstream html;
-    html << "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
-         << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
-         << "<title>" << html_escape(title) << " - BSFChat ID</title>"
-         << "<link rel=\"stylesheet\" href=\"/css/style.css\"></head><body>"
-         << "<div class=\"container\"><div class=\"card\">"
-         << "<div class=\"logo\"><h1>BSFChat ID</h1>"
-         << "<p class=\"subtitle\">" << html_escape(title) << "</p></div>"
-         << "<p>" << html_escape(detail) << "</p>"
-         << "<p style=\"color:var(--text-muted);font-size:14px;\">"
-         << html_escape(next_step) << "</p>"
-         << "</div></div></body></html>";
-
+                        const std::string& detail, const std::string& next_step,
+                        const std::string& action_href = {},
+                        const std::string& action_label = {}) {
     res.status = status;
     res.set_header("Cache-Control", "no-store");
     res.set_header("X-Frame-Options", "DENY");
     res.set_header("Content-Security-Policy", "frame-ancestors 'none'");
-    res.set_content(html.str(), "text/html");
+    res.set_content(notice_page_html(title, detail, next_step, action_href, action_label),
+                    "text/html");
 }
 
 // The host (and port, if not the default) of a canonical audience URL, for
@@ -200,6 +193,84 @@ std::string audience_display_host(const std::string& canonical) {
     if (start == std::string::npos) return canonical;
     start += 3;
     return canonical.substr(start, canonical.find('/', start) - start);
+}
+
+// Is the caller a person in a browser, who should get a page rather than
+// JSON? See wants_html() in core/WebUtil.h. API clients, the tests and the
+// pages' own fetch() calls keep getting JSON.
+bool browser_wants_html(const httplib::Request& req) {
+    return wants_html(req.get_header_value("Accept"), req.get_header_value("Sec-Fetch-Mode"));
+}
+
+// An error from an endpoint people reach in a browser: a notice page for a
+// browser, the JSON `{"error": ...}` it always was for everyone else.
+void browser_or_json_error(const httplib::Request& req, httplib::Response& res, int status,
+                           const std::string& json_message, const std::string& title,
+                           const std::string& detail, const std::string& next_step,
+                           const std::string& action_href = {},
+                           const std::string& action_label = {}) {
+    if (browser_wants_html(req)) {
+        render_notice_page(res, status, title, detail, next_step, action_href, action_label);
+    } else {
+        json_error(res, status, json_message);
+    }
+}
+
+// What to tell someone whose /authorize link is malformed or names a client
+// or return address this service does not know. Nothing they can do on this
+// page fixes it, and nothing here should send them anywhere.
+constexpr const char* kBadAuthorizeNextStep =
+    "Go back to the app and start signing in again. If this keeps happening, the app may need "
+    "updating, or it may not be set up to use this BSFChat ID.";
+
+// A same-origin /authorize URL putting the given authorization request again.
+// Every value is re-encoded here; /authorize re-validates all of it, and it
+// only ever renders a login or consent page, never a code.
+std::string build_authorize_url(const std::string& client_id, const std::string& redirect_uri,
+                                const std::string& scope, const std::string& state,
+                                const std::string& code_challenge, const std::string& resource,
+                                const std::string& nonce) {
+    std::string url = "/authorize";
+    append_query_param(url, "client_id", client_id);
+    append_query_param(url, "redirect_uri", redirect_uri);
+    append_query_param(url, "response_type", "code");
+    append_query_param(url, "scope", scope);
+    if (!state.empty()) append_query_param(url, "state", state);
+    if (!code_challenge.empty()) {
+        append_query_param(url, "code_challenge", code_challenge);
+        append_query_param(url, "code_challenge_method", "S256");
+    }
+    // Dropping either of these would quietly turn a server-bound sign-in
+    // into a legacy one — the same trap the login-page round trip has.
+    if (!resource.empty()) append_query_param(url, "resource", resource);
+    if (!nonce.empty()) append_query_param(url, "nonce", nonce);
+    return url;
+}
+
+std::string authorize_url_for(const ConsentRequest& request) {
+    return build_authorize_url(request.client_id, request.redirect_uri, request.scope,
+                               request.state, request.code_challenge, request.resource,
+                               request.nonce);
+}
+
+// The consent form carries, as `restart`, the /authorize URL that produced
+// it, so that a decision arriving without a session (the cookie expired or
+// was cleared while the page sat open) can offer to put the same request
+// again. Only used when there is NO session: the value is whatever the POST
+// says, so it is never trusted with anything but building a link to
+// /authorize — which anybody can already link to with any parameters they
+// like. Re-parsed and rebuilt from the known parameters, never echoed.
+std::string restart_url_from_form(const std::string& restart) {
+    static const std::string prefix = "/authorize?";
+    if (restart.size() > 4096 || restart.rfind(prefix, 0) != 0) return {};
+    auto params = parse_form(restart.substr(prefix.size()));
+    const auto get = [&](const char* key) {
+        auto it = params.find(key);
+        return it == params.end() ? std::string{} : it->second;
+    };
+    if (get("client_id").empty() || get("redirect_uri").empty()) return {};
+    return build_authorize_url(get("client_id"), get("redirect_uri"), get("scope"), get("state"),
+                               get("code_challenge"), get("resource"), get("nonce"));
 }
 
 } // namespace
@@ -269,19 +340,28 @@ void OidcHandler::handle_authorize(const httplib::Request& req, httplib::Respons
     auto nonce = req.get_param_value("nonce");
 
     if (client_id.empty() || redirect_uri.empty()) {
-        json_error(res, 400, "client_id and redirect_uri are required");
+        browser_or_json_error(req, res, 400, "client_id and redirect_uri are required",
+                              "Sign-in link is incomplete",
+                              "The app opened a sign-in link that is missing part of the request.",
+                              kBadAuthorizeNextStep);
         return;
     }
 
     if (response_type != "code") {
-        json_error(res, 400, "Only response_type=code is supported");
+        browser_or_json_error(req, res, 400, "Only response_type=code is supported",
+                              "Sign-in could not start",
+                              "The app asked to sign in in a way this BSFChat ID does not support.",
+                              kBadAuthorizeNextStep);
         return;
     }
 
     // Verify client exists
     auto client = store_.get_oauth_client(client_id);
     if (!client) {
-        json_error(res, 400, "Unknown client_id");
+        browser_or_json_error(req, res, 400, "Unknown client_id",
+                              "Unknown app",
+                              "The app that sent you here is not registered with this BSFChat ID.",
+                              kBadAuthorizeNextStep);
         return;
     }
 
@@ -293,7 +373,11 @@ void OidcHandler::handle_authorize(const httplib::Request& req, httplib::Respons
     // only relaxes the *port* for genuine loopback registrations.
     if (!redirect_uri_is_registered(client_id, redirect_uri)) {
         // Never redirect to an unvalidated URI — report in-band instead.
-        json_error(res, 400, "Invalid redirect_uri for this client");
+        browser_or_json_error(req, res, 400, "Invalid redirect_uri for this client",
+                              "Sign-in could not start",
+                              "The app asked to be sent back to an address it is not registered "
+                              "with, so this sign-in was stopped.",
+                              kBadAuthorizeNextStep);
         return;
     }
 
@@ -384,7 +468,10 @@ void OidcHandler::handle_authorize(const httplib::Request& req, httplib::Respons
 
     auto account = store_.get_account_by_id(account_id);
     if (!account) {
-        json_error(res, 500, "Account not found");
+        browser_or_json_error(req, res, 500, "Account not found",
+                              "Sign-in could not start",
+                              "Your account could not be loaded.",
+                              "Go back to the app and start signing in again.");
         return;
     }
 
@@ -410,18 +497,23 @@ void OidcHandler::handle_authorize(const httplib::Request& req, httplib::Respons
     consent.nonce = nonce;
 
     if (consent.session_id.empty() || !store_.store_consent_request(consent)) {
-        json_error(res, 500, "Failed to start authorization");
+        browser_or_json_error(req, res, 500, "Failed to start authorization",
+                              "Sign-in could not start",
+                              "Something went wrong on our side while starting this sign-in.",
+                              "Go back to the app and try again in a moment.");
         return;
     }
 
-    render_consent_page(res, *client, *account, scope, consent_token, redirect_uri, resource);
+    render_consent_page(res, *client, *account, scope, consent_token, redirect_uri, resource,
+                        authorize_url_for(consent));
 }
 
 void OidcHandler::render_consent_page(httplib::Response& res, const OAuthClient& client,
                                       const Account& account, const std::string& scope,
                                       const std::string& consent_token,
                                       const std::string& redirect_uri,
-                                      const std::string& resource) {
+                                      const std::string& resource,
+                                      const std::string& restart_url) {
     std::ostringstream scopes_html;
     std::istringstream scope_stream(scope);
     std::string token;
@@ -469,8 +561,19 @@ void OidcHandler::render_consent_page(httplib::Response& res, const OAuthClient&
          << "You will be returned to " << html_escape(redirect_uri) << "</p>"
          << "<form method=\"POST\" action=\"/authorize/decision\">"
          << "<input type=\"hidden\" name=\"consent_token\" value=\"" << html_escape(consent_token) << "\">"
+         // See restart_url_from_form(): lets a decision that arrives after the
+         // session ended offer to put this request again.
+         << "<input type=\"hidden\" name=\"restart\" value=\"" << html_escape(restart_url) << "\">"
+         << "<div class=\"btn-stack\">"
          << "<button type=\"submit\" name=\"approve\" value=\"true\" class=\"btn btn-primary\">Allow</button>"
          << "<button type=\"submit\" name=\"approve\" value=\"false\" class=\"btn btn-secondary\">Deny</button>"
+         << "</div>"
+         // Audit I-6. A button in the same form, not a link: signing out is a
+         // state change, so it rides on the consent token like Allow and Deny
+         // do, and a foreign page cannot sign anybody out by linking here.
+         << "<p class=\"form-aside\">Not " << html_escape(account.username) << "? "
+         << "<button type=\"submit\" name=\"approve\" value=\"switch\" class=\"link-button\">"
+         << "Use a different account</button></p>"
          << "</form></div></div></body></html>";
 
     res.set_header("Cache-Control", "no-store");
@@ -487,9 +590,14 @@ void OidcHandler::handle_authorize_decision(const httplib::Request& req, httplib
     auto params = parse_form(req.body);
     auto consent_token = params["consent_token"];
     auto approve = params["approve"];
+    // "Not you? Use a different account" (audit I-6).
+    const bool switch_account = approve == "switch";
 
     if (consent_token.empty()) {
-        json_error(res, 400, "Missing consent token");
+        browser_or_json_error(req, res, 400, "Missing consent token",
+                              "Sign-in request not recognised",
+                              "This page did not say which sign-in it was answering.",
+                              "Go back to the app and start signing in again.");
         return;
     }
 
@@ -499,7 +607,27 @@ void OidcHandler::handle_authorize_decision(const httplib::Request& req, httplib
     // does not match here.
     auto ctx = account_handler_.authenticate(req, "");
     if (!ctx.authenticated() || !ctx.is_browser_session()) {
-        json_error(res, 401, "Not authenticated");
+        // The session ended while the consent page was open (it expired, or
+        // the user signed out in another tab). Nothing is approved or denied.
+        // A person gets a way forward instead of `{"error":"Not
+        // authenticated"}` (audit I-5): the same request put again, which
+        // goes through the sign-in page. restart_url_from_form() explains
+        // why the posted value is safe to build that link from.
+        const auto restart = restart_url_from_form(params["restart"]);
+        if (switch_account && !restart.empty()) {
+            // Already signed out, which is what they asked for.
+            res.set_redirect(restart);
+            return;
+        }
+        browser_or_json_error(req, res, 401, "Not authenticated",
+                              "Your sign-in session ended",
+                              "You were signed out of BSFChat ID while this page was open, so "
+                              "this sign-in was not completed.",
+                              restart.empty()
+                                  ? "Return to the app and start signing in again."
+                                  : "Sign in again to carry on, or return to the app and start "
+                                    "signing in again from there.",
+                              restart, "Sign in again");
         return;
     }
 
@@ -518,6 +646,32 @@ void OidcHandler::handle_authorize_decision(const httplib::Request& req, httplib
     // consume_consent_request.
     auto decision = store_.consume_consent_request(consent_token, ctx.credential_id,
                                                    ctx.account_id);
+
+    // "Not you? Use a different account": end THIS browser session and put
+    // the same authorization request again, which lands on the sign-in page
+    // because the browser no longer has a session. Honoured only where the
+    // caller has proved the prompt is its own account's — the outcomes that
+    // carry the request (Granted spent it, so it cannot be approved later;
+    // Expired and SessionSuperseded are this account's too). For anything
+    // else the arms below answer exactly as for Allow or Deny, and nobody's
+    // session is touched by a decision that does not prove ownership.
+    if (switch_account && decision.request && ctx.account_id == decision.request->account_id &&
+        (decision.outcome == ConsentOutcome::Granted ||
+         decision.outcome == ConsentOutcome::Expired ||
+         decision.outcome == ConsentOutcome::SessionSuperseded)) {
+        store_.delete_session(ctx.credential_id);
+        res.set_header("Set-Cookie", account_handler_.session_cookie("", 0));
+        log->info("Consent page: account {} chose to use a different account (client {})",
+                  ctx.account_id, decision.request->client_id);
+        if (redirect_uri_is_registered(decision.request->client_id,
+                                       decision.request->redirect_uri)) {
+            res.set_redirect(authorize_url_for(*decision.request));
+        } else {
+            res.set_redirect("/login.html");
+        }
+        return;
+    }
+
     switch (decision.outcome) {
     case ConsentOutcome::Unknown:
     case ConsentOutcome::SessionMismatch:
@@ -540,8 +694,12 @@ void OidcHandler::handle_authorize_decision(const httplib::Request& req, httplib
         // and fail that one's state check. Say so and stop.
         log->info("Consent decision resubmitted for a prompt this session had already answered "
                   "(client {})", decision.request->client_id);
-        render_notice_page(res, 409, "Already approved",
-                           "You have already approved this sign-in.",
+        //
+        // Neutral wording: the row is marked answered before the answer is
+        // read, so which way it went is not known here, and "You have already
+        // approved" used to greet people who had pressed Deny (audit I-7).
+        render_notice_page(res, 409, "Already answered",
+                           "This sign-in request was already answered.",
                            "Switch back to the BSFChat app to carry on. If it is still waiting, "
                            "start signing in again from there.");
         return;
@@ -603,24 +761,7 @@ void OidcHandler::handle_authorize_decision(const httplib::Request& req, httplib
                                "Go back to BSFChat and start signing in again.");
             return;
         }
-        std::string again = "/authorize";
-        append_query_param(again, "client_id", decision.request->client_id);
-        append_query_param(again, "redirect_uri", decision.request->redirect_uri);
-        append_query_param(again, "response_type", "code");
-        append_query_param(again, "scope", decision.request->scope);
-        if (!decision.request->state.empty())
-            append_query_param(again, "state", decision.request->state);
-        if (!decision.request->code_challenge.empty()) {
-            append_query_param(again, "code_challenge", decision.request->code_challenge);
-            append_query_param(again, "code_challenge_method", "S256");
-        }
-        // Dropping either of these would quietly turn a server-bound sign-in
-        // into a legacy one — the same trap the login-page round trip has.
-        if (!decision.request->resource.empty())
-            append_query_param(again, "resource", decision.request->resource);
-        if (!decision.request->nonce.empty())
-            append_query_param(again, "nonce", decision.request->nonce);
-        res.set_redirect(again);
+        res.set_redirect(authorize_url_for(*decision.request));
         return;
     }
 
@@ -657,7 +798,10 @@ void OidcHandler::handle_authorize_decision(const httplib::Request& req, httplib
     auth_code.nonce = consent->nonce;
 
     if (!store_.store_auth_code(auth_code)) {
-        json_error(res, 500, "Failed to issue authorization code");
+        browser_or_json_error(req, res, 500, "Failed to issue authorization code",
+                              "Sign-in could not be completed",
+                              "Something went wrong on our side while finishing this sign-in.",
+                              "Go back to the app and start signing in again.");
         return;
     }
 

@@ -24,6 +24,7 @@ add_executable(bsfchat-id
     src/core/ClientRegistration.cpp
     src/core/Logger.cpp
     src/core/IdentityServer.cpp
+    src/core/PasswordReset.cpp
     src/core/RateLimiter.cpp
     src/core/Username.cpp
     src/core/WebUtil.cpp

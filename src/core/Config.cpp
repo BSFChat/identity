@@ -123,6 +123,7 @@ Config Config::load(const std::string& path) {
             read_into(server, "bind_address", cfg.bind_address);
             read_into(server, "port", cfg.port);
             read_into(server, "issuer_url", cfg.issuer_url);
+            read_into(server, "support_contact", cfg.support_contact);
         }
 
         // [database]
@@ -195,6 +196,24 @@ Config Config::load(const std::string& path) {
     }
 
     validate_trusted_proxies(cfg);
+
+    // The contact is shown to unauthenticated visitors, so it is held to
+    // something a page can display sensibly: printable ASCII, bounded. A bad
+    // value is dropped with a warning rather than failing startup.
+    {
+        auto& contact = cfg.support_contact;
+        const auto first = contact.find_first_not_of(" \t");
+        const auto last = contact.find_last_not_of(" \t");
+        contact = first == std::string::npos ? std::string{} : contact.substr(first, last - first + 1);
+        const bool printable = std::all_of(contact.begin(), contact.end(), [](char c) {
+            return c >= 0x20 && c <= 0x7e;
+        });
+        if (contact.size() > 256 || !printable) {
+            get_logger()->warn("[server] support_contact must be printable ASCII of at most 256 "
+                               "characters; ignoring it");
+            contact.clear();
+        }
+    }
 
     return cfg;
 }

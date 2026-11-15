@@ -5,35 +5,20 @@
 
 let pendingLoginToken = null;
 
-// Rebuild the /authorize request this page was sent from, if any.
-//
-// Every parameter is forwarded as it arrived (only `redirect` is renamed back
-// to `redirect_uri`), so a parameter /authorize learns later — nonce,
-// resource — survives the trip through the login page without this file
-// having to know about it. It can only ever navigate to /authorize on this
-// origin, which validates everything, so this is not an open redirect.
-function getOidcRedirectUrl() {
-    const params = new URLSearchParams(window.location.search);
-    const redirect = params.get('redirect');
-    if (!redirect) return null;
-    const forward = new URLSearchParams();
-    for (const [key, value] of params) {
-        forward.append(key === 'redirect' ? 'redirect_uri' : key, value);
-    }
-    if (!forward.has('response_type')) forward.set('response_type', 'code');
-    if (!forward.has('scope')) forward.set('scope', 'openid');
-    return '/authorize?' + forward.toString();
-}
-
-function onLoginComplete() {
-    const oidcUrl = getOidcRedirectUrl();
-    window.location.href = oidcUrl || '/profile.html';
-}
+// Carry the authorization request (if any) over to the sign-up page, so
+// "Create one" from the app's sign-in does not strand the app.
+document.getElementById('register-link').href = withAuthRequest('/register.html');
+applyRegistrationVisibility();
+// The forgot-password page links back here, so it keeps the request too.
+document.getElementById('forgot-link').href = withAuthRequest('/forgot-password.html');
 
 // Step 1: password
 document.getElementById('login-form').addEventListener('submit', async (e) => {
     e.preventDefault();
-    const username = document.getElementById('username').value;
+    clearError();
+    // Surrounding spaces are an autocomplete artefact, never part of a name.
+    // Case is left alone here: the server folds it (see handle_login).
+    const username = document.getElementById('username').value.trim();
     const password = document.getElementById('password').value;
 
     try {
@@ -46,7 +31,7 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
             document.getElementById('2fa-step').classList.remove('hidden');
             document.getElementById('totp-code').focus();
         } else {
-            onLoginComplete();
+            continueAfterSignIn();
         }
     } catch (err) {
         showError(err.message);
@@ -56,7 +41,9 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
 // Step 2: TOTP code
 document.getElementById('2fa-form').addEventListener('submit', async (e) => {
     e.preventDefault();
-    const code = document.getElementById('totp-code').value.trim();
+    clearError();
+    // Some authenticators show "123 456"; no code contains whitespace.
+    const code = document.getElementById('totp-code').value.replace(/\s+/g, '');
     if (!code) return;
 
     try {
@@ -64,10 +51,32 @@ document.getElementById('2fa-form').addEventListener('submit', async (e) => {
             login_token: pendingLoginToken,
             code: code
         });
-        onLoginComplete();
+        continueAfterSignIn();
     } catch (err) {
         showError(err.message);
     }
+});
+
+// Authenticator code (numeric keypad) or backup code (letters and digits).
+let usingBackupCode = false;
+function setBackupCodeMode(on) {
+    usingBackupCode = on;
+    const input = document.getElementById('totp-code');
+    input.inputMode = on ? 'text' : 'numeric';
+    input.placeholder = on ? 'Backup code' : '000000';
+    input.value = '';
+    document.getElementById('totp-label').textContent = on ? 'Backup Code' : 'Authentication Code';
+    document.getElementById('totp-hint').textContent = on
+        ? 'Enter one of the backup codes you saved when you turned on two-factor authentication. Letter case matters.'
+        : 'Enter the 6-digit code from your authenticator app.';
+    document.getElementById('backup-code-toggle').textContent = on
+        ? 'Use an authenticator code instead'
+        : 'Use a backup code instead';
+    input.focus();
+}
+document.getElementById('backup-code-toggle').addEventListener('click', (e) => {
+    e.preventDefault();
+    setBackupCodeMode(!usingBackupCode);
 });
 
 // Back link
@@ -76,5 +85,6 @@ document.getElementById('back-to-login').addEventListener('click', (e) => {
     pendingLoginToken = null;
     document.getElementById('2fa-step').classList.add('hidden');
     document.getElementById('login-form').classList.remove('hidden');
-    document.getElementById('totp-code').value = '';
+    setBackupCodeMode(false);
+    document.getElementById('username').focus();
 });

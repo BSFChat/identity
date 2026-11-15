@@ -159,4 +159,14 @@ bool password_needs_rehash(const std::string& stored_hash, int target_iterations
     return parsed.iterations < target_iterations;
 }
 
+std::optional<std::string> password_policy_error(std::string_view password) {
+    if (password.size() < kMinPasswordLength) {
+        return "Password must be at least " + std::to_string(kMinPasswordLength) + " characters";
+    }
+    if (password.size() > kMaxPasswordLength) {
+        return std::string("Password is too long");
+    }
+    return std::nullopt;
+}
+
 } // namespace bsfchat::id
