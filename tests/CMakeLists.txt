@@ -48,6 +48,7 @@ target_link_libraries(identity_tests PRIVATE
 # Compile required source files for testing
 target_sources(identity_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/core/ClientAddress.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/PasswordReset.cpp
     ${CMAKE_SOURCE_DIR}/src/core/ClientRegistration.cpp
     ${CMAKE_SOURCE_DIR}/src/core/Logger.cpp
     ${CMAKE_SOURCE_DIR}/src/core/Config.cpp

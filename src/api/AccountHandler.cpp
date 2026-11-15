@@ -45,7 +45,6 @@ std::string generate_session_id() {
 }
 
 constexpr int kSessionLifetimeSeconds = 86400 * 7;
-constexpr size_t kMaxPasswordLength = 1024;
 
 void json_error(httplib::Response& res, int status, const std::string& error) {
     res.status = status;
@@ -436,12 +435,8 @@ void AccountHandler::handle_register(const httplib::Request& req, httplib::Respo
         return;
     }
 
-    if (password.size() < 8) {
-        json_error(res, 400, "Password must be at least 8 characters");
-        return;
-    }
-    if (password.size() > kMaxPasswordLength) {
-        json_error(res, 400, "Password is too long");
+    if (auto err = password_policy_error(password)) {
+        json_error(res, 400, *err);
         return;
     }
 
@@ -759,12 +754,8 @@ void AccountHandler::handle_update_profile(const httplib::Request& req, httplib:
             return;
         }
         auto new_password = string_field(*body, "new_password");
-        if (new_password.size() < 8) {
-            json_error(res, 400, "New password must be at least 8 characters");
-            return;
-        }
-        if (new_password.size() > kMaxPasswordLength) {
-            json_error(res, 400, "New password is too long");
+        if (auto err = password_policy_error(new_password)) {
+            json_error(res, 400, "New p" + err->substr(1));
             return;
         }
         // update_account() does not write password_hash, so the change has to

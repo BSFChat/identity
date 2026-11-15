@@ -9,6 +9,8 @@ let pendingLoginToken = null;
 // "Create one" from the app's sign-in does not strand the app.
 document.getElementById('register-link').href = withAuthRequest('/register.html');
 applyRegistrationVisibility();
+// The forgot-password page links back here, so it keeps the request too.
+document.getElementById('forgot-link').href = withAuthRequest('/forgot-password.html');
 
 // Step 1: password
 document.getElementById('login-form').addEventListener('submit', async (e) => {

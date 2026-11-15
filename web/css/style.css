@@ -220,9 +220,23 @@ a.btn {
     margin-top: 24px;
 }
 
+.form-aside {
+    text-align: center;
+    margin-top: 12px;
+    font-size: 13px;
+}
+
+.form-aside a {
+    color: var(--text-secondary);
+}
+
 .lead {
     color: var(--text-secondary);
     margin-bottom: 12px;
+}
+
+.lead a {
+    color: var(--accent);
 }
 
 .btn:active {

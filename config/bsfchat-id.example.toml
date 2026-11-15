@@ -5,11 +5,24 @@ port = 8480
 issuer_url = "http://localhost:8480"
 
 # Who users should contact when they cannot sign in: an email address or an
-# https:// URL, shown on the "Forgot password?" page. This service sends no
-# email, so a forgotten password is reset by the operator with
-#   bsfchat-id --config <this file> --reset-password <username>
-# (see the [auth] notes below). Optional; leave empty to show generic advice.
+# https:// URL, shown on the "Forgot password?" page. Optional; leave it unset
+# to show generic "contact the operator" advice.
 # support_contact = "support@example.com"
+#
+# PASSWORD RECOVERY. This service sends no email, so there is no self-service
+# reset: a user who forgot their password contacts you, and you run
+#
+#   bsfchat-id --config /etc/bsfchat/identity.toml --reset-password <username>
+#
+# (in the shipped container: docker exec -it <container> bsfchat-id
+# --config /etc/bsfchat/identity.toml --reset-password <username>). It asks
+# for the new password twice without echoing it (or reads one line from
+# stdin when piped), applies the same rules as sign-up (8 to 1024
+# characters), stores it, signs the account out of every browser session and
+# app, and exits. The running service does not need to stop. It refuses to
+# run if the database in this file cannot be opened, rather than creating an
+# empty one. Two-factor authentication is left as it is. Make sure the
+# account really is the requester's before you reset it.
 
 [database]
 path = "./data/identity.db"

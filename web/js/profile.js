@@ -68,14 +68,23 @@ document.getElementById('profile-form').addEventListener('submit', async (e) => 
 // ---- Security tab: password ----
 document.getElementById('password-form').addEventListener('submit', async (e) => {
     e.preventDefault();
+    const newPassword = document.getElementById('new_password').value;
+    // There is no reset by email, so a typo here would lock the user out
+    // until an operator resets the password (audit I-2).
+    if (newPassword !== document.getElementById('confirm_new_password').value) {
+        showError('The new passwords do not match');
+        document.getElementById('confirm_new_password').focus();
+        return;
+    }
     try {
         const data = await apiPut('/api/profile', {
             old_password: document.getElementById('old_password').value,
-            new_password: document.getElementById('new_password').value
+            new_password: newPassword
         });
         showSuccess(signedOutNotice('Password changed.', data.signed_out_elsewhere || 0));
         document.getElementById('old_password').value = '';
         document.getElementById('new_password').value = '';
+        document.getElementById('confirm_new_password').value = '';
     } catch (err) {
         showError(err.message);
     }
