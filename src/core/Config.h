@@ -69,6 +69,12 @@ struct Config {
     // reset a 30-day clock every time, so a token in regular use never expired.
     int refresh_token_idle_days = 30;
     int refresh_token_max_lifetime_days = 90;
+    // Audit I-16: how long after a refresh token was rotated the app may
+    // present it once more and get a fresh successor instead of tripping
+    // replay detection (two refreshes racing, or a reply lost on the way).
+    // Only the token immediately before the live one, and only once. 0
+    // turns the window off.
+    int refresh_reuse_grace_seconds = 30;
 
     // Housekeeping
     int session_sweep_interval = 3600; // seconds between expiry sweeps

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <set>
 #include <stdexcept>
 
 namespace bsfchat::id {
@@ -937,7 +938,7 @@ namespace {
 
 constexpr const char* kRefreshColumns =
     "SELECT token, client_id, account_id, scope, expires_at, family_id, family_expires_at, "
-    "created_at, replaced_at FROM refresh_tokens ";
+    "created_at, replaced_at, replaced_by, grace_used FROM refresh_tokens ";
 
 RefreshToken read_refresh_row(sqlite3_stmt* stmt) {
     RefreshToken rt;
@@ -950,6 +951,8 @@ RefreshToken read_refresh_row(sqlite3_stmt* stmt) {
     rt.family_expires_at = sqlite3_column_int64(stmt, 6);
     rt.created_at = sqlite3_column_int64(stmt, 7);
     rt.replaced_at = sqlite3_column_int64(stmt, 8);
+    rt.replaced_by = col_text(stmt, 9);
+    rt.grace_used = sqlite3_column_int(stmt, 10) != 0;
     return rt;
 }
 
@@ -994,7 +997,8 @@ void IdentityStore::delete_refresh_token(const std::string& token) {
 }
 
 RotateResult IdentityStore::rotate_refresh_token(const std::string& old_token,
-                                                 const RefreshToken& replacement) {
+                                                 const RefreshToken& replacement,
+                                                 int64_t grace_seconds) {
     std::lock_guard lock(mutex_);
     Transaction txn(db_);
 
@@ -1006,6 +1010,53 @@ RotateResult IdentityStore::rotate_refresh_token(const std::string& old_token,
         if (sqlite3_step(stmt.get()) == SQLITE_ROW) current = read_refresh_row(stmt.get());
     }
     if (!current) return RotateResult::Invalid;
+
+    const auto now = now_seconds();
+
+    // The successor inherits the family and its absolute expiry whatever the
+    // caller filled in: rotation must not be able to extend a grant.
+    RefreshToken next = replacement;
+    next.family_id = current->family_id;
+    next.family_expires_at = current->family_expires_at;
+    next.created_at = current->created_at;
+    next.account_id = current->account_id;
+    next.client_id = current->client_id;
+    next.scope = current->scope;
+    if (next.expires_at > next.family_expires_at) next.expires_at = next.family_expires_at;
+
+    // Audit I-16: two refreshes racing with the same token (or a retry after
+    // a lost reply) used to revoke the family, signing the app out. A
+    // retired token is a retry, not a replay, when all of these hold: it was
+    // retired within the grace window, its one retry is unspent, and the
+    // token that replaced it has not been used yet — i.e. it is the token
+    // immediately before the live one. The retry gets a fresh token of the
+    // same family (the successor's raw value is not kept, so it cannot be
+    // handed out again); both stay live, and either being replayed later
+    // still kills the family.
+    if (current->replaced_at != 0 && grace_seconds > 0 && !current->grace_used &&
+        now - current->replaced_at <= grace_seconds && !current->replaced_by.empty() &&
+        current->family_expires_at >= now) {
+        bool successor_unused = false;
+        {
+            auto stmt = prepare(db_,
+                "SELECT replaced_at FROM refresh_tokens WHERE token = ? AND family_id = ?");
+            bind_text(stmt.get(), 1, current->replaced_by);
+            bind_text(stmt.get(), 2, current->family_id);
+            successor_unused = sqlite3_step(stmt.get()) == SQLITE_ROW &&
+                               sqlite3_column_int64(stmt.get(), 0) == 0;
+        }
+        if (successor_unused) {
+            auto upd = prepare(db_,
+                "UPDATE refresh_tokens SET grace_used = 1 WHERE token = ? AND grace_used = 0");
+            bind_text(upd.get(), 1, current->token);
+            if (sqlite3_step(upd.get()) != SQLITE_DONE || sqlite3_changes(db_) == 0) {
+                return RotateResult::Invalid;
+            }
+            if (!insert_refresh_row(db_, next)) return RotateResult::Invalid;
+            txn.commit();
+            return RotateResult::RetriedInGrace;
+        }
+    }
 
     if (current->replaced_at != 0) {
         // A retired token came back. Either the client is replaying (it lost
@@ -1020,7 +1071,6 @@ RotateResult IdentityStore::rotate_refresh_token(const std::string& old_token,
         return RotateResult::Reused;
     }
 
-    const auto now = now_seconds();
     if (current->expires_at < now || current->family_expires_at < now) {
         auto del = prepare(db_, "DELETE FROM refresh_tokens WHERE family_id = ?");
         bind_text(del.get(), 1, current->family_id);
@@ -1030,24 +1080,17 @@ RotateResult IdentityStore::rotate_refresh_token(const std::string& old_token,
     }
 
     {
-        auto upd = prepare(db_, "UPDATE refresh_tokens SET replaced_at = ? WHERE token = ? AND replaced_at = 0");
+        auto upd = prepare(db_,
+            "UPDATE refresh_tokens SET replaced_at = ?, replaced_by = ? "
+            "WHERE token = ? AND replaced_at = 0");
         sqlite3_bind_int64(upd.get(), 1, now);
-        bind_text(upd.get(), 2, current->token); // already the stored hash
+        bind_text(upd.get(), 2, hash_token(next.token));
+        bind_text(upd.get(), 3, current->token); // already the stored hash
         if (sqlite3_step(upd.get()) != SQLITE_DONE || sqlite3_changes(db_) == 0) {
             return RotateResult::Invalid;
         }
     }
 
-    // The successor inherits the family and its absolute expiry whatever the
-    // caller filled in: rotation must not be able to extend a grant.
-    RefreshToken next = replacement;
-    next.family_id = current->family_id;
-    next.family_expires_at = current->family_expires_at;
-    next.created_at = current->created_at;
-    next.account_id = current->account_id;
-    next.client_id = current->client_id;
-    next.scope = current->scope;
-    if (next.expires_at > next.family_expires_at) next.expires_at = next.family_expires_at;
     if (!insert_refresh_row(db_, next)) return RotateResult::Invalid;
 
     txn.commit();
@@ -1070,7 +1113,11 @@ std::vector<RefreshToken> IdentityStore::list_refresh_tokens_for_account(const s
     bind_text(stmt.get(), 1, account_id);
     sqlite3_bind_int64(stmt.get(), 2, now_seconds());
     std::vector<RefreshToken> out;
-    while (sqlite3_step(stmt.get()) == SQLITE_ROW) out.push_back(read_refresh_row(stmt.get()));
+    std::set<std::string> families;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        auto rt = read_refresh_row(stmt.get());
+        if (families.insert(rt.family_id).second) out.push_back(std::move(rt));
+    }
     return out;
 }
 

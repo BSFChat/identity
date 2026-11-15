@@ -79,11 +79,19 @@ struct RefreshToken {
     // is kept until it expires so a second presentation is recognised as a
     // replay rather than as an unknown token.
     int64_t replaced_at = 0;
+    // Hash of the token that replaced this one, and whether its one retry
+    // inside the grace window was spent (audit I-16).
+    std::string replaced_by;
+    bool grace_used = false;
 };
 
 enum class RotateResult {
     Rotated,  // old token retired, replacement stored
     Reused,   // old token had already been rotated: the family was revoked
+    // The token immediately before the live one came back inside the grace
+    // window, once: `replacement` was stored as a second live token of the
+    // family (audit I-16).
+    RetriedInGrace,
     Invalid,  // unknown, expired, or its account is disabled
 };
 
@@ -240,10 +248,15 @@ public:
     // concurrent refreshes of one token cannot both succeed and fork it
     // (security audit L4). Presenting a token that was already rotated
     // revokes its whole family: one of the two presenters is not the client.
-    RotateResult rotate_refresh_token(const std::string& old_token, const RefreshToken& replacement);
+    // Except (audit I-16) within `grace_seconds` of its rotation, once, and
+    // only while its successor is still unused: then it is a retry — two
+    // refreshes racing, or a reply lost — and gets RetriedInGrace.
+    RotateResult rotate_refresh_token(const std::string& old_token, const RefreshToken& replacement,
+                                      int64_t grace_seconds = 0);
     // Deletes the family `token` belongs to (RFC 7009 revocation).
     void revoke_refresh_token_family(const std::string& token);
-    // The live token of each family, newest first.
+    // The live token of each family, newest first (one per family, even
+    // while a grace retry has left two).
     std::vector<RefreshToken> list_refresh_tokens_for_account(const std::string& account_id);
     bool delete_refresh_family(const std::string& account_id, const std::string& family_id);
 

@@ -521,9 +521,97 @@ TEST_F(SecurityFixTest, ReplayingARotatedTokenRevokesTheGrant) {
     auto res = refresh(first);
     ASSERT_EQ(status_of(res), 200);
     auto second = json::parse(res.body)["refresh_token"].get<std::string>();
+    res = refresh(second);
+    ASSERT_EQ(status_of(res), 200);
+    auto third = json::parse(res.body)["refresh_token"].get<std::string>();
 
+    // Two generations back: no grace window covers it (I-16 only forgives
+    // the token immediately before the live one).
+    EXPECT_EQ(status_of(refresh(first)), 400);
+    EXPECT_EQ(status_of(refresh(third)), 400) << "the live token survived a replay of an ancestor";
+}
+
+// Audit I-16. Two refreshes racing with one token (or a retry after a lost
+// reply) must not sign the app out.
+TEST_F(SecurityFixTest, I16_ARetryInsideTheGraceWindowGetsAFreshToken) {
+    auto first = desktop_login(browser_session)["refresh_token"].get<std::string>();
+    auto res = refresh(first);
+    ASSERT_EQ(status_of(res), 200);
+    auto second = json::parse(res.body)["refresh_token"].get<std::string>();
+
+    auto retry = refresh(first);
+    ASSERT_EQ(status_of(retry), 200) << retry.body;
+    auto sibling = json::parse(retry.body)["refresh_token"].get<std::string>();
+    EXPECT_NE(sibling, second);
+    // Whichever reply the app kept, it keeps working.
+    EXPECT_EQ(status_of(refresh(second)), 200);
+    EXPECT_EQ(status_of(refresh(sibling)), 200);
+    // Still one app grant as the user sees it.
+    EXPECT_EQ(store->list_refresh_tokens_for_account("acct-1").size(), 1u);
+}
+
+TEST_F(SecurityFixTest, I16_TheGraceRetryIsSpentOnce) {
+    auto first = desktop_login(browser_session)["refresh_token"].get<std::string>();
+    auto res = refresh(first);
+    ASSERT_EQ(status_of(res), 200);
+    auto second = json::parse(res.body)["refresh_token"].get<std::string>();
+    ASSERT_EQ(status_of(refresh(first)), 200);
+    // A third presentation is a replay: the whole grant goes.
+    EXPECT_EQ(status_of(refresh(first)), 400);
+    EXPECT_EQ(status_of(refresh(second)), 400);
+}
+
+TEST_F(SecurityFixTest, I16_NoGraceOnceTheSuccessorWasUsed) {
+    auto first = desktop_login(browser_session)["refresh_token"].get<std::string>();
+    auto res = refresh(first);
+    ASSERT_EQ(status_of(res), 200);
+    auto second = json::parse(res.body)["refresh_token"].get<std::string>();
+    res = refresh(second);
+    ASSERT_EQ(status_of(res), 200);
+    auto third = json::parse(res.body)["refresh_token"].get<std::string>();
+    // `second` is now the immediately-previous token, so it may retry...
+    ASSERT_EQ(status_of(refresh(second)), 200);
+    // ...but `first`, whose successor has been used, may not.
+    EXPECT_EQ(status_of(refresh(first)), 400);
+    EXPECT_EQ(status_of(refresh(third)), 400);
+}
+
+class NoRefreshGraceTest : public SecurityFixTest {
+protected:
+    void configure(Config& c) override { c.refresh_reuse_grace_seconds = 0; }
+};
+
+TEST_F(NoRefreshGraceTest, WithoutAGraceWindowAnImmediateReplayRevokesTheGrant) {
+    auto first = desktop_login(browser_session)["refresh_token"].get<std::string>();
+    auto res = refresh(first);
+    ASSERT_EQ(status_of(res), 200);
+    auto second = json::parse(res.body)["refresh_token"].get<std::string>();
     EXPECT_EQ(status_of(refresh(first)), 400);
     EXPECT_EQ(status_of(refresh(second)), 400) << "the successor survived a replay of its parent";
+}
+
+TEST_F(SecurityFixTest, I16_OutsideTheWindowARetiredTokenIsAReplay) {
+    auto now = now_seconds();
+    RefreshToken rt;
+    rt.token = "grace-old";
+    rt.client_id = "bsfchat-desktop";
+    rt.account_id = "acct-1";
+    rt.scope = "openid";
+    rt.family_id = "fam-grace";
+    rt.created_at = now - 3600;
+    rt.family_expires_at = now + 86400;
+    rt.expires_at = now + 86400;
+    ASSERT_TRUE(store->store_refresh_token(rt));
+    RefreshToken next;
+    next.token = "grace-new";
+    next.expires_at = now + 86400;
+    ASSERT_EQ(store->rotate_refresh_token("grace-old", next, 30), RotateResult::Rotated);
+    // Inside the window: a retry. Window of 0: the same presentation, a replay.
+    RefreshToken again;
+    again.token = "grace-again";
+    again.expires_at = now + 86400;
+    EXPECT_EQ(store->rotate_refresh_token("grace-old", again, 0), RotateResult::Reused);
+    EXPECT_FALSE(store->get_refresh_token("grace-new")) << "replay outside the window kept the family";
 }
 
 TEST_F(SecurityFixTest, RefreshTokensAreVisibleAndRevocable) {

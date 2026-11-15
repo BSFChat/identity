@@ -1168,8 +1168,15 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
         RefreshToken new_rt;
         new_rt.token = new_refresh_token;
         new_rt.expires_at = now + int64_t{86400} * config_.refresh_token_idle_days;
-        switch (store_.rotate_refresh_token(refresh_token_str, new_rt)) {
+        switch (store_.rotate_refresh_token(refresh_token_str, new_rt,
+                                            config_.refresh_reuse_grace_seconds)) {
             case RotateResult::Rotated:
+                break;
+            case RotateResult::RetriedInGrace:
+                // Audit I-16: two refreshes raced, or a reply was lost.
+                log->info("Refresh token retried inside the grace window for account {} "
+                          "(client {}); issued a second token of the same grant",
+                          rt->account_id, rt->client_id);
                 break;
             case RotateResult::Reused:
                 log->warn("Refresh token replayed for account {} (client {}); its grant was revoked",

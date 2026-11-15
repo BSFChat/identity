@@ -151,6 +151,7 @@ Config Config::load(const std::string& path) {
             read_into(auth, "trusted_public_proxies_reason", cfg.trusted_public_proxies_reason);
             read_into(auth, "refresh_token_idle_days", cfg.refresh_token_idle_days);
             read_into(auth, "refresh_token_max_lifetime_days", cfg.refresh_token_max_lifetime_days);
+            read_into(auth, "refresh_reuse_grace_seconds", cfg.refresh_reuse_grace_seconds);
 
             // `password_hash_cost` was a log2 exponent whose shipped default of
             // 12 meant only 4,096 iterations. Refuse to honour it silently.
@@ -211,6 +212,8 @@ Config Config::load(const std::string& path) {
     if (cfg.totp_max_attempts < 1) cfg.totp_max_attempts = 1;
     if (cfg.refresh_token_max_lifetime_days < 1) cfg.refresh_token_max_lifetime_days = 1;
     if (cfg.refresh_token_idle_days < 1) cfg.refresh_token_idle_days = 1;
+    // A long window would keep a stolen, already-rotated token useful.
+    cfg.refresh_reuse_grace_seconds = std::clamp(cfg.refresh_reuse_grace_seconds, 0, 120);
     if (cfg.refresh_token_idle_days > cfg.refresh_token_max_lifetime_days) {
         cfg.refresh_token_idle_days = cfg.refresh_token_max_lifetime_days;
     }
