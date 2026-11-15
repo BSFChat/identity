@@ -58,6 +58,15 @@ struct AuthCode {
     std::string resource;
     // OIDC nonce from the authorization request, echoed into the id_token.
     std::string nonce;
+    // Non-zero once the code was exchanged (audit I-9). The row is kept until
+    // it expires so a replay is recognised and can revoke what it bought.
+    int64_t redeemed_at = 0;
+};
+
+enum class CodeClaim {
+    Claimed,          // this caller redeems it
+    AlreadyRedeemed,  // a replay: see revoke_auth_code_grant()
+    Unknown,
 };
 
 struct RefreshToken {
@@ -233,9 +242,21 @@ public:
     bool store_auth_code(const AuthCode& code);
     std::optional<AuthCode> get_auth_code(const std::string& code);
     void delete_auth_code(const std::string& code);
-    // Atomically fetches and deletes an authorization code inside a single
-    // transaction, so two concurrent redemptions cannot both succeed.
+    // Atomically fetches and deletes an unredeemed authorization code inside
+    // a single transaction, so two concurrent redemptions cannot both succeed.
     std::optional<AuthCode> consume_auth_code(const std::string& code);
+    // Audit I-9: the token endpoint reads the code with get_auth_code(),
+    // checks the client and PKCE, and only then claims it — so a wrong
+    // verifier no longer burns the code. Atomic: of two concurrent claims
+    // exactly one gets Claimed.
+    CodeClaim claim_auth_code(const std::string& code);
+    // After a Claimed code was exchanged: what it bought, so that a replay
+    // can revoke it (`access_token` raw; stored hashed).
+    void record_auth_code_grant(const std::string& code, const std::string& family_id,
+                                const std::string& access_token);
+    // A redeemed code came back: revokes the refresh-token family and the
+    // access token issued from its first redemption (RFC 6749 4.1.2).
+    void revoke_auth_code_grant(const std::string& code);
     void delete_expired_auth_codes();
 
     // Refresh tokens

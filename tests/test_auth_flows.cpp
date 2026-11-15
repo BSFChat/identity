@@ -590,6 +590,102 @@ TEST_F(AuthFlowTest, AuthorizationCodeIsSingleUse) {
     EXPECT_EQ(json::parse(sres.body)["error"], "invalid_grant");
 }
 
+// Audit I-9. A wrong verifier used to burn the code: anybody who saw it (the
+// https fallback page puts it in a web server's log) could break the real
+// app's sign-in. The code is now claimed only after PKCE passes.
+TEST_F(AuthFlowTest, I9_AWrongVerifierDoesNotBurnTheCode) {
+    auto location = authorize_and_consent("bsfchat-desktop", "http://localhost:41234/oauth/callback",
+                                          s256_challenge(kVerifier));
+    auto code = query_param(location, "code");
+    ASSERT_FALSE(code.empty());
+    std::map<std::string, std::string> params = {
+        {"grant_type", "authorization_code"},
+        {"code", code},
+        {"redirect_uri", "http://localhost:41234/oauth/callback"},
+        {"client_id", "bsfchat-desktop"},
+        {"code_verifier", "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"},
+    };
+    auto bad = form_request(params);
+    httplib::Response bres;
+    oidc->handle_token(bad, bres);
+    EXPECT_EQ(status_of(bres), 400);
+
+    params["code_verifier"] = kVerifier;
+    auto good = form_request(params);
+    httplib::Response gres;
+    oidc->handle_token(good, gres);
+    EXPECT_EQ(status_of(gres), 200) << gres.body;
+}
+
+// Audit I-9. A code redeemed twice with the right verifier means somebody
+// else holds both: the tokens from the first redemption are revoked.
+TEST_F(AuthFlowTest, I9_ReplayingARedeemedCodeRevokesItsTokens) {
+    auto location = authorize_and_consent("bsfchat-desktop", "http://localhost:41234/oauth/callback",
+                                          s256_challenge(kVerifier));
+    auto code = query_param(location, "code");
+    ASSERT_FALSE(code.empty());
+    std::map<std::string, std::string> params = {
+        {"grant_type", "authorization_code"},
+        {"code", code},
+        {"redirect_uri", "http://localhost:41234/oauth/callback"},
+        {"client_id", "bsfchat-desktop"},
+        {"code_verifier", kVerifier},
+    };
+    auto first = form_request(params);
+    httplib::Response fres;
+    oidc->handle_token(first, fres);
+    ASSERT_EQ(status_of(fres), 200) << fres.body;
+    auto tokens = json::parse(fres.body);
+
+    auto replay = form_request(params);
+    httplib::Response rres;
+    oidc->handle_token(replay, rres);
+    EXPECT_EQ(status_of(rres), 400);
+    EXPECT_EQ(json::parse(rres.body)["error"], "invalid_grant");
+
+    EXPECT_TRUE(store->list_refresh_tokens_for_account("acct-1").empty())
+        << "the refresh token from the first redemption survived a code replay";
+    auto rreq = form_request({{"grant_type", "refresh_token"},
+                              {"refresh_token", tokens["refresh_token"].get<std::string>()},
+                              {"client_id", "bsfchat-desktop"}});
+    httplib::Response refres;
+    oidc->handle_token(rreq, refres);
+    EXPECT_EQ(status_of(refres), 400);
+
+    httplib::Request ureq;
+    ureq.method = "GET";
+    ureq.set_header("Authorization", "Bearer " + tokens["access_token"].get<std::string>());
+    httplib::Response ures;
+    oidc->handle_userinfo(ureq, ures);
+    EXPECT_EQ(status_of(ures), 401) << "the access token from the first redemption survived";
+}
+
+// Only a replay that passes PKCE revokes: someone who merely saw the code
+// cannot sign the real client out with it.
+TEST_F(AuthFlowTest, I9_AReplayWithoutTheVerifierRevokesNothing) {
+    auto location = authorize_and_consent("bsfchat-desktop", "http://localhost:41234/oauth/callback",
+                                          s256_challenge(kVerifier));
+    auto code = query_param(location, "code");
+    std::map<std::string, std::string> params = {
+        {"grant_type", "authorization_code"},
+        {"code", code},
+        {"redirect_uri", "http://localhost:41234/oauth/callback"},
+        {"client_id", "bsfchat-desktop"},
+        {"code_verifier", kVerifier},
+    };
+    auto first = form_request(params);
+    httplib::Response fres;
+    oidc->handle_token(first, fres);
+    ASSERT_EQ(status_of(fres), 200) << fres.body;
+
+    params["code_verifier"] = "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ";
+    auto replay = form_request(params);
+    httplib::Response rres;
+    oidc->handle_token(replay, rres);
+    EXPECT_EQ(status_of(rres), 400);
+    EXPECT_EQ(store->list_refresh_tokens_for_account("acct-1").size(), 1u);
+}
+
 TEST_F(AuthFlowTest, RedirectUriWithUserinfoSmugglingIsRejected) {
     httplib::Request req;
     req.method = "GET";

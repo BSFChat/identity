@@ -860,7 +860,7 @@ std::optional<AuthCode> IdentityStore::get_auth_code(const std::string& code) {
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_,
         "SELECT code, client_id, account_id, redirect_uri, scope, code_challenge, expires_at, "
-        "resource, nonce FROM auth_codes WHERE code = ?");
+        "resource, nonce, redeemed_at FROM auth_codes WHERE code = ?");
     bind_text(stmt.get(), 1, transient_key(code));
     if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
         AuthCode ac;
@@ -873,6 +873,7 @@ std::optional<AuthCode> IdentityStore::get_auth_code(const std::string& code) {
         ac.expires_at = sqlite3_column_int64(stmt.get(), 6);
         ac.resource = col_text(stmt.get(), 7);
         ac.nonce = col_text(stmt.get(), 8);
+        ac.redeemed_at = sqlite3_column_int64(stmt.get(), 9);
         return ac;
     }
     return std::nullopt;
@@ -893,7 +894,7 @@ std::optional<AuthCode> IdentityStore::consume_auth_code(const std::string& code
     {
         auto stmt = prepare(db_,
             "SELECT code, client_id, account_id, redirect_uri, scope, code_challenge, expires_at, "
-            "resource, nonce FROM auth_codes WHERE code = ?");
+            "resource, nonce FROM auth_codes WHERE code = ? AND redeemed_at = 0");
         bind_text(stmt.get(), 1, transient_key(code));
         if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
             AuthCode ac;
@@ -923,6 +924,53 @@ std::optional<AuthCode> IdentityStore::consume_auth_code(const std::string& code
 
     txn.commit();
     return result;
+}
+
+CodeClaim IdentityStore::claim_auth_code(const std::string& code) {
+    std::lock_guard lock(mutex_);
+    auto upd = prepare(db_, "UPDATE auth_codes SET redeemed_at = ? WHERE code = ? AND redeemed_at = 0");
+    sqlite3_bind_int64(upd.get(), 1, now_seconds());
+    bind_text(upd.get(), 2, transient_key(code));
+    if (sqlite3_step(upd.get()) == SQLITE_DONE && sqlite3_changes(db_) > 0) return CodeClaim::Claimed;
+    auto have = prepare(db_, "SELECT 1 FROM auth_codes WHERE code = ?");
+    bind_text(have.get(), 1, transient_key(code));
+    return sqlite3_step(have.get()) == SQLITE_ROW ? CodeClaim::AlreadyRedeemed : CodeClaim::Unknown;
+}
+
+void IdentityStore::record_auth_code_grant(const std::string& code, const std::string& family_id,
+                                           const std::string& access_token) {
+    std::lock_guard lock(mutex_);
+    auto upd = prepare(db_, "UPDATE auth_codes SET family_id = ?, access_token = ? WHERE code = ?");
+    bind_text(upd.get(), 1, family_id);
+    bind_text(upd.get(), 2, hash_token(access_token));
+    bind_text(upd.get(), 3, transient_key(code));
+    sqlite3_step(upd.get());
+}
+
+void IdentityStore::revoke_auth_code_grant(const std::string& code) {
+    std::lock_guard lock(mutex_);
+    Transaction txn(db_);
+    std::string family_id, access_hash;
+    {
+        auto stmt = prepare(db_,
+            "SELECT family_id, access_token FROM auth_codes WHERE code = ? AND redeemed_at != 0");
+        bind_text(stmt.get(), 1, transient_key(code));
+        if (sqlite3_step(stmt.get()) != SQLITE_ROW) return;
+        family_id = col_text(stmt.get(), 0);
+        access_hash = col_text(stmt.get(), 1);
+    }
+    if (!family_id.empty()) {
+        auto del = prepare(db_, "DELETE FROM refresh_tokens WHERE family_id = ?");
+        bind_text(del.get(), 1, family_id);
+        sqlite3_step(del.get());
+    }
+    if (!access_hash.empty()) {
+        auto del = prepare(db_, "DELETE FROM sessions WHERE session_id = ? AND token_type = ?");
+        bind_text(del.get(), 1, access_hash);
+        bind_text(del.get(), 2, token_type::kOidcAccess);
+        sqlite3_step(del.get());
+    }
+    txn.commit();
 }
 
 void IdentityStore::delete_expired_auth_codes() {

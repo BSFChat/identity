@@ -944,10 +944,13 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
             return;
         }
 
-        // Single fetch-and-delete inside one transaction. The old code did a
-        // separate SELECT and DELETE, so two concurrent redemptions of the same
-        // code could both pass the lookup and both get tokens.
-        auto auth_code = store_.consume_auth_code(code);
+        // Read, not consumed (audit I-9): the code is claimed only once the
+        // client and PKCE checks below have passed, so a request with a
+        // wrong verifier — anybody who saw the code in a log, say — cannot
+        // burn it and break the real client's sign-in. The claim itself is
+        // atomic (claim_auth_code), so two concurrent redemptions still
+        // cannot both get tokens.
+        auto auth_code = store_.get_auth_code(code);
         if (!auth_code) {
             oauth_error(res, 400, "invalid_grant", "Invalid authorization code");
             return;
@@ -1027,6 +1030,27 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
             return;
         }
 
+        // Every check passed: claim the code. A code that was already
+        // redeemed and is presented again WITH the right verifier means two
+        // parties hold the code and the verifier, and one of them already has
+        // tokens: revoke what the first redemption bought (RFC 6749 4.1.2;
+        // audit I-9). Requiring the checks first keeps someone who only saw
+        // the code from signing the real client out with it.
+        switch (store_.claim_auth_code(code)) {
+            case CodeClaim::Claimed:
+                break;
+            case CodeClaim::AlreadyRedeemed:
+                store_.revoke_auth_code_grant(code);
+                log->warn("Authorization code replayed for account {} (client {}); the tokens "
+                          "from its first redemption were revoked",
+                          auth_code->account_id, auth_code->client_id);
+                oauth_error(res, 400, "invalid_grant", "Authorization code already used");
+                return;
+            case CodeClaim::Unknown:
+                oauth_error(res, 400, "invalid_grant", "Invalid authorization code");
+                return;
+        }
+
         // Generate tokens
         auto access_token = create_access_token();
         auto id_token = create_id_token(*account, auth_code->client_id, auth_code->scope,
@@ -1063,6 +1087,7 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
                                  rt.family_expires_at);
         rt.created_at = now;
         store_.store_refresh_token(rt);
+        store_.record_auth_code_grant(code, rt.family_id, access_token);
 
         json response = {
             {"access_token", access_token},
