@@ -174,6 +174,12 @@ Config Config::load(const std::string& path) {
             read_into(hk, "session_sweep_interval", cfg.session_sweep_interval);
         }
 
+        // [apps]
+        if (auto apps = tbl["apps"].as_table()) {
+            read_into(apps, "mobile_redirect_uri", cfg.mobile_redirect_uri);
+            read_into(apps, "allow_legacy_mobile_scheme", cfg.allow_legacy_mobile_scheme);
+        }
+
     } catch (const toml::parse_error& e) {
         throw std::runtime_error(std::string("Failed to parse config: ") + e.what());
     }
@@ -182,6 +188,20 @@ Config Config::load(const std::string& path) {
         get_logger()->warn("password_hash_iterations={} is below the {} minimum; clamping",
                            cfg.password_hash_iterations, kMinPbkdf2Iterations);
         cfg.password_hash_iterations = kMinPbkdf2Iterations;
+    }
+    // The mobile redirect is matched exactly and is where authorization codes
+    // are delivered, so it must be an absolute https URL with no fragment.
+    if (cfg.mobile_redirect_uri.rfind("https://", 0) != 0 ||
+        cfg.mobile_redirect_uri.find('#') != std::string::npos ||
+        cfg.mobile_redirect_uri.size() <= std::string("https://").size()) {
+        throw std::runtime_error("[apps] mobile_redirect_uri must be an absolute https:// URL "
+                                 "without a fragment, got: " + cfg.mobile_redirect_uri);
+    }
+    if (cfg.allow_legacy_mobile_scheme) {
+        get_logger()->warn(
+            "[apps] allow_legacy_mobile_scheme is on: bsfchat-desktop accepts "
+            "bsfchat://oauth/callback, which any app on a phone can claim. Turn it off once "
+            "your users have the current mobile app.");
     }
     if (cfg.session_sweep_interval < 60) cfg.session_sweep_interval = 60;
     if (cfg.login_rate_limit < 1) cfg.login_rate_limit = 1;

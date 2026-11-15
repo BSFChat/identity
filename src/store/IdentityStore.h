@@ -12,6 +12,10 @@
 
 namespace bsfchat::id {
 
+// The most servers one account's list may hold. Shared by /api/servers and by
+// the automatic record a first-party sign-in makes.
+inline constexpr size_t kMaxServerMemberships = 100;
+
 struct Account {
     std::string id;
     std::string username;
@@ -329,6 +333,11 @@ public:
     };
     void add_server_membership(const std::string& account_id, const std::string& server_url,
                                 const std::string& server_name = "");
+    // Adds a server to the account's list when one of the first-party apps
+    // signs in to it, so every device restores it. Insert-if-missing: a name
+    // the user set is never overwritten. False when the list is full.
+    bool record_server_signin(const std::string& account_id, const std::string& server_url,
+                              const std::string& server_name, size_t max_memberships);
     void remove_server_membership(const std::string& account_id, const std::string& server_url);
     std::vector<ServerMembership> list_server_memberships(const std::string& account_id);
 

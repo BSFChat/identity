@@ -2,87 +2,126 @@
 #include "core/Logger.h"
 
 #include <chrono>
+#include <string>
 
 namespace bsfchat::id {
 
 namespace {
 
-// "bsfchat-desktop" is the first-party client for every platform, not just
-// desktop, and its two registered redirect shapes are the two halves of
-// RFC 8252:
+// Two first-party PUBLIC clients (empty secret, so PKCE is mandatory at both
+// /authorize and /token — authenticate_client() and the PublicClient* cases in
+// tests/test_auth_flows.cpp pin that):
 //
-//   * Loopback (§7.3) — desktop. The client binds an ephemeral port and
-//     listens on /oauth/callback. Registering the full path (rather than a
-//     bare "http://localhost") lets redirect_uri_matches() relax only the
-//     port.
+//   * "bsfchat-desktop" — RFC 8252 §7.3 loopback. The client binds an
+//     ephemeral port and listens on /oauth/callback; registering the full path
+//     lets redirect_uri_matches() relax only the port.
 //
-//   * Private-use URI scheme (§7.1) — iOS AND Android. Neither has a
-//     working loopback option
-//     there: handing off to the system browser suspends the app, so nothing
-//     ever accepts the callback connection and sign-in hangs. The client
-//     presents ASWebAuthenticationSession in-process and takes the redirect
-//     from it. redirect_uri_matches() short-circuits its port-flexible rule
-//     on any non-http scheme, so this one is matched byte for byte.
+//   * "bsfchat-mobile" — RFC 8252 §7.2 claimed https redirect, one exact URL
+//     ([apps] mobile_redirect_uri). Android delivers it only to the app whose
+//     signing key the domain's assetlinks.json names, and iOS only to the app
+//     its apple-app-site-association names.
 //
-// Why a private-use scheme is safe to register HERE: nobody can reserve
-// "bsfchat://", so a hostile app on the same device can register it too and
-// win the redirect. What it cannot do is spend the code — bsfchat-desktop is
-// a public client (empty secret), which makes PKCE mandatory at both
-// /authorize and /token, and the S256 verifier never leaves the real client.
-// That enforcement is load-bearing for this entry specifically: see
-// authenticate_client() and the PKCE checks in OidcHandler, and the
-// PublicClient* cases in tests/test_auth_flows.cpp that pin them.
+// Why mobile stopped sharing bsfchat-desktop's "bsfchat://oauth/callback": a
+// private-use scheme cannot be reserved. PKCE stops another app from spending
+// the REAL app's code, but nothing stopped another app from starting its OWN
+// sign-in as bsfchat-desktop with that redirect: the consent page truthfully
+// said "BSFChat Desktop", and one tap of Allow gave the impostor a token for
+// the user's chat server plus write access to their server list (M5). With a
+// claimed https redirect the OS will not hand the code to that app at all.
 //
-// The iOS client reuses this client_id rather than getting its own because
-// /api/servers is gated on client_id == "bsfchat-desktop" (AccountHandler,
-// audit finding M5), and because the admin API only mints CONFIDENTIAL
-// clients — the wrong shape for an app that cannot keep a secret.
+// The desktop loopback has the same property in principle (any local process
+// can bind a port, RFC 8252 §8.6), but a process already running on your
+// desktop is a different threat from an app installed from a store.
+constexpr const char* kDesktopClientId = "bsfchat-desktop";
+constexpr const char* kMobileClientId = "bsfchat-mobile";
+
 constexpr const char* kDesktopRedirectUris =
+    R"(["http://127.0.0.1/oauth/callback","http://localhost/oauth/callback"])";
+// Only with [apps] allow_legacy_mobile_scheme: mobile builds from before
+// bsfchat-mobile existed still sign in as bsfchat-desktop through this.
+constexpr const char* kDesktopWithLegacySchemeRedirectUris =
     R"(["http://127.0.0.1/oauth/callback","http://localhost/oauth/callback","bsfchat://oauth/callback"])";
 
-// Values shipped previously. Each is upgraded in place on startup, and only
-// an exact match is touched, so an operator who has customised the list keeps
-// what they wrote.
+// Values shipped previously. Only an exact match is rewritten, so an operator
+// who has customised the list keeps what they wrote.
 //
 // The bare-localhost one matched any path on any localhost port.
 constexpr const char* kLegacyDesktopRedirectUris = R"(["http://localhost"])";
-// Loopback only, from before the iOS client existed. An installation left on
-// this value refuses every iOS sign-in with "Invalid redirect_uri for this
-// client", so it has to be widened here rather than by hand.
-constexpr const char* kLoopbackOnlyDesktopRedirectUris =
-    R"(["http://127.0.0.1/oauth/callback","http://localhost/oauth/callback"])";
+
+std::string json_string_array_of_one(const std::string& uri) {
+    // The value has passed Config's https/no-fragment check; quote and
+    // backslash are escaped anyway so the stored JSON is always well formed.
+    std::string out = "[\"";
+    for (char c : uri) {
+        if (c == '"' || c == '\\') out += '\\';
+        out += c;
+    }
+    out += "\"]";
+    return out;
+}
+
+int64_t now_seconds() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
 
 } // namespace
 
 const char* first_party_redirect_uris() { return kDesktopRedirectUris; }
+const char* desktop_client_id() { return kDesktopClientId; }
+const char* mobile_client_id() { return kMobileClientId; }
 
-void ensure_first_party_client(IdentityStore& store) {
+bool is_first_party_client(const std::string& client_id) {
+    return client_id == kDesktopClientId || client_id == kMobileClientId;
+}
+
+void ensure_first_party_client(IdentityStore& store, const Config& config) {
     auto log = get_logger();
 
-    // Auto-create the well-known desktop client if it doesn't exist
-    auto desktop = store.get_oauth_client("bsfchat-desktop");
+    // --- bsfchat-desktop ----------------------------------------------------
+    const char* desktop_uris = config.allow_legacy_mobile_scheme
+                                   ? kDesktopWithLegacySchemeRedirectUris
+                                   : kDesktopRedirectUris;
+    auto desktop = store.get_oauth_client(kDesktopClientId);
     if (!desktop.has_value()) {
         OAuthClient client;
-        client.client_id = "bsfchat-desktop";
+        client.client_id = kDesktopClientId;
         client.client_secret = ""; // public client — authenticates via PKCE
         client.name = "BSFChat Desktop";
-        client.redirect_uris = kDesktopRedirectUris;
-        client.created_at = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
+        client.redirect_uris = desktop_uris;
+        client.created_at = now_seconds();
         store.create_oauth_client(client);
-        return;
+    } else if (desktop->redirect_uris != desktop_uris &&
+               (desktop->redirect_uris == kLegacyDesktopRedirectUris ||
+                desktop->redirect_uris == kDesktopRedirectUris ||
+                desktop->redirect_uris == kDesktopWithLegacySchemeRedirectUris)) {
+        // One of the shapes this code has shipped, so it is ours to move:
+        // narrowing the bare-localhost entry, dropping bsfchat:// (the
+        // default now), or re-adding it when the operator asked for the
+        // transition. A list an operator wrote by hand is left alone.
+        store.update_oauth_client_redirect_uris(kDesktopClientId, desktop_uris);
+        log->info("Set bsfchat-desktop redirect_uris to {}", desktop_uris);
     }
 
-    if (desktop->redirect_uris == kLegacyDesktopRedirectUris) {
-        // Narrow the existing registration to the paths the client actually
-        // uses. Left alone if an operator has customised it.
-        store.update_oauth_client_redirect_uris("bsfchat-desktop", kDesktopRedirectUris);
-        log->info("Tightened bsfchat-desktop redirect_uris to the callback paths");
-    } else if (desktop->redirect_uris == kLoopbackOnlyDesktopRedirectUris) {
-        // Widen, not narrow: the loopback entries are unchanged, and the
-        // private-use scheme the iOS client redirects to is added alongside.
-        store.update_oauth_client_redirect_uris("bsfchat-desktop", kDesktopRedirectUris);
-        log->info("Added the bsfchat:// native callback to bsfchat-desktop redirect_uris");
+    // --- bsfchat-mobile -----------------------------------------------------
+    // Fully managed from [apps] mobile_redirect_uri: the redirect is where the
+    // OS routes codes to the verified app, and it has to agree with the
+    // domain the app was built for, so config is the one source of truth.
+    const std::string mobile_uris = json_string_array_of_one(config.mobile_redirect_uri);
+    auto mobile = store.get_oauth_client(kMobileClientId);
+    if (!mobile.has_value()) {
+        OAuthClient client;
+        client.client_id = kMobileClientId;
+        client.client_secret = ""; // public client — authenticates via PKCE
+        client.name = "BSFChat";
+        client.redirect_uris = mobile_uris;
+        client.created_at = now_seconds();
+        store.create_oauth_client(client);
+        log->info("Registered the bsfchat-mobile client ({})", config.mobile_redirect_uri);
+    } else if (mobile->redirect_uris != mobile_uris) {
+        store.update_oauth_client_redirect_uris(kMobileClientId, mobile_uris);
+        log->info("Set bsfchat-mobile redirect_uris to {}", mobile_uris);
     }
 }
 

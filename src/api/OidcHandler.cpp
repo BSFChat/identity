@@ -1,4 +1,5 @@
 #include "api/OidcHandler.h"
+#include "core/ClientRegistration.h"
 #include "core/Version.h"
 #include "core/Logger.h"
 #include "core/WebUtil.h"
@@ -870,7 +871,7 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
 
     // Parse either form-encoded or JSON body
     std::string grant_type, code, redirect_uri, client_id, client_secret, refresh_token_str, code_verifier;
-    std::string resource;
+    std::string resource, nonce;
     bool secret_presented = false;
 
     if (req.get_header_value("Content-Type").find("application/x-www-form-urlencoded") != std::string::npos) {
@@ -882,6 +883,7 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
         refresh_token_str = params["refresh_token"];
         code_verifier = params["code_verifier"];
         resource = params["resource"];
+        nonce = params["nonce"];
         if (params.count("client_secret")) {
             client_secret = params["client_secret"];
             secret_presented = true;
@@ -900,6 +902,9 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
         code_verifier = body.value("code_verifier", "");
         if (body.contains("resource") && body["resource"].is_string()) {
             resource = body["resource"].get<std::string>();
+        }
+        if (body.contains("nonce") && body["nonce"].is_string()) {
+            nonce = body["nonce"].get<std::string>();
         }
         if (body.contains("client_secret") && body["client_secret"].is_string()) {
             client_secret = body["client_secret"].get<std::string>();
@@ -1026,6 +1031,9 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
         auto access_token = create_access_token();
         auto id_token = create_id_token(*account, auth_code->client_id, auth_code->scope,
                                         auth_code->resource, auth_code->nonce);
+        if (!auth_code->resource.empty()) {
+            record_first_party_signin(account->id, auth_code->client_id, auth_code->resource);
+        }
         auto refresh_token = random_hex(32);
 
         auto now = now_seconds();
@@ -1101,6 +1109,42 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
             return;
         }
 
+        // A chat-server token on refresh (RFC 8707 resource on the refresh
+        // grant). This is what lets a signed-in BSFChat app join another
+        // server without a browser trip: the id_token is audienced to exactly
+        // the server named here — so C1 holds, a token for one server is
+        // still refused by every other — and only the app holding this
+        // refresh token can ask. Only the first-party apps may: for them,
+        // the user picking a server in the app is the consent; for a third
+        // party it would be a silent grant to servers the user never saw.
+        //
+        // Checked BEFORE rotation, so a bad request costs nothing: rotating
+        // first and then refusing would burn the token and sign the app out.
+        std::string server_audience;
+        if (!resource.empty()) {
+            if (!is_first_party_client(rt->client_id)) {
+                oauth_error(res, 400, "invalid_target",
+                            "This client cannot request a chat-server token on refresh");
+                return;
+            }
+            auto canonical = bsfchat::canonical_audience_url(resource);
+            if (!canonical || !bsfchat::audience_url_is_secure(*canonical)) {
+                oauth_error(res, 400, "invalid_target", "resource is not a valid server URL");
+                return;
+            }
+            // Chat servers accept each sign-in token once, keyed by its nonce,
+            // so a server token without one would be refused anyway.
+            if (nonce.empty() || !nonce_acceptable(nonce)) {
+                oauth_error(res, 400, "invalid_request",
+                            "nonce is required with resource on refresh");
+                return;
+            }
+            server_audience = *canonical;
+        } else if (!nonce.empty()) {
+            oauth_error(res, 400, "invalid_request", "nonce is only accepted with resource");
+            return;
+        }
+
         // Rotate first, atomically (security audit L4): the old token is
         // retired and its successor stored in one transaction, and nothing is
         // minted unless that succeeded. Expiry (idle and absolute) and replay
@@ -1125,18 +1169,21 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
 
         // Generate new tokens.
         //
-        // The id_token minted here names no chat server: a refresh token is
-        // not bound to one (the refresh token rows carry a family, not a
-        // resource, and the desktop client never uses this path for a
-        // sign-in — it runs a fresh authorization per server). So it gets the
-        // legacy client_id audience, which no upgraded chat server accepts.
-        // A refresh token therefore cannot be turned into a sign-in anywhere
-        // that has the C1 fix, which is the safe direction to be wrong in.
-        // Claims still follow the scope the grant was given (M4), and there
-        // is no nonce: that belongs to an authorization request, and a
-        // refresh is not one.
+        // Without a resource the id_token names no chat server and gets the
+        // legacy client_id audience, which no upgraded chat server accepts —
+        // so a plain refresh still cannot sign anyone in anywhere. Claims
+        // follow the scope the grant was given (M4).
         auto access_token = create_access_token();
-        auto id_token = create_id_token(*account, rt->client_id, rt->scope, "", "");
+        // With a resource (validated above) the id_token names that one chat
+        // server and echoes the client's nonce, exactly as an authorization
+        // would have.
+        auto id_token = create_id_token(*account, rt->client_id, rt->scope, server_audience,
+                                        server_audience.empty() ? "" : nonce);
+        if (!server_audience.empty()) {
+            record_first_party_signin(account->id, rt->client_id, server_audience);
+            log->info("Issued a server token on refresh for account {} to {}", account->id,
+                      server_audience);
+        }
 
         Session access_session;
         access_session.session_id = access_token;
@@ -1296,6 +1343,21 @@ std::string OidcHandler::create_id_token(const Account& account, const std::stri
 
 std::string OidcHandler::create_access_token() {
     return random_hex(32);
+}
+
+void OidcHandler::record_first_party_signin(const std::string& account_id,
+                                            const std::string& client_id,
+                                            const std::string& server_url) {
+    if (!is_first_party_client(client_id) || server_url.empty()) return;
+    // The list's display name: the host. A name the user later sets in the
+    // portal or the app is kept, because the record never overwrites.
+    std::string name = server_url;
+    if (auto p = name.find("://"); p != std::string::npos) name = name.substr(p + 3);
+    if (auto slash = name.find('/'); slash != std::string::npos) name = name.substr(0, slash);
+    if (!store_.record_server_signin(account_id, server_url, name, kMaxServerMemberships)) {
+        get_logger()->info("Server list for account {} is full; {} not recorded", account_id,
+                           server_url);
+    }
 }
 
 } // namespace bsfchat::id

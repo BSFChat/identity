@@ -166,6 +166,8 @@ protected:
         desktop.redirect_uris = first_party_redirect_uris();
         desktop.created_at = now;
         ASSERT_TRUE(store->create_oauth_client(desktop));
+        // And the mobile client, as production seeds it (the native tests).
+        ensure_first_party_client(*store, config);
 
         // Some other relying party an admin registered: a bot dashboard, a
         // web app. Confidential, so no PKCE needed.
@@ -564,18 +566,18 @@ TEST_F(TokenAudienceTest, ServerListWritesRefuseCrossSiteBrowserRequests) {
 // ---------------------------------------------------------------------------
 // The iOS transport does not touch any of this.
 //
-// iOS signs in through ASWebAuthenticationSession with a private-use URI
-// scheme callback, because the desktop loopback redirect cannot work there —
+// Mobile signs in as bsfchat-mobile through a claimed https callback, because
+// the desktop loopback redirect cannot work there —
 // the browser hand-off suspends the app and the callback is never accepted.
 // What changed is where the redirect lands. What must NOT change is the
 // audience binding C1 exists for, the nonce, azp, or the token's lifetime.
 // ---------------------------------------------------------------------------
 
 TEST_F(TokenAudienceTest, TheNativeCallbackKeepsTheAudienceBinding) {
-    const std::string kNative = "bsfchat://oauth/callback";
+    const std::string kNative = "https://bsfchat.com/oauth/callback";
 
     auto req = cookie_request();
-    req.params.emplace("client_id", "bsfchat-desktop");
+    req.params.emplace("client_id", "bsfchat-mobile");
     req.params.emplace("redirect_uri", kNative);
     req.params.emplace("response_type", "code");
     req.params.emplace("scope", "openid profile");
@@ -592,12 +594,12 @@ TEST_F(TokenAudienceTest, TheNativeCallbackKeepsTheAudienceBinding) {
     auto code = approve(res);
     ASSERT_FALSE(code.empty());
 
-    auto tres = redeem(code, {{"redirect_uri", kNative}, {"resource", kChat}});
+    auto tres = redeem(code, {{"client_id", "bsfchat-mobile"}, {"redirect_uri", kNative}, {"resource", kChat}});
     ASSERT_EQ(status_of(tres), 200) << tres.body;
 
     auto claims = jwt_payload(json::parse(tres.body)["id_token"].get<std::string>());
     EXPECT_EQ(claims["aud"], kChat);              // C1: the chat server, not the client
-    EXPECT_EQ(claims.value("azp", ""), "bsfchat-desktop");
+    EXPECT_EQ(claims.value("azp", ""), "bsfchat-mobile");
     EXPECT_EQ(claims.value("nonce", ""), "n-from-ios");
     EXPECT_LE(claims["exp"].get<int64_t>() - claims["iat"].get<int64_t>(), 300);
 }
@@ -605,10 +607,10 @@ TEST_F(TokenAudienceTest, TheNativeCallbackKeepsTheAudienceBinding) {
 TEST_F(TokenAudienceTest, TheNativeCallbackCannotBorrowAnotherServersToken) {
     // The C1 proof, over the iOS transport: a code issued for one chat server
     // cannot be redeemed naming another.
-    const std::string kNative = "bsfchat://oauth/callback";
+    const std::string kNative = "https://bsfchat.com/oauth/callback";
 
     auto req = cookie_request();
-    req.params.emplace("client_id", "bsfchat-desktop");
+    req.params.emplace("client_id", "bsfchat-mobile");
     req.params.emplace("redirect_uri", kNative);
     req.params.emplace("response_type", "code");
     req.params.emplace("scope", "openid profile");
@@ -623,7 +625,123 @@ TEST_F(TokenAudienceTest, TheNativeCallbackCannotBorrowAnotherServersToken) {
     auto code = approve(res);
     ASSERT_FALSE(code.empty());
 
-    auto tres = redeem(code, {{"redirect_uri", kNative},
+    auto tres = redeem(code, {{"client_id", "bsfchat-mobile"}, {"redirect_uri", kNative},
                               {"resource", "https://evil.example"}});
     EXPECT_NE(status_of(tres), 200) << tres.body;
+}
+
+// ---------------------------------------------------------------------------
+// Auth first: a signed-in app joins a server without a browser trip.
+//
+// The refresh grant takes a `resource` (RFC 8707) and a nonce from a
+// first-party app and returns an id_token for exactly that server. The C1
+// binding holds — one token, one server — and only the holder of the refresh
+// token can ask. Every server a first-party app signs in to is added to the
+// account's list, so the next device restores it with no web-console visit.
+// ---------------------------------------------------------------------------
+namespace {
+const std::string kChat2 = "https://second.example";
+}
+
+class AuthFirstTest : public TokenAudienceTest {
+protected:
+    httplib::Response refresh_for(const std::string& refresh_token,
+                                  const std::map<std::string, std::string>& extra,
+                                  const std::string& client = "bsfchat-desktop") {
+        std::map<std::string, std::string> p{{"grant_type", "refresh_token"},
+                                             {"refresh_token", refresh_token},
+                                             {"client_id", client}};
+        for (const auto& [k, v] : extra) p[k] = v;
+        auto req = form_request(p);
+        httplib::Response res;
+        oidc->handle_token(req, res);
+        return res;
+    }
+    bool listed(const std::string& url) {
+        for (const auto& m : store->list_server_memberships("acct-1")) {
+            if (m.server_url == url) return true;
+        }
+        return false;
+    }
+};
+
+TEST_F(AuthFirstTest, RefreshNamesOneServerAndEchoesTheNonce) {
+    auto first = desktop_login({{"resource", kChat}});
+    auto res = refresh_for(first["refresh_token"].get<std::string>(),
+                           {{"resource", kChat2}, {"nonce", "n-join-2"}});
+    ASSERT_EQ(status_of(res), 200) << res.body;
+    auto body = json::parse(res.body);
+    auto claims = jwt_payload(body["id_token"].get<std::string>());
+    EXPECT_EQ(claims["aud"], kChat2);
+    EXPECT_EQ(claims.value("azp", ""), "bsfchat-desktop");
+    EXPECT_EQ(claims.value("nonce", ""), "n-join-2");
+    // Still rotates: the old refresh token is spent, a new one is issued.
+    EXPECT_FALSE(body.value("refresh_token", "").empty());
+    EXPECT_NE(body["refresh_token"], first["refresh_token"]);
+}
+
+TEST_F(AuthFirstTest, ABadServerRequestDoesNotBurnTheRefreshToken) {
+    const auto rt = desktop_login({{"resource", kChat}})["refresh_token"].get<std::string>();
+    // No nonce: chat servers refuse a sign-in token without one.
+    auto no_nonce = refresh_for(rt, {{"resource", kChat2}});
+    EXPECT_EQ(status_of(no_nonce), 400);
+    EXPECT_EQ(json::parse(no_nonce.body)["error"], "invalid_request");
+    // Not a server URL an audience may be.
+    auto insecure = refresh_for(rt, {{"resource", "http://evil.example"}, {"nonce", "n1"}});
+    EXPECT_EQ(status_of(insecure), 400);
+    EXPECT_EQ(json::parse(insecure.body)["error"], "invalid_target");
+    // A nonce with nothing to bind it to.
+    EXPECT_EQ(status_of(refresh_for(rt, {{"nonce", "n1"}})), 400);
+    // And after all three refusals the token still works: nothing was rotated.
+    EXPECT_EQ(status_of(refresh_for(rt, {{"resource", kChat2}, {"nonce", "n2"}})), 200);
+}
+
+TEST_F(AuthFirstTest, AThirdPartyClientCannotMintServerTokensOnRefresh) {
+    httplib::Request areq = cookie_request();
+    areq.params.emplace("client_id", "web-app");
+    areq.params.emplace("redirect_uri", "https://app.example.com/cb");
+    areq.params.emplace("response_type", "code");
+    areq.params.emplace("scope", "openid");
+    httplib::Response ares;
+    oidc->handle_authorize(areq, ares);
+    auto code = approve(ares);
+    ASSERT_FALSE(code.empty());
+    auto treq = form_request({{"grant_type", "authorization_code"},
+                              {"code", code},
+                              {"redirect_uri", "https://app.example.com/cb"},
+                              {"client_id", "web-app"},
+                              {"client_secret", "s3cr3t-value"}});
+    httplib::Response tres;
+    oidc->handle_token(treq, tres);
+    ASSERT_EQ(status_of(tres), 200) << tres.body;
+    const auto rt = json::parse(tres.body)["refresh_token"].get<std::string>();
+
+    auto req = form_request({{"grant_type", "refresh_token"},
+                             {"refresh_token", rt},
+                             {"client_id", "web-app"},
+                             {"client_secret", "s3cr3t-value"},
+                             {"resource", kChat},
+                             {"nonce", "n1"}});
+    httplib::Response res;
+    oidc->handle_token(req, res);
+    EXPECT_EQ(status_of(res), 400);
+    EXPECT_EQ(json::parse(res.body)["error"], "invalid_target");
+    EXPECT_FALSE(listed(kChat));
+}
+
+TEST_F(AuthFirstTest, EveryServerAFirstPartyAppSignsInToIsListed) {
+    auto first = desktop_login({{"resource", kChat}});
+    EXPECT_TRUE(listed(kChat)) << "a browser sign-in to a server did not record it";
+    ASSERT_EQ(status_of(refresh_for(first["refresh_token"].get<std::string>(),
+                                    {{"resource", kChat2}, {"nonce", "n-2"}})),
+              200);
+    EXPECT_TRUE(listed(kChat2)) << "a joined server did not record it";
+}
+
+TEST_F(AuthFirstTest, RecordingNeverOverwritesANameTheUserChose) {
+    store->add_server_membership("acct-1", kChat, "Our team");
+    desktop_login({{"resource", kChat}});
+    for (const auto& m : store->list_server_memberships("acct-1")) {
+        if (m.server_url == kChat) EXPECT_EQ(m.server_name, "Our team");
+    }
 }

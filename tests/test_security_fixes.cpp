@@ -947,3 +947,96 @@ TEST(SchemaMigrationV3Test, PreIntegrationSecurityV2DatabaseIsNotHashedTwice) {
     EXPECT_EQ(user_version_of(path), 3);
     remove_db(db_path);
 }
+
+// ---------------------------------------------------------------------------
+// L5, completed: login tokens, authorization codes and consent tokens were the
+// three bearer values still stored raw. A login token is a password already
+// proven, waiting on the second factor; a copy of identity.db (a backup) held
+// them live. Stored now as "h1:" + sha256, and a raw row an older build left
+// behind is hashed on open, still works, and is not hashed again on the next.
+// ---------------------------------------------------------------------------
+namespace {
+bool db_file_contains(const std::string& path, const std::string& needle) {
+    // The WAL as well as the main file: a value is "at rest" in either.
+    for (const auto& f : {path, path + "-wal"}) {
+        std::ifstream in(f, std::ios::binary);
+        if (!in) continue;
+        std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        if (bytes.find(needle) != std::string::npos) return true;
+    }
+    return false;
+}
+}  // namespace
+
+TEST(TransientTokensAtRest, NoRawLoginTokenCodeOrConsentTokenIsStored) {
+    auto db_path = bsfchat::test::unique_temp_file("bsfchat_id_transient", ".db");
+    remove_db(db_path);
+    const auto path = db_path.string();
+    const std::string login_token(64, 'a'), code(64, 'b'), consent(64, 'c');
+    {
+        IdentityStore store(path);
+        store.initialize();
+        Account a;
+        a.id = "a1";
+        a.username = "alice";
+        a.created_at = a.updated_at = now_seconds();
+        ASSERT_TRUE(store.create_account(a));
+
+        store.create_login_token(login_token, "a1", now_seconds() + 300);
+        AuthCode ac;
+        ac.code = code;
+        ac.client_id = "bsfchat-desktop";
+        ac.account_id = "a1";
+        ac.expires_at = now_seconds() + 300;
+        ASSERT_TRUE(store.store_auth_code(ac));
+        ConsentRequest cr;
+        cr.token = consent;
+        cr.session_id = "sess";
+        cr.account_id = "a1";
+        cr.client_id = "bsfchat-desktop";
+        cr.expires_at = now_seconds() + 300;
+        ASSERT_TRUE(store.store_consent_request(cr));
+
+        // Still usable by the presented value.
+        EXPECT_EQ(store.validate_login_token(login_token).value_or(""), "a1");
+        auto got = store.get_auth_code(code);
+        ASSERT_TRUE(got.has_value());
+        EXPECT_EQ(got->code, code) << "callers get back the value they presented";
+    }
+    EXPECT_FALSE(db_file_contains(path, login_token)) << "raw login token at rest";
+    EXPECT_FALSE(db_file_contains(path, code)) << "raw authorization code at rest";
+    EXPECT_FALSE(db_file_contains(path, consent)) << "raw consent token at rest";
+    {
+        IdentityStore store(path);
+        store.initialize();
+        EXPECT_EQ(store.consume_consent_request(consent, "sess").outcome, ConsentOutcome::Granted);
+        EXPECT_TRUE(store.consume_auth_code(code).has_value());
+    }
+    remove_db(db_path);
+}
+
+TEST(TransientTokensAtRest, RawRowsFromAnOlderBuildAreHashedOnceAndKeepWorking) {
+    auto db_path = bsfchat::test::unique_temp_file("bsfchat_id_transient_up", ".db");
+    remove_db(db_path);
+    const auto path = db_path.string();
+    const auto exp = std::to_string(now_seconds() + 300);
+    {
+        IdentityStore fresh(path);
+        fresh.initialize();
+    }
+    run_sql(path, "INSERT INTO login_tokens (token, account_id, expires_at) VALUES ('raw-login', 'a1', " +
+                      exp + ")");
+    run_sql(path, "INSERT INTO auth_codes (code, client_id, account_id, redirect_uri, scope, "
+                  "code_challenge, expires_at) VALUES ('raw-code', 'c', 'a1', 'r', 'openid', 'cc', " +
+                      exp + ")");
+    for (int open = 0; open < 2; ++open) {  // the second open must change nothing
+        IdentityStore store(path);
+        ASSERT_NO_THROW(store.initialize());
+        EXPECT_EQ(store.validate_login_token("raw-login").value_or(""), "a1")
+            << "open " << open << ": in-flight login token lost or hashed twice";
+        EXPECT_TRUE(store.get_auth_code("raw-code").has_value()) << "open " << open;
+    }
+    EXPECT_FALSE(db_file_contains(path, "raw-login"));
+    EXPECT_FALSE(db_file_contains(path, "raw-code"));
+    remove_db(db_path);
+}

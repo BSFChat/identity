@@ -16,6 +16,14 @@ namespace {
 // Bump when a new migration step is appended to migrate_locked().
 constexpr int kSchemaVersion = 3;
 
+// How the three short-lived bearer values (login tokens, authorization codes,
+// consent tokens) are stored: hashed like sessions, behind a prefix so the
+// migration that hashes pre-existing rows can tell hashed from raw.
+constexpr const char* kTransientKeyPrefix = "h1:";
+std::string transient_key(const std::string& raw) {
+    return std::string(kTransientKeyPrefix) + hash_token(raw);
+}
+
 // Backup codes carry ~47 bits of entropy and are checked one at a time against
 // at most a handful of stored hashes, so a lighter KDF than the password one is
 // appropriate; this keeps a redemption well under a second.
@@ -490,6 +498,46 @@ void IdentityStore::migrate_locked() {
         txn.commit();
         log->info("Identity database schema migrated to version {}", kSchemaVersion);
     }
+
+    // --- short-lived bearer values, hashed at rest (L5, completed) -----------
+    // v3 hashed sessions, refresh tokens and client secrets but left three
+    // tables holding raw bearer values: login_tokens (a password already
+    // proven, waiting on the second factor), auth_codes and consent_requests.
+    // A copy of identity.db — a backup — carried them live. They are now
+    // stored as transient_key(), whose "h1:" prefix is what makes this pass
+    // idempotent: raw values are 64 hex characters, the same shape as a bare
+    // SHA-256, so without a marker a second run could not tell what it had
+    // already done. Unconditional rather than versioned, like the column
+    // checks above: the tables are tiny and the pass is a no-op once done.
+    // Rows are rewritten, not dropped, so a sign-in in flight across the
+    // upgrade still completes.
+    {
+        Transaction txn(db_);
+        for (const auto& [table, column] :
+             {std::pair{"auth_codes", "code"}, std::pair{"login_tokens", "token"},
+              std::pair{"consent_requests", "token"}}) {
+            std::vector<std::string> values;
+            {
+                auto stmt = prepare(db_, std::string("SELECT ") + column + " FROM " + table +
+                                             " WHERE substr(" + column + ", 1, 3) != '" +
+                                             kTransientKeyPrefix + "'");
+                while (sqlite3_step(stmt.get()) == SQLITE_ROW) values.push_back(col_text(stmt.get(), 0));
+            }
+            auto upd = prepare(db_, std::string("UPDATE ") + table + " SET " + column +
+                                        " = ? WHERE " + column + " = ?");
+            for (const auto& v : values) {
+                sqlite3_reset(upd.get());
+                bind_text(upd.get(), 1, transient_key(v));
+                bind_text(upd.get(), 2, v);
+                sqlite3_step(upd.get());
+            }
+            if (!values.empty()) {
+                log->info("Schema migration: hashed {} {}.{} value(s) at rest", values.size(), table,
+                          column);
+            }
+        }
+        txn.commit();
+    }
 }
 
 // Accounts
@@ -755,7 +803,7 @@ bool IdentityStore::store_auth_code(const AuthCode& code) {
     auto stmt = prepare(db_,
         "INSERT INTO auth_codes (code, client_id, account_id, redirect_uri, scope, code_challenge, expires_at, "
         "resource, nonce) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
-    sqlite3_bind_text(stmt.get(), 1, code.code.c_str(), -1, SQLITE_TRANSIENT);
+    bind_text(stmt.get(), 1, transient_key(code.code));
     sqlite3_bind_text(stmt.get(), 2, code.client_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 3, code.account_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 4, code.redirect_uri.c_str(), -1, SQLITE_TRANSIENT);
@@ -772,10 +820,10 @@ std::optional<AuthCode> IdentityStore::get_auth_code(const std::string& code) {
     auto stmt = prepare(db_,
         "SELECT code, client_id, account_id, redirect_uri, scope, code_challenge, expires_at, "
         "resource, nonce FROM auth_codes WHERE code = ?");
-    sqlite3_bind_text(stmt.get(), 1, code.c_str(), -1, SQLITE_TRANSIENT);
+    bind_text(stmt.get(), 1, transient_key(code));
     if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
         AuthCode ac;
-        ac.code = col_text(stmt.get(), 0);
+        ac.code = code;
         ac.client_id = col_text(stmt.get(), 1);
         ac.account_id = col_text(stmt.get(), 2);
         ac.redirect_uri = col_text(stmt.get(), 3);
@@ -792,7 +840,7 @@ std::optional<AuthCode> IdentityStore::get_auth_code(const std::string& code) {
 void IdentityStore::delete_auth_code(const std::string& code) {
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_, "DELETE FROM auth_codes WHERE code = ?");
-    sqlite3_bind_text(stmt.get(), 1, code.c_str(), -1, SQLITE_TRANSIENT);
+    bind_text(stmt.get(), 1, transient_key(code));
     sqlite3_step(stmt.get());
 }
 
@@ -805,10 +853,10 @@ std::optional<AuthCode> IdentityStore::consume_auth_code(const std::string& code
         auto stmt = prepare(db_,
             "SELECT code, client_id, account_id, redirect_uri, scope, code_challenge, expires_at, "
             "resource, nonce FROM auth_codes WHERE code = ?");
-        bind_text(stmt.get(), 1, code);
+        bind_text(stmt.get(), 1, transient_key(code));
         if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
             AuthCode ac;
-            ac.code = col_text(stmt.get(), 0);
+            ac.code = code;
             ac.client_id = col_text(stmt.get(), 1);
             ac.account_id = col_text(stmt.get(), 2);
             ac.redirect_uri = col_text(stmt.get(), 3);
@@ -823,7 +871,7 @@ std::optional<AuthCode> IdentityStore::consume_auth_code(const std::string& code
 
     if (result) {
         auto del = prepare(db_, "DELETE FROM auth_codes WHERE code = ?");
-        bind_text(del.get(), 1, code);
+        bind_text(del.get(), 1, transient_key(code));
         sqlite3_step(del.get());
         // If the DELETE affected no rows another transaction already consumed
         // the code; treat it as invalid rather than issuing a second token set.
@@ -1221,7 +1269,7 @@ void IdentityStore::create_login_token(const std::string& token, const std::stri
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_,
         "INSERT INTO login_tokens (token, account_id, expires_at) VALUES (?, ?, ?)");
-    sqlite3_bind_text(stmt.get(), 1, token.c_str(), -1, SQLITE_TRANSIENT);
+    bind_text(stmt.get(), 1, transient_key(token));
     sqlite3_bind_text(stmt.get(), 2, account_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt.get(), 3, expires_at);
     sqlite3_step(stmt.get());
@@ -1233,7 +1281,7 @@ std::optional<std::string> IdentityStore::validate_login_token(const std::string
         std::chrono::system_clock::now().time_since_epoch()).count();
     auto stmt = prepare(db_,
         "SELECT account_id FROM login_tokens WHERE token = ? AND expires_at > ?");
-    sqlite3_bind_text(stmt.get(), 1, token.c_str(), -1, SQLITE_TRANSIENT);
+    bind_text(stmt.get(), 1, transient_key(token));
     sqlite3_bind_int64(stmt.get(), 2, now);
     if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
         return col_text(stmt.get(), 0);
@@ -1244,7 +1292,7 @@ std::optional<std::string> IdentityStore::validate_login_token(const std::string
 void IdentityStore::delete_login_token(const std::string& token) {
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_, "DELETE FROM login_tokens WHERE token = ?");
-    sqlite3_bind_text(stmt.get(), 1, token.c_str(), -1, SQLITE_TRANSIENT);
+    bind_text(stmt.get(), 1, transient_key(token));
     sqlite3_step(stmt.get());
 }
 
@@ -1255,7 +1303,7 @@ bool IdentityStore::record_login_token_failure(const std::string& token, int max
     int attempts = 0;
     {
         auto stmt = prepare(db_, "SELECT attempts FROM login_tokens WHERE token = ?");
-        bind_text(stmt.get(), 1, token);
+        bind_text(stmt.get(), 1, transient_key(token));
         if (sqlite3_step(stmt.get()) != SQLITE_ROW) {
             txn.commit();
             return true; // already gone
@@ -1270,12 +1318,12 @@ bool IdentityStore::record_login_token_failure(const std::string& token, int max
         // Burn the token: a wrong second factor must not leave a credential
         // that can be retried for the remainder of its five minute lifetime.
         auto del = prepare(db_, "DELETE FROM login_tokens WHERE token = ?");
-        bind_text(del.get(), 1, token);
+        bind_text(del.get(), 1, transient_key(token));
         sqlite3_step(del.get());
     } else {
         auto upd = prepare(db_, "UPDATE login_tokens SET attempts = ? WHERE token = ?");
         sqlite3_bind_int(upd.get(), 1, attempts);
-        bind_text(upd.get(), 2, token);
+        bind_text(upd.get(), 2, transient_key(token));
         sqlite3_step(upd.get());
     }
 
@@ -1298,7 +1346,7 @@ bool IdentityStore::store_consent_request(const ConsentRequest& request) {
         "INSERT INTO consent_requests "
         "(token, session_id, account_id, client_id, redirect_uri, scope, state, code_challenge, expires_at, "
         "resource, nonce) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-    bind_text(stmt.get(), 1, request.token);
+    bind_text(stmt.get(), 1, transient_key(request.token));
     // The browser session this prompt is bound to, hashed like the sessions
     // table itself: the raw value would be a live session id at rest.
     bind_text(stmt.get(), 2, hash_token(request.session_id));
@@ -1335,9 +1383,9 @@ ConsentDecision IdentityStore::consume_consent_request(const std::string& token,
         auto stmt = prepare(db_,
             "SELECT token, session_id, account_id, client_id, redirect_uri, scope, state, code_challenge, expires_at, "
             "resource, nonce, consumed_at FROM consent_requests WHERE token = ?");
-        bind_text(stmt.get(), 1, token);
+        bind_text(stmt.get(), 1, transient_key(token));
         if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
-            row.token = col_text(stmt.get(), 0);
+            row.token = token;
             row.session_id = col_text(stmt.get(), 1);
             row.account_id = col_text(stmt.get(), 2);
             row.client_id = col_text(stmt.get(), 3);
@@ -1399,7 +1447,7 @@ ConsentDecision IdentityStore::consume_consent_request(const std::string& token,
             "UPDATE consent_requests SET consumed_at = ? "
             "WHERE token = ? AND session_id = ? AND consumed_at = 0");
         sqlite3_bind_int64(upd.get(), 1, now_seconds());
-        bind_text(upd.get(), 2, token);
+        bind_text(upd.get(), 2, transient_key(token));
         bind_text(upd.get(), 3, presented);
         sqlite3_step(upd.get());
         if (sqlite3_changes(db_) == 0) {
@@ -1447,6 +1495,42 @@ void IdentityStore::add_server_membership(const std::string& account_id,
     sqlite3_bind_text(stmt.get(), 2, server_url.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 3, server_name.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(stmt.get());
+}
+
+bool IdentityStore::record_server_signin(const std::string& account_id,
+                                         const std::string& server_url,
+                                         const std::string& server_name,
+                                         size_t max_memberships) {
+    std::lock_guard lock(mutex_);
+    Transaction txn(db_);
+    {
+        auto have = prepare(db_,
+            "SELECT 1 FROM server_memberships WHERE account_id = ? AND server_url = ?");
+        bind_text(have.get(), 1, account_id);
+        bind_text(have.get(), 2, server_url);
+        if (sqlite3_step(have.get()) == SQLITE_ROW) {
+            txn.commit();
+            return true; // already listed; a name the user chose is kept
+        }
+    }
+    {
+        auto count = prepare(db_, "SELECT COUNT(*) FROM server_memberships WHERE account_id = ?");
+        bind_text(count.get(), 1, account_id);
+        if (sqlite3_step(count.get()) == SQLITE_ROW &&
+            static_cast<size_t>(sqlite3_column_int64(count.get(), 0)) >= max_memberships) {
+            txn.commit();
+            return false;
+        }
+    }
+    auto ins = prepare(db_,
+        "INSERT INTO server_memberships (account_id, server_url, server_name, joined_at) "
+        "VALUES (?, ?, ?, strftime('%s','now'))");
+    bind_text(ins.get(), 1, account_id);
+    bind_text(ins.get(), 2, server_url);
+    bind_text(ins.get(), 3, server_name);
+    const bool ok = sqlite3_step(ins.get()) == SQLITE_DONE;
+    txn.commit();
+    return ok;
 }
 
 void IdentityStore::remove_server_membership(const std::string& account_id,

@@ -1,4 +1,5 @@
 #include "api/AccountHandler.h"
+#include "core/ClientRegistration.h"
 #include "crypto/PasswordHash.h"
 #include "crypto/Secrets.h"
 #include "crypto/Totp.h"
@@ -83,11 +84,11 @@ constexpr const char* kServersScope = "openid";
 // to. That list is the desktop app's own state; nobody else has a reason to
 // write it. Seeded in IdentityServer.cpp. A browser session (the portal's
 // own profile page) is unaffected.
-constexpr const char* kServerListClientId = "bsfchat-desktop";
-
+//
+// Both first-party apps qualify: desktop and mobile restore the same list.
 bool may_use_server_list(const AuthContext& ctx) {
     return ctx.authenticated() &&
-           (ctx.is_browser_session() || ctx.client_id == kServerListClientId);
+           (ctx.is_browser_session() || is_first_party_client(ctx.client_id));
 }
 
 // Bounds on a server-membership row. The desktop client walks this list on
@@ -96,7 +97,6 @@ bool may_use_server_list(const AuthContext& ctx) {
 // carry the "openid" scope that every relying party asks for.
 constexpr size_t kMaxServerUrlLength = 512;
 constexpr size_t kMaxServerNameLength = 128;
-constexpr size_t kMaxServerMemberships = 100;
 
 // Characters a homeserver or avatar URL never needs, and which are exactly the
 // ones that break out of an HTML attribute or a JS string: security audit M1
@@ -494,6 +494,38 @@ void AccountHandler::handle_register(const httplib::Request& req, httplib::Respo
     start_session(account, res, 201);
 }
 
+bool AccountHandler::recheck_password(const httplib::Request& req, httplib::Response& res,
+                                      const Account& account, const std::string& password,
+                                      const char* wrong_message) {
+    // Volume first, before any PBKDF2: the same per-address budget /api/login
+    // spends, under its own prefix so the two do not starve each other.
+    const auto ip_key = client_key(req);
+    if (!ip_key.empty() && !login_limiter_.allow("recheck:" + ip_key)) {
+        res.set_header("Retry-After", std::to_string(config_.login_rate_window));
+        json_error(res, 429, "Too many attempts, please slow down");
+        return false;
+    }
+    // Then a per-ACCOUNT lockout, because the caller here already holds a
+    // session for the account, possibly a stolen one, and can rotate
+    // addresses. Keyed by account id, separately from login's username key,
+    // so this cannot be used to lock the owner out of signing in.
+    const auto key = "recheck-user:" + account.id;
+    if (account_failures_.is_locked(key)) {
+        res.set_header("Retry-After", std::to_string(account_failures_.retry_after(key)));
+        json_error(res, 429, "Too many failed attempts, try again later");
+        return false;
+    }
+    if (password.empty() || !verify_password(password, account.password_hash)) {
+        if (account_failures_.record_failure(key)) {
+            get_logger()->warn("Password re-check lockout engaged for account {}", account.id);
+        }
+        json_error(res, 403, wrong_message);
+        return false;
+    }
+    account_failures_.clear(key);
+    return true;
+}
+
 void AccountHandler::handle_login(const httplib::Request& req, httplib::Response& res) {
     auto log = get_logger();
 
@@ -767,8 +799,7 @@ void AccountHandler::handle_update_profile(const httplib::Request& req, httplib:
     int signed_out = -1;
     if (body->contains("new_password")) {
         auto old_password = string_field(*body, "old_password");
-        if (old_password.empty() || !verify_password(old_password, account->password_hash)) {
-            json_error(res, 403, "Current password is incorrect");
+        if (!recheck_password(req, res, *account, old_password, "Current password is incorrect")) {
             return;
         }
         auto new_password = string_field(*body, "new_password");
@@ -1054,10 +1085,7 @@ void AccountHandler::handle_2fa_disable(const httplib::Request& req, httplib::Re
         return;
     }
 
-    if (!verify_password(password, account->password_hash)) {
-        json_error(res, 403, "Invalid password");
-        return;
-    }
+    if (!recheck_password(req, res, *account, password, "Invalid password")) return;
 
     store_.disable_totp(account_id);
 
@@ -1191,7 +1219,11 @@ void AccountHandler::handle_list_servers(const httplib::Request& req, httplib::R
             {"joined_at", s.joined_at}
         });
     }
-    res.set_content(arr.dump(), "application/json");
+    // replace, not the default strict handler: rows written before the
+    // truncation above was made boundary-safe can hold a split character, and
+    // one bad name must not take the whole list down with a 500.
+    res.set_content(arr.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
+                    "application/json");
 }
 
 void AccountHandler::handle_add_server(const httplib::Request& req, httplib::Response& res) {
@@ -1234,7 +1266,15 @@ void AccountHandler::handle_add_server(const httplib::Request& req, httplib::Res
     std::string name;
     if (body.contains("server_name") && body["server_name"].is_string()) {
         name = body["server_name"].get<std::string>();
-        if (name.size() > kMaxServerNameLength) name.resize(kMaxServerNameLength);
+        if (name.size() > kMaxServerNameLength) {
+            // Cut on a code-point boundary. resize() at a byte split a
+            // multi-byte character, stored invalid UTF-8, and every later
+            // GET /api/servers then threw in dump() and answered 500 — for
+            // good, since the list that would offer "remove" never rendered.
+            size_t cut = kMaxServerNameLength;
+            while (cut > 0 && (static_cast<unsigned char>(name[cut]) & 0xC0) == 0x80) --cut;
+            name.resize(cut);
+        }
     }
 
     // The list is a convenience sync, not storage. Without a cap a single

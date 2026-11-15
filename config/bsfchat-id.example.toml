@@ -100,3 +100,17 @@ session_sweep_interval = 3600
 # NOTE: there is deliberately no [tls] section. This service speaks plain HTTP
 # and expects TLS to be terminated by the reverse proxy in front of it. A [tls]
 # block used to be parsed here and silently ignored; it is now warned about.
+
+# First-party apps
+[apps]
+# Where the mobile app's sign-in returns. It is an https URL the phone hands
+# ONLY to the verified BSFChat app (Android App Links / iOS associated
+# domains), which is what stops another app signing in as BSFChat. Leave it
+# at the default unless you ship your own app build with its own domain: the
+# official app's verified domain is fixed when the app is built.
+mobile_redirect_uri = "https://bsfchat.com/oauth/callback"
+# Re-admit bsfchat://oauth/callback for mobile app versions released before
+# the https callback. ANY app on a phone can claim that scheme and sign in as
+# BSFChat with one tap of Allow, so leave this off unless you are deliberately
+# giving users time to update, and turn it off again afterwards.
+allow_legacy_mobile_scheme = false
