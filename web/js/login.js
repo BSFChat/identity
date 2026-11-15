@@ -15,6 +15,7 @@ document.getElementById('forgot-link').href = withAuthRequest('/forgot-password.
 // Step 1: password
 document.getElementById('login-form').addEventListener('submit', async (e) => {
     e.preventDefault();
+    clearError();
     // Surrounding spaces are an autocomplete artefact, never part of a name.
     // Case is left alone here: the server folds it (see handle_login).
     const username = document.getElementById('username').value.trim();
@@ -40,6 +41,7 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
 // Step 2: TOTP code
 document.getElementById('2fa-form').addEventListener('submit', async (e) => {
     e.preventDefault();
+    clearError();
     // Some authenticators show "123 456"; no code contains whitespace.
     const code = document.getElementById('totp-code').value.replace(/\s+/g, '');
     if (!code) return;

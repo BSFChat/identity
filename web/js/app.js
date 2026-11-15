@@ -1,18 +1,50 @@
 // BSFChat ID - Shared JavaScript
 
+// What to say when the answer is not this service's JSON: a reverse proxy's
+// own error page (nginx's 502 while the service restarts, 413 for a body
+// over its limit) or no answer at all. res.json() on those used to surface
+// as "Unexpected token '<'".
+function friendlyHttpError(status) {
+    if (status === 413) return 'That was too large to send.';
+    if (status === 429) return 'Too many attempts. Wait a minute and try again.';
+    if (status === 502 || status === 503 || status === 504) {
+        return 'BSFChat ID is not reachable right now. Try again in a moment.';
+    }
+    if (status >= 500) return `Something went wrong on our side (error ${status}). Try again in a moment.`;
+    return `The request could not be completed (error ${status}).`;
+}
+
 async function apiRequest(method, url, body) {
     const opts = {
         method,
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
         credentials: 'same-origin'
     };
     if (body && method !== 'GET') {
         opts.body = JSON.stringify(body);
     }
-    const res = await fetch(url, opts);
-    const data = await res.json();
+    let res;
+    try {
+        res = await fetch(url, opts);
+    } catch (networkError) {
+        throw new Error('Could not reach BSFChat ID. Check your connection and try again.');
+    }
+    let data = null;
+    const type = res.headers.get('Content-Type') || '';
+    if (type.includes('application/json')) {
+        try {
+            data = await res.json();
+        } catch (parseError) {
+            data = null;
+        }
+    }
     if (!res.ok) {
-        throw new Error(data.error || `Request failed (${res.status})`);
+        const err = new Error((data && data.error) || friendlyHttpError(res.status));
+        err.status = res.status;
+        throw err;
+    }
+    if (data === null) {
+        throw new Error('BSFChat ID sent an unexpected answer. Try again in a moment.');
     }
     return data;
 }
@@ -100,22 +132,43 @@ function apiDelete(url) {
     return apiRequest('DELETE', url);
 }
 
+// Banners. Both are live regions in the markup (role="alert" for errors,
+// role="status" for success), so a screen reader announces them. An error
+// stays until the next message replaces it — it used to vanish after five
+// seconds, often before it was read — and is scrolled into view, taking
+// focus only when focus is not in a field the user is typing in.
+let successTimer = null;
+
+function revealBanner(node) {
+    node.classList.remove('hidden');
+    node.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
 function showError(msg) {
-    const el = document.getElementById('error-msg');
-    if (el) {
-        el.textContent = msg;
-        el.classList.remove('hidden');
-        setTimeout(() => el.classList.add('hidden'), 5000);
-    }
+    const node = document.getElementById('error-msg');
+    if (!node) return;
+    const success = document.getElementById('success-msg');
+    if (success) success.classList.add('hidden');
+    node.textContent = msg;
+    revealBanner(node);
+    const active = document.activeElement;
+    const typing = active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA');
+    if (!typing) node.focus({ preventScroll: true });
+}
+
+function clearError() {
+    const node = document.getElementById('error-msg');
+    if (node) node.classList.add('hidden');
 }
 
 function showSuccess(msg) {
-    const el = document.getElementById('success-msg');
-    if (el) {
-        el.textContent = msg;
-        el.classList.remove('hidden');
-        setTimeout(() => el.classList.add('hidden'), 5000);
-    }
+    const node = document.getElementById('success-msg');
+    if (!node) return;
+    clearError();
+    node.textContent = msg;
+    revealBanner(node);
+    clearTimeout(successTimer);
+    successTimer = setTimeout(() => node.classList.add('hidden'), 8000);
 }
 
 // Escapes text for interpolation into HTML, attribute values included.

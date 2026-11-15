@@ -26,6 +26,7 @@ loadInstanceInfo().then(info => {
 
 document.getElementById('register-form').addEventListener('submit', async (e) => {
     e.preventDefault();
+    clearError();
     const username = document.getElementById('username').value.trim().toLowerCase();
     const email = document.getElementById('email').value;
     const password = document.getElementById('password').value;
