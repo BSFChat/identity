@@ -79,6 +79,21 @@ bool is_json_content_type(const std::string& content_type);
 // fetch() calls (Accept: */*) on JSON.
 bool wants_html(const std::string& accept, const std::string& sec_fetch_mode);
 
+// Should a 404 for `path` be the friendly HTML page? Only for a browser
+// navigation (wants_html) to something that is not an API or protocol
+// endpoint: /api/..., /token, /userinfo, /jwks, /register and /.well-known/...
+// keep a JSON 404 whatever the Accept header says.
+bool not_found_wants_page(const std::string& path, const std::string& accept,
+                          const std::string& sec_fetch_mode);
+
+// The HTML of a plain notice page in the service's style: a title, what
+// happened, what to do next, and optionally one button linking to
+// `action_href` (a same-origin path). Every value is escaped. Used for the
+// sign-in dead ends (OidcHandler) and the 404 page (IdentityServer).
+std::string notice_page_html(const std::string& title, const std::string& detail,
+                             const std::string& next_step, const std::string& action_href = {},
+                             const std::string& action_label = {});
+
 // Headers every response carries (security audit L7), applied by the server's
 // post-routing handler without overwriting anything a handler set itself —
 // the consent page sets its own CSP.

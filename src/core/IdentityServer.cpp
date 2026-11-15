@@ -85,6 +85,27 @@ void IdentityServer::register_routes() {
         }
     });
 
+    // Unknown paths (no route, no static file) used to answer an empty 404.
+    // A person who follows a stale link gets a page that says where they are
+    // and links home; everything API-shaped gets a JSON body. Only bodiless
+    // 404s are touched: a handler's own 404 ("Account not found") and every
+    // other error status pass through unchanged. The security headers are
+    // added after this by the post-routing handler, as for any response.
+    svr.set_error_handler([](const httplib::Request& req, httplib::Response& res) {
+        if (res.status != 404 || !res.body.empty()) return httplib::Server::HandlerResponse::Unhandled;
+        if (not_found_wants_page(req.path, req.get_header_value("Accept"),
+                                 req.get_header_value("Sec-Fetch-Mode"))) {
+            res.set_content(notice_page_html("Page not found",
+                                             "There is nothing at this address.",
+                                             "The link may be out of date or mistyped.",
+                                             "/", "Go to BSFChat ID"),
+                            "text/html");
+        } else {
+            res.set_content(R"({"error":"Not found"})", "application/json");
+        }
+        return httplib::Server::HandlerResponse::Handled;
+    });
+
     // Handle CORS preflight
     svr.Options(R"(.*)", [](const httplib::Request&, httplib::Response& res) {
         res.set_header("Access-Control-Allow-Origin", "*");

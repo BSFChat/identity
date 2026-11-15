@@ -253,4 +253,43 @@ bool wants_html(const std::string& accept, const std::string& sec_fetch_mode) {
     return lowered.find("text/html") != std::string::npos || sec_fetch_mode == "navigate";
 }
 
+std::string notice_page_html(const std::string& title, const std::string& detail,
+                             const std::string& next_step, const std::string& action_href,
+                             const std::string& action_label) {
+    std::ostringstream html;
+    html << "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
+         << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
+         << "<title>" << html_escape(title) << " - BSFChat ID</title>"
+         << "<link rel=\"stylesheet\" href=\"/css/style.css\"></head><body>"
+         << "<div class=\"container\"><div class=\"card\">"
+         << "<div class=\"logo\"><h1>BSFChat ID</h1>"
+         << "<p class=\"subtitle\">" << html_escape(title) << "</p></div>"
+         << "<p>" << html_escape(detail) << "</p>"
+         << "<p style=\"color:var(--text-muted);font-size:14px;\">"
+         << html_escape(next_step) << "</p>";
+    if (!action_href.empty()) {
+        html << "<div class=\"btn-stack\"><a class=\"btn btn-primary\" href=\""
+             << html_escape(action_href) << "\">" << html_escape(action_label) << "</a></div>";
+    }
+    html << "</div></div></body></html>";
+    return html.str();
+}
+
+bool not_found_wants_page(const std::string& path, const std::string& accept,
+                          const std::string& sec_fetch_mode) {
+    static const char* const kApiPrefixes[] = {"/api/", "/.well-known/", "/token", "/userinfo",
+                                               "/jwks", "/register", "/authorize/"};
+    for (const char* prefix : kApiPrefixes) {
+        const std::string p(prefix);
+        // A prefix ending in '/' covers its subtree; otherwise the path must be
+        // the endpoint itself or something under it ("/token/revoke"), not a
+        // page that merely starts the same way ("/register.html").
+        if (path.rfind(p, 0) == 0 &&
+            (p.back() == '/' || path.size() == p.size() || path[p.size()] == '/')) {
+            return false;
+        }
+    }
+    return wants_html(accept, sec_fetch_mode);
+}
+
 } // namespace bsfchat::id

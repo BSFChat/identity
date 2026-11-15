@@ -469,3 +469,28 @@ TEST_F(BrowserFacingOidcTest, ResubmittedDenyIsNotCalledAnApproval) {
     EXPECT_EQ(again.body.find("approved"), std::string::npos);
     EXPECT_NE(again.body.find("already answered"), std::string::npos);
 }
+
+// ---------------------------------------------------------------------------
+// 404s (landing page work)
+// ---------------------------------------------------------------------------
+
+TEST(NotFoundTest, BrowsersGetAPageApiPathsKeepJson) {
+    const std::string browser = kBrowserAccept;
+    EXPECT_TRUE(not_found_wants_page("/no-such-page", browser, "navigate"));
+    EXPECT_TRUE(not_found_wants_page("/register.html.bak", browser, "navigate"));
+    EXPECT_TRUE(not_found_wants_page("/tokens-faq", browser, "navigate"));
+    EXPECT_FALSE(not_found_wants_page("/no-such-page", "*/*", ""));
+    EXPECT_FALSE(not_found_wants_page("/api/nope", browser, "navigate"));
+    EXPECT_FALSE(not_found_wants_page("/.well-known/nope", browser, "navigate"));
+    EXPECT_FALSE(not_found_wants_page("/token", browser, "navigate"));
+    EXPECT_FALSE(not_found_wants_page("/token/nope", browser, "navigate"));
+    EXPECT_FALSE(not_found_wants_page("/register", browser, "navigate"));
+}
+
+TEST(NotFoundTest, NoticePageEscapesEverything) {
+    auto html = notice_page_html("<t>", "\"d\"", "n&s", "/x?a=1&b=\"2\"", "<go>");
+    EXPECT_EQ(html.find("<t>"), std::string::npos);
+    EXPECT_EQ(html.find("<go>"), std::string::npos);
+    EXPECT_NE(html.find("href=\"/x?a=1&amp;b=&quot;2&quot;\""), std::string::npos);
+    EXPECT_EQ(notice_page_html("t", "d", "n").find("btn-stack"), std::string::npos);
+}
