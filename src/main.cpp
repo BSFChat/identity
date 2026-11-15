@@ -1,3 +1,4 @@
+#include "core/AccountDeletion.h"
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "core/IdentityServer.h"
@@ -27,16 +28,21 @@ namespace {
 constexpr const char* kUsage =
     "usage: bsfchat-id [--config <file>]\n"
     "       bsfchat-id [--config <file>] --reset-password <username>\n"
+    "       bsfchat-id [--config <file>] --delete-account <username>\n"
     "\n"
     "  --config <file>              TOML configuration (default: built-in defaults)\n"
     "  --reset-password <username>  set a new password for <username>, read from stdin\n"
     "                               (not echoed on a terminal), sign the account out\n"
     "                               everywhere, and exit. The service may keep running.\n"
+    "  --delete-account <username>  delete <username>'s personal data, 2FA, sign-ins and\n"
+    "                               server list, keep the name reserved, and exit.\n"
+    "                               Irreversible; asks for the username again on a terminal.\n"
     "  --help                       show this help\n";
 
 struct Options {
     std::optional<std::string> config_path;
     std::optional<std::string> reset_username;
+    std::optional<std::string> delete_username;
     bool help = false;
 };
 
@@ -60,12 +66,20 @@ std::optional<Options> parse_args(int argc, char* argv[]) {
             auto v = value("--reset-password");
             if (!v) return std::nullopt;
             opts.reset_username = *v;
+        } else if (arg == "--delete-account") {
+            auto v = value("--delete-account");
+            if (!v) return std::nullopt;
+            opts.delete_username = *v;
         } else if (arg == "--help" || arg == "-h") {
             opts.help = true;
         } else {
             std::cerr << "bsfchat-id: unknown argument '" << arg << "'\n" << kUsage;
             return std::nullopt;
         }
+    }
+    if (opts.reset_username && opts.delete_username) {
+        std::cerr << "bsfchat-id: --reset-password and --delete-account cannot be combined\n";
+        return std::nullopt;
     }
     return opts;
 }
@@ -108,9 +122,9 @@ std::optional<std::string> read_secret_line(const char* prompt) {
     return line;
 }
 
-int run_reset_password(const bsfchat::id::Config& config, const std::string& username) {
-    using bsfchat::id::PasswordResetResult;
-
+// Opens the service's existing database for an operator command, or prints
+// why not and returns null.
+std::unique_ptr<bsfchat::id::IdentityStore> open_existing_store(const bsfchat::id::Config& config) {
     // Refuse rather than create: sqlite would happily make a new, empty
     // database at a mistyped path and report "no such account", which reads
     // like the account is gone.
@@ -118,7 +132,7 @@ int run_reset_password(const bsfchat::id::Config& config, const std::string& use
     if (!std::filesystem::is_regular_file(config.database_path, ec)) {
         std::cerr << "bsfchat-id: cannot open the database: '" << config.database_path
                   << "' does not exist or is not a file. Pass the service's --config.\n";
-        return 1;
+        return nullptr;
     }
 
     std::unique_ptr<bsfchat::id::IdentityStore> store;
@@ -129,8 +143,57 @@ int run_reset_password(const bsfchat::id::Config& config, const std::string& use
     } catch (const std::exception& e) {
         std::cerr << "bsfchat-id: cannot open the database '" << config.database_path
                   << "': " << e.what() << "\n";
+        return nullptr;
+    }
+    return store;
+}
+
+int run_delete_account(const bsfchat::id::Config& config, const std::string& username) {
+    using bsfchat::id::AccountDeletionResult;
+
+    auto store = open_existing_store(config);
+    if (!store) return 1;
+
+    auto account = store->get_account_by_username(username);
+    if (!account) {
+        std::cerr << "bsfchat-id: no account is named '" << username << "'\n";
         return 1;
     }
+    // On a terminal, the same "type the name" confirmation the web page asks
+    // for. Piped (a script), the command line is taken as the decision.
+    if (isatty(STDIN_FILENO)) {
+        std::cerr << "This permanently deletes '" << account->username << "' (" << account->id
+                  << "). Chat servers keep their own accounts and messages.\n"
+                  << "Type the username again to confirm: " << std::flush;
+        std::string typed;
+        if (!std::getline(std::cin, typed) || typed != account->username) {
+            std::cerr << "bsfchat-id: not confirmed; nothing was changed\n";
+            return 1;
+        }
+    }
+
+    AccountDeletionResult result;
+    try {
+        result = bsfchat::id::delete_account_by_username(*store, username);
+    } catch (const std::exception& e) {
+        std::cerr << "bsfchat-id: account deletion failed: " << e.what() << "\n";
+        return 1;
+    }
+    if (result.status != AccountDeletionResult::Status::Deleted) {
+        std::cerr << "bsfchat-id: " << result.message << "; nothing was changed\n";
+        return 1;
+    }
+    std::cout << result.message << ".\n"
+              << "Chat servers the user joined still hold their own account and messages; "
+                 "deactivate it on each server separately if asked to.\n";
+    return 0;
+}
+
+int run_reset_password(const bsfchat::id::Config& config, const std::string& username) {
+    using bsfchat::id::PasswordResetResult;
+
+    auto store = open_existing_store(config);
+    if (!store) return 1;
 
     // Look the account up before asking for a password, so a typo in the
     // username is reported before anyone types a secret.
@@ -181,7 +244,7 @@ int main(int argc, char* argv[]) {
         std::cout << kUsage;
         return 0;
     }
-    const bool reset_mode = opts->reset_username.has_value();
+    const bool reset_mode = opts->reset_username.has_value() || opts->delete_username.has_value();
 
     // The operator command keeps stdout for its own answer; only warnings
     // and errors from loading the config are logged.
@@ -207,6 +270,7 @@ int main(int argc, char* argv[]) {
         log->info("Using default configuration");
     }
 
+    if (opts->delete_username) return run_delete_account(config, *opts->delete_username);
     if (reset_mode) return run_reset_password(config, *opts->reset_username);
 
     std::signal(SIGINT, signal_handler);

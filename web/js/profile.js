@@ -65,6 +65,39 @@ document.getElementById('profile-form').addEventListener('submit', async (e) => 
     }
 });
 
+// ---- Profile tab: delete account (audit I-12) ----
+async function prepareDeleteForm() {
+    // The second-factor field only when 2FA is on; the server checks anyway.
+    try {
+        const data = await apiGet('/api/user/2fa/status');
+        document.getElementById('delete-code-group').classList.toggle('hidden', !data.enabled);
+    } catch (err) { /* leave it hidden; the server says if a code is needed */ }
+}
+
+document.getElementById('delete-account-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const typed = document.getElementById('delete-confirm-username').value;
+    if (typed !== document.getElementById('username').value) {
+        showError('Type your username exactly to confirm');
+        document.getElementById('delete-confirm-username').focus();
+        return;
+    }
+    if (!confirm('Delete your BSFChat ID permanently? This cannot be undone.')) return;
+    try {
+        const data = await apiPost('/api/account/delete', {
+            confirm_username: typed,
+            password: document.getElementById('delete-password').value,
+            code: document.getElementById('delete-code').value.trim()
+        });
+        window.location.href = data.redirect || '/account-deleted.html';
+    } catch (err) {
+        showError(err.message);
+        if (/two-factor/i.test(err.message)) {
+            document.getElementById('delete-code-group').classList.remove('hidden');
+        }
+    }
+});
+
 // ---- Security tab: password ----
 document.getElementById('password-form').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -337,3 +370,4 @@ document.getElementById('logout-btn').addEventListener('click', async (e) => {
 
 // ---- Init ----
 loadProfile();
+prepareDeleteForm();

@@ -12,6 +12,7 @@
 #include "api/AccountHandler.h"
 #include "api/AdminHandler.h"
 #include "api/OidcHandler.h"
+#include "core/AccountDeletion.h"
 #include "core/ClientAddress.h"
 #include "core/Config.h"
 #include "core/Username.h"
@@ -1127,4 +1128,154 @@ TEST(TransientTokensAtRest, RawRowsFromAnOlderBuildAreHashedOnceAndKeepWorking) 
     EXPECT_FALSE(db_file_contains(path, "raw-login"));
     EXPECT_FALSE(db_file_contains(path, "raw-code"));
     remove_db(db_path);
+}
+
+// ---------------------------------------------------------------------------
+// Audit 2026-11-15 I-12 — self-service account deletion
+// ---------------------------------------------------------------------------
+
+namespace {
+
+class AccountDeletionTest : public SecurityFixTest {
+protected:
+    httplib::Response delete_account(const std::string& session, const json& body) {
+        httplib::Response res;
+        accounts->handle_delete_account(cookie_json(session, body), res);
+        return res;
+    }
+    json request_for_alice(const json& extra = json::object()) {
+        json body = {{"confirm_username", "alice"}, {"password", kPassword}};
+        for (auto it = extra.begin(); it != extra.end(); ++it) body[it.key()] = it.value();
+        return body;
+    }
+};
+
+} // namespace
+
+TEST_F(AccountDeletionTest, AWrongPasswordIsRefusedAndNothingChanges) {
+    auto res = delete_account(browser_session,
+                              json{{"confirm_username", "alice"}, {"password", "not the password"}});
+    EXPECT_EQ(status_of(res), 403) << res.body;
+    auto account = store->get_account_by_id("acct-1");
+    ASSERT_TRUE(account);
+    EXPECT_FALSE(account->deleted());
+    EXPECT_FALSE(account->disabled());
+    httplib::Response pres;
+    accounts->handle_get_profile(cookie_request(browser_session), pres);
+    EXPECT_EQ(status_of(pres), 200);
+}
+
+TEST_F(AccountDeletionTest, TheUsernameMustBeTypedExactly) {
+    auto res = delete_account(browser_session,
+                              json{{"confirm_username", "Alice"}, {"password", kPassword}});
+    EXPECT_EQ(status_of(res), 400);
+    EXPECT_FALSE(store->get_account_by_id("acct-1")->deleted());
+}
+
+TEST_F(AccountDeletionTest, WithTwoFactorOnTheCodeIsRequiredToo) {
+    store->set_totp_secret("acct-1", bsfchat::generate_totp_secret(), {"backup-code-1"});
+    store->enable_totp("acct-1");
+
+    EXPECT_EQ(status_of(delete_account(browser_session, request_for_alice())), 400)
+        << "deleted a 2FA account with the password alone";
+    EXPECT_EQ(status_of(delete_account(browser_session, request_for_alice({{"code", "000000"}}))), 403);
+    EXPECT_FALSE(store->get_account_by_id("acct-1")->deleted());
+
+    auto res = delete_account(browser_session, request_for_alice({{"code", "backup-code-1"}}));
+    ASSERT_EQ(status_of(res), 200) << res.body;
+    EXPECT_TRUE(store->get_account_by_id("acct-1")->deleted());
+    EXPECT_FALSE(store->get_totp("acct-1")) << "the 2FA secret survived deletion";
+}
+
+TEST_F(AccountDeletionTest, DeletionRevokesEverythingAndLeavesATombstone) {
+    auto tokens = desktop_login(browser_session);
+    auto other = new_browser_session("acct-1");
+    store->add_server_membership("acct-1", "https://chat.example", "Chat");
+
+    auto res = delete_account(browser_session, request_for_alice());
+    ASSERT_EQ(status_of(res), 200) << res.body;
+    EXPECT_EQ(json::parse(res.body).value("redirect", ""), "/account-deleted.html");
+    EXPECT_NE(header_of(res, "Set-Cookie").find("Max-Age=0"), std::string::npos)
+        << "the session cookie was not cleared: " << header_of(res, "Set-Cookie");
+
+    // Every credential is gone.
+    for (const auto& s : {browser_session, other}) {
+        httplib::Response pres;
+        accounts->handle_get_profile(cookie_request(s), pres);
+        EXPECT_EQ(status_of(pres), 401);
+    }
+    EXPECT_EQ(status_of(refresh(tokens["refresh_token"].get<std::string>())), 400);
+    httplib::Request ureq;
+    ureq.set_header("Authorization", "Bearer " + tokens["access_token"].get<std::string>());
+    httplib::Response ures;
+    oidc->handle_userinfo(ureq, ures);
+    EXPECT_EQ(status_of(ures), 401);
+    httplib::Response lres;
+    accounts->handle_login(json_request(json{{"username", "alice"}, {"password", kPassword}}), lres);
+    EXPECT_EQ(status_of(lres), 401);
+
+    // Personal data is gone; the tombstone keeps the name.
+    auto account = store->get_account_by_id("acct-1");
+    ASSERT_TRUE(account);
+    EXPECT_EQ(account->username, "alice");
+    EXPECT_TRUE(account->deleted());
+    EXPECT_TRUE(account->disabled());
+    EXPECT_TRUE(account->email.empty());
+    EXPECT_TRUE(account->password_hash.empty());
+    EXPECT_TRUE(account->display_name.empty());
+    EXPECT_TRUE(store->list_server_memberships("acct-1").empty());
+    EXPECT_TRUE(store->list_refresh_tokens_for_account("acct-1").empty());
+    EXPECT_FALSE(store->enable_account("acct-1")) << "a deleted account was re-enabled";
+
+    // Nobody can take the name, or a lookalike of it, to pass as the former
+    // owner; the email address is free again.
+    httplib::Response rres;
+    accounts->handle_register(json_request(json{{"username", "alice"}, {"password", kPassword}},
+                                           "10.0.0.7"),
+                              rres);
+    EXPECT_EQ(status_of(rres), 409) << rres.body;
+    httplib::Response lookalike;
+    accounts->handle_register(json_request(json{{"username", "a1ice"}, {"password", kPassword}},
+                                           "10.0.0.8"),
+                              lookalike);
+    EXPECT_EQ(status_of(lookalike), 409) << lookalike.body;
+    httplib::Response reuse;
+    accounts->handle_register(json_request(json{{"username", "bob"},
+                                                {"password", kPassword},
+                                                {"email", "alice@example.com"}},
+                                           "10.0.0.9"),
+                              reuse);
+    EXPECT_EQ(status_of(reuse), 201) << reuse.body;
+}
+
+TEST_F(AccountDeletionTest, AnAppAccessTokenCannotDeleteTheAccount) {
+    auto tokens = desktop_login(browser_session);
+    auto req = json_request(request_for_alice());
+    req.set_header("Authorization", "Bearer " + tokens["access_token"].get<std::string>());
+    httplib::Response res;
+    accounts->handle_delete_account(req, res);
+    EXPECT_EQ(status_of(res), 401);
+    EXPECT_FALSE(store->get_account_by_id("acct-1")->deleted());
+}
+
+TEST_F(AccountDeletionTest, ACrossSiteRequestIsRefused) {
+    auto req = cookie_json(browser_session, request_for_alice());
+    req.set_header("Sec-Fetch-Site", "cross-site");
+    httplib::Response res;
+    accounts->handle_delete_account(req, res);
+    EXPECT_EQ(status_of(res), 403);
+    EXPECT_FALSE(store->get_account_by_id("acct-1")->deleted());
+}
+
+TEST_F(AccountDeletionTest, TheOperatorCommandDeletesByUsername) {
+    auto result = delete_account_by_username(*store, "alice");
+    EXPECT_EQ(result.status, AccountDeletionResult::Status::Deleted) << result.message;
+    EXPECT_TRUE(store->get_account_by_id("acct-1")->deleted());
+    EXPECT_EQ(delete_account_by_username(*store, "alice").status,
+              AccountDeletionResult::Status::AlreadyDeleted);
+    EXPECT_EQ(delete_account_by_username(*store, "nobody").status,
+              AccountDeletionResult::Status::NoSuchAccount);
+    httplib::Response pres;
+    accounts->handle_get_profile(cookie_request(browser_session), pres);
+    EXPECT_EQ(status_of(pres), 401);
 }

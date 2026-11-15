@@ -18,12 +18,18 @@ async function loadUsers() {
             tr.appendChild(cell(user.is_admin ? 'Yes' : 'No'));
             tr.appendChild(cell(new Date(user.created_at * 1000).toLocaleDateString()));
             const actions = document.createElement('td');
-            const btn = el('button', 'btn btn-small ' + (user.disabled ? 'btn-secondary' : 'btn-danger'),
-                           user.disabled ? 'Enable' : 'Disable');
-            btn.type = 'button';
-            btn.addEventListener('click', () => setUserEnabled(user.id, user.disabled));
-            if (user.disabled) actions.appendChild(el('span', 'status-badge disabled', 'Disabled'));
-            actions.appendChild(btn);
+            if (user.deleted) {
+                // A tombstone: the name is reserved, nothing else is left,
+                // and it cannot be re-enabled.
+                actions.appendChild(el('span', 'status-badge disabled', 'Deleted'));
+            } else {
+                const btn = el('button', 'btn btn-small ' + (user.disabled ? 'btn-secondary' : 'btn-danger'),
+                               user.disabled ? 'Enable' : 'Disable');
+                btn.type = 'button';
+                btn.addEventListener('click', () => setUserEnabled(user.id, user.disabled));
+                if (user.disabled) actions.appendChild(el('span', 'status-badge disabled', 'Disabled'));
+                actions.appendChild(btn);
+            }
             tr.appendChild(actions);
             tbody.appendChild(tr);
         }

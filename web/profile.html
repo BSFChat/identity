@@ -52,6 +52,42 @@
                     </div>
                     <button type="submit" class="btn btn-primary">Save Changes</button>
                 </form>
+
+                <hr>
+
+                <!-- Delete account (audit I-12) -->
+                <div class="section">
+                    <div class="section-title">Delete Account</div>
+                    <div class="section-desc">
+                        Permanently deletes your BSFChat ID: your email address, password,
+                        two-factor settings, server list, and every session and app sign-in.
+                        Your username stays reserved so nobody else can take it. This cannot
+                        be undone.
+                    </div>
+                    <div class="section-desc">
+                        <strong>Chat servers keep their own accounts and messages.</strong>
+                        Deleting your BSFChat ID does not remove what you posted on any chat
+                        server; deactivate your account on each server first if you want that
+                        gone. See the <a href="https://bsfchat.com/privacy/" rel="noopener">privacy policy</a>.
+                    </div>
+                    <form id="delete-account-form">
+                        <div class="form-group">
+                            <label for="delete-confirm-username">Type your username to confirm</label>
+                            <input type="text" id="delete-confirm-username" autocomplete="off"
+                                   autocapitalize="none" autocorrect="off" spellcheck="false">
+                        </div>
+                        <div class="form-group">
+                            <label for="delete-password">Current Password</label>
+                            <input type="password" id="delete-password" autocomplete="current-password">
+                        </div>
+                        <div class="form-group hidden" id="delete-code-group">
+                            <label for="delete-code">Two-factor code (or a backup code)</label>
+                            <input type="text" id="delete-code" autocomplete="one-time-code"
+                                   autocapitalize="none" autocorrect="off" spellcheck="false">
+                        </div>
+                        <button type="submit" class="btn btn-danger">Delete my account</button>
+                    </form>
+                </div>
             </div>
 
             <!-- ====== Security Tab ====== -->

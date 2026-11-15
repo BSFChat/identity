@@ -152,6 +152,8 @@ void IdentityServer::register_routes() {
             [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_get_profile(req, res); });
     svr.Put("/api/profile",
             [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_update_profile(req, res); });
+    svr.Post("/api/account/delete",
+             [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_delete_account(req, res); });
 
     // Session management
     svr.Get("/api/user/sessions",

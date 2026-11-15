@@ -587,7 +587,7 @@ namespace {
 
 constexpr const char* kAccountColumns =
     "SELECT id, username, email, password_hash, display_name, avatar_url, is_admin, created_at, "
-    "updated_at, disabled_at FROM accounts ";
+    "updated_at, disabled_at, deleted_at FROM accounts ";
 
 Account read_account_row(sqlite3_stmt* stmt) {
     Account a;
@@ -601,6 +601,7 @@ Account read_account_row(sqlite3_stmt* stmt) {
     a.created_at = sqlite3_column_int64(stmt, 7);
     a.updated_at = sqlite3_column_int64(stmt, 8);
     a.disabled_at = sqlite3_column_int64(stmt, 9);
+    a.deleted_at = sqlite3_column_int64(stmt, 10);
     return a;
 }
 
@@ -755,9 +756,35 @@ bool IdentityStore::disable_account(const std::string& id) {
     return true;
 }
 
+bool IdentityStore::delete_account(const std::string& id) {
+    std::lock_guard lock(mutex_);
+    Transaction txn(db_);
+    // The username and its skeleton stay, which is the point of a tombstone:
+    // a freed name could be registered by someone else and, on every chat
+    // server that still shows the old owner's messages under it, read as
+    // them. The email is released (NULL), so it may be used again.
+    auto stmt = prepare(db_,
+        "UPDATE accounts SET email = NULL, password_hash = '', display_name = '', avatar_url = '', "
+        "is_admin = 0, disabled_at = CASE WHEN disabled_at = 0 THEN ?1 ELSE disabled_at END, "
+        "deleted_at = ?1, updated_at = ?1 WHERE id = ?2 AND deleted_at = 0");
+    sqlite3_bind_int64(stmt.get(), 1, now_seconds());
+    bind_text(stmt.get(), 2, id);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE || sqlite3_changes(db_) == 0) return false;
+    revoke_credentials_locked(id, "");
+    for (const char* table : {"user_totp", "sso_links", "server_memberships", "consent_requests"}) {
+        auto del = prepare(db_, std::string("DELETE FROM ") + table + " WHERE account_id = ?");
+        bind_text(del.get(), 1, id);
+        sqlite3_step(del.get());
+    }
+    txn.commit();
+    return true;
+}
+
 bool IdentityStore::enable_account(const std::string& id) {
     std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_, "UPDATE accounts SET disabled_at = 0, updated_at = ? WHERE id = ?");
+    // Never a deleted account: it has no password left and must stay gone.
+    auto stmt = prepare(db_,
+        "UPDATE accounts SET disabled_at = 0, updated_at = ? WHERE id = ? AND deleted_at = 0");
     sqlite3_bind_int64(stmt.get(), 1, now_seconds());
     bind_text(stmt.get(), 2, id);
     return sqlite3_step(stmt.get()) == SQLITE_DONE && sqlite3_changes(db_) > 0;

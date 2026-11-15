@@ -38,6 +38,11 @@ public:
     void handle_instance_info(const httplib::Request& req, httplib::Response& res);
     void handle_get_profile(const httplib::Request& req, httplib::Response& res);
     void handle_update_profile(const httplib::Request& req, httplib::Response& res);
+    // POST /api/account/delete (audit I-12). Browser session only, JSON,
+    // same-origin. Body: {"password", "confirm_username", "code"} — `code`
+    // (TOTP or a backup code) only when 2FA is on. Deletes the account as
+    // IdentityStore::delete_account() describes and clears the cookie.
+    void handle_delete_account(const httplib::Request& req, httplib::Response& res);
 
     // Session management
     void handle_list_sessions(const httplib::Request& req, httplib::Response& res);

@@ -73,7 +73,8 @@ void AdminHandler::handle_list_users(const httplib::Request& req, httplib::Respo
             {"is_admin", a.is_admin},
             {"created_at", a.created_at},
             {"disabled", a.disabled()},
-            {"disabled_at", a.disabled_at}
+            {"disabled_at", a.disabled_at},
+            {"deleted", a.deleted()}
         });
     }
 
@@ -116,6 +117,10 @@ void AdminHandler::handle_enable_user(const httplib::Request& req, httplib::Resp
     auto user_id = user_id_from_path(req.path, "enable");
     if (user_id.empty()) {
         json_error(res, 400, "Invalid path");
+        return;
+    }
+    if (auto account = store_.get_account_by_id(user_id); account && account->deleted()) {
+        json_error(res, 409, "This account was deleted and cannot be re-enabled");
         return;
     }
     // Only the flag is cleared: the user signs in again with the password

@@ -30,8 +30,14 @@ struct Account {
     // Disabling used to blank password_hash and nothing else; the flag is
     // what every credential lookup now checks, and it is reversible.
     int64_t disabled_at = 0;
+    // Non-zero once the account was deleted (audit I-12). The row stays as a
+    // tombstone holding only id, username and its skeleton, created_at and
+    // these timestamps, so nobody can register the name and pass as the
+    // former owner. A deleted account is also disabled, permanently.
+    int64_t deleted_at = 0;
 
     bool disabled() const { return disabled_at != 0; }
+    bool deleted() const { return deleted_at != 0; }
 };
 
 struct OAuthClient {
@@ -217,6 +223,14 @@ public:
     // pending auth codes, consent requests and 2FA login tokens. False when
     // the account does not exist.
     bool disable_account(const std::string& id);
+    // Audit I-12, in one transaction: blanks the account's personal data
+    // (email, password hash, display name, avatar, admin flag), marks it
+    // deleted and disabled, ends every credential (sessions, access and
+    // refresh tokens, auth codes, login tokens, consent prompts), and deletes
+    // its 2FA secret and backup codes, SSO links and server list. Irreversible;
+    // enable_account() refuses a deleted account. False when there is no such
+    // account or it was already deleted.
+    bool delete_account(const std::string& id);
     bool enable_account(const std::string& id);
     // Account id whose username_skeleton equals `skeleton`, if any.
     std::optional<std::string> find_account_by_username_skeleton(const std::string& skeleton);

@@ -853,6 +853,82 @@ void AccountHandler::handle_update_profile(const httplib::Request& req, httplib:
 
 // Session management
 
+void AccountHandler::handle_delete_account(const httplib::Request& req, httplib::Response& res) {
+    auto log = get_logger();
+    // A browser session only: an app's access token must not be able to
+    // delete the account it was minted from.
+    auto account_id = get_session_account(req);
+    if (account_id.empty()) {
+        json_error(res, 401, "Not authenticated");
+        return;
+    }
+    if (!reject_unsafe_request(req, res)) return;
+
+    auto body = parse_object(req, res);
+    if (!body) return;
+
+    auto account = store_.get_account_by_id(account_id);
+    if (!account || account->deleted()) {
+        json_error(res, 404, "Account not found");
+        return;
+    }
+
+    // Typed by hand, so a stray click (or a confused autofill) is not enough.
+    if (string_field(*body, "confirm_username") != account->username) {
+        json_error(res, 400, "Type your username exactly to confirm");
+        return;
+    }
+
+    auto password = string_field(*body, "password");
+    if (password.empty()) {
+        json_error(res, 400, "Password is required");
+        return;
+    }
+    if (!recheck_password(req, res, *account, password, "Password is incorrect")) return;
+
+    // With 2FA on, the second factor as well: a password alone does not
+    // sign this account in, so it must not delete it either. Counted against
+    // the same per-account lockout as the login prompt.
+    if (auto totp = store_.get_totp(account_id); totp && totp->enabled) {
+        const auto key = "2fa-user:" + account_id;
+        if (totp_failures_.is_locked(key)) {
+            res.set_header("Retry-After", std::to_string(totp_failures_.retry_after(key)));
+            json_error(res, 429, "Too many incorrect codes, try again later");
+            return;
+        }
+        auto code = string_field(*body, "code");
+        if (code.empty()) {
+            json_error(res, 400, "Your two-factor code is required");
+            return;
+        }
+        bool code_valid = false;
+        if (auto step = bsfchat::verify_totp_step(totp->secret, code)) {
+            code_valid = store_.accept_totp_step(account_id, *step);
+        } else {
+            code_valid = store_.consume_backup_code(account_id, code);
+        }
+        if (!code_valid) {
+            totp_failures_.record_failure(key);
+            json_error(res, 403, "Invalid two-factor code");
+            return;
+        }
+        totp_failures_.clear(key);
+    }
+
+    if (!store_.delete_account(account_id)) {
+        json_error(res, 500, "The account could not be deleted");
+        return;
+    }
+    // The audit record. The username is kept in the tombstone anyway, so
+    // logging it reveals nothing that is not still stored.
+    log->warn("AUDIT account deleted by its owner: account {} ({}) from {}", account_id,
+              account->username, redact_ip_for_log(client_key(req)));
+
+    res.set_header("Set-Cookie", session_cookie("", 0));
+    res.set_content(json{{"success", true}, {"redirect", "/account-deleted.html"}}.dump(),
+                    "application/json");
+}
+
 void AccountHandler::handle_list_sessions(const httplib::Request& req, httplib::Response& res) {
     auto account_id = get_session_account(req);
     if (account_id.empty()) {
