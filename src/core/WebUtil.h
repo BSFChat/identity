@@ -71,6 +71,14 @@ std::string uri_origin(const ParsedUri& uri);
 // such as charset are ignored, case is not significant).
 bool is_json_content_type(const std::string& content_type);
 
+// Content negotiation for endpoints a person reaches in a browser (/authorize,
+// the consent POST, unknown paths). True when the request is a browser
+// navigation that wants a page: its Accept names text/html, or the browser
+// says it is a navigation (Sec-Fetch-Mode: navigate) — and in neither case
+// asks for application/json, which keeps every API client and the pages' own
+// fetch() calls (Accept: */*) on JSON.
+bool wants_html(const std::string& accept, const std::string& sec_fetch_mode);
+
 // Headers every response carries (security audit L7), applied by the server's
 // post-routing handler without overwriting anything a handler set itself —
 // the consent page sets its own CSP.

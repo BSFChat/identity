@@ -245,4 +245,12 @@ bool scope_contains(const std::string& scope_list, const std::string& scope) {
     return false;
 }
 
+bool wants_html(const std::string& accept, const std::string& sec_fetch_mode) {
+    std::string lowered = accept;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (lowered.find("application/json") != std::string::npos) return false;
+    return lowered.find("text/html") != std::string::npos || sec_fetch_mode == "navigate";
+}
+
 } // namespace bsfchat::id

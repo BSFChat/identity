@@ -230,6 +230,21 @@ a.btn {
     color: var(--text-secondary);
 }
 
+/* A form button that reads as a link ("Use a different account"). */
+.link-button {
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    color: var(--accent);
+    cursor: pointer;
+    text-decoration: underline;
+}
+
+.link-button:hover {
+    color: var(--accent-hover);
+}
+
 .lead {
     color: var(--text-secondary);
     margin-bottom: 12px;
