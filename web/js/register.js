@@ -3,6 +3,18 @@
 // Back to sign-in without losing the authorization request (see app.js).
 document.getElementById('login-link').href = withAuthRequest('/login.html');
 
+// Usernames are lowercase by grammar (the server refuses uppercase rather
+// than folding it), so fold as the user types instead of failing the submit.
+const usernameInput = document.getElementById('username');
+usernameInput.addEventListener('input', () => {
+    const lower = usernameInput.value.toLowerCase();
+    if (lower !== usernameInput.value) {
+        const caret = usernameInput.selectionStart;
+        usernameInput.value = lower;
+        usernameInput.setSelectionRange(caret, caret);
+    }
+});
+
 // Say so up front on a deployment with sign-up closed, instead of letting
 // someone fill the form in only to be refused.
 loadInstanceInfo().then(info => {
@@ -14,7 +26,7 @@ loadInstanceInfo().then(info => {
 
 document.getElementById('register-form').addEventListener('submit', async (e) => {
     e.preventDefault();
-    const username = document.getElementById('username').value;
+    const username = document.getElementById('username').value.trim().toLowerCase();
     const email = document.getElementById('email').value;
     const password = document.getElementById('password').value;
     const confirmPassword = document.getElementById('confirm-password').value;

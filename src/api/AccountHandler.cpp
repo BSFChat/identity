@@ -519,8 +519,28 @@ void AccountHandler::handle_login(const httplib::Request& req, httplib::Response
         return;
     }
 
-    // Failure keys use the username as SUBMITTED, never whether it exists,
-    // so the lockout is not an existence oracle. They are never logged.
+    // Usernames are lowercase by grammar (core/Username.cpp), but phones
+    // capitalise the first letter of a text field, and "Alice" used to be a
+    // wrong password that counted toward the lockout (audit I-4). The exact
+    // name is still tried first, for any account created before the grammar
+    // refused uppercase; failing that, the ASCII-lowercased name. The folded
+    // name is what the failure keys below use, so "ALICE" and "alice" share
+    // one lockout instead of doubling the attempts a guesser gets.
+    auto account = store_.get_account_by_username(username);
+    if (!account) {
+        std::string folded = username;
+        std::transform(folded.begin(), folded.end(), folded.begin(), [](unsigned char c) {
+            return static_cast<char>(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
+        });
+        if (folded != username) {
+            username = std::move(folded);
+            account = store_.get_account_by_username(username);
+        }
+    }
+
+    // Failure keys use the username as submitted (after the fold above),
+    // never whether it exists, so the lockout is not an existence oracle.
+    // They are never logged.
     //
     // There is no per-address lockout any more (security audit H2): behind a
     // proxy that is not in trusted_proxies every user shares one address, and
@@ -528,8 +548,6 @@ void AccountHandler::handle_login(const httplib::Request& req, httplib::Response
     // VOLUME is still bounded by login_limiter_ above.
     const auto pair_key = ip_key.empty() ? std::string{} : "login:" + ip_key + "|" + username;
     const auto name_key = "login-user:" + username;
-
-    auto account = store_.get_account_by_username(username);
 
     // A second factor under attack locks its account for everybody, the
     // owner included (security audit M2). Only somebody holding the password

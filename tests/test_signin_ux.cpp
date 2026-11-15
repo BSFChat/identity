@@ -163,3 +163,66 @@ TEST(PasswordResetTest, PolicyIsSharedWithRegistration) {
     EXPECT_FALSE(password_policy_error(std::string(kMaxPasswordLength, 'x')));
     EXPECT_TRUE(password_policy_error(std::string(kMaxPasswordLength + 1, 'x')));
 }
+
+// ---------------------------------------------------------------------------
+// Login folds the case of a username (audit I-4)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+httplib::Request login_request(const std::string& username, const std::string& password) {
+    httplib::Request req;
+    req.method = "POST";
+    req.set_header("Content-Type", "application/json");
+    req.body = json{{"username", username}, {"password", password}}.dump();
+    req.remote_addr = "10.0.0.1";
+    return req;
+}
+
+} // namespace
+
+class UsernameCaseTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        config.password_hash_iterations = kMinPbkdf2Iterations;
+        config.login_rate_limit = 1000;
+        config.login_max_failures = 3;
+        store = std::make_unique<IdentityStore>(":memory:");
+        store->initialize();
+        accounts = std::make_unique<AccountHandler>(*store, config);
+        ASSERT_TRUE(store->create_account(make_account("acct-a", "alice", "correct horse battery")));
+    }
+
+    int login(const std::string& username, const std::string& password) {
+        auto req = login_request(username, password);
+        httplib::Response res;
+        accounts->handle_login(req, res);
+        return status_of(res);
+    }
+
+    Config config;
+    std::unique_ptr<IdentityStore> store;
+    std::unique_ptr<AccountHandler> accounts;
+};
+
+TEST_F(UsernameCaseTest, CapitalisedUsernameSignsInToTheLowercaseAccount) {
+    // What a phone's autocapitalisation turns "alice" into.
+    EXPECT_EQ(login("Alice", "correct horse battery"), 200);
+    EXPECT_EQ(login("ALICE", "correct horse battery"), 200);
+    EXPECT_EQ(login("Alice", "wrong"), 401);
+}
+
+TEST_F(UsernameCaseTest, CaseVariantsShareOneLockout) {
+    // Spreading guesses over "alice", "Alice", "ALICE"... must not multiply
+    // the attempts allowed: they all count against the folded name.
+    EXPECT_EQ(login("alice", "wrong-1"), 401);
+    EXPECT_EQ(login("Alice", "wrong-2"), 401);
+    EXPECT_EQ(login("ALICE", "wrong-3"), 401);
+    EXPECT_EQ(login("aLiCe", "correct horse battery"), 429);
+}
+
+TEST_F(UsernameCaseTest, AnExactLegacyUppercaseNameStillWins) {
+    // Accounts from before the lowercase grammar keep signing in as typed.
+    ASSERT_TRUE(store->create_account(make_account("acct-b", "Bob", "bob's long password")));
+    EXPECT_EQ(login("Bob", "bob's long password"), 200);
+}

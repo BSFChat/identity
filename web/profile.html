@@ -121,9 +121,11 @@
                         <div class="section-desc">
                             Enter a 6-digit code from your authenticator to finish setup.
                         </div>
+                        <label for="2fa-verify-code" class="visually-hidden">6-digit code from your authenticator</label>
                         <div class="code-input">
                             <input type="text" id="2fa-verify-code" maxlength="6"
-                                   placeholder="000000" autocomplete="off">
+                                   placeholder="000000" autocomplete="one-time-code" inputmode="numeric"
+                                   pattern="[0-9]*" autocapitalize="none" autocorrect="off" spellcheck="false">
                             <button class="btn btn-primary btn-small" id="2fa-verify-btn">Verify</button>
                             <button class="btn btn-secondary btn-small" id="2fa-cancel-btn">Cancel</button>
                         </div>
