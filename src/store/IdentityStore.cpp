@@ -595,6 +595,22 @@ void IdentityStore::migrate_locked() {
         exec("ALTER TABLE sessions ADD COLUMN family_id TEXT NOT NULL DEFAULT ''");
     }
     exec("CREATE INDEX IF NOT EXISTS idx_sessions_family ON sessions(family_id)");
+    // family_consents (I2-2): which chat servers a refresh family may mint
+    // sign-in tokens for — the server its authorization-code sign-in named,
+    // plus those it inherited from the grant the app held before. Nothing is
+    // backfilled from server_memberships.consented_at: an account-level
+    // consent says nothing about which grant it was given to, and carrying it
+    // into every family is the bug. After the upgrade each app grant asks
+    // once per server in the browser (invalid_target, which the app already
+    // answers with /authorize).
+    exec(R"(
+        CREATE TABLE IF NOT EXISTS family_consents (
+            family_id    TEXT NOT NULL,
+            server_url   TEXT NOT NULL,
+            consented_at INTEGER NOT NULL,
+            PRIMARY KEY (family_id, server_url)
+        )
+    )");
     // accounts.deleted_at (I-12): a deleted account's tombstone. See
     // delete_account().
     if (!has_column_locked("accounts", "deleted_at")) {
@@ -974,53 +990,6 @@ std::optional<AuthCode> IdentityStore::consume_auth_code(const std::string& code
     return result;
 }
 
-CodeClaim IdentityStore::claim_auth_code(const std::string& code) {
-    std::lock_guard lock(mutex_);
-    auto upd = prepare(db_, "UPDATE auth_codes SET redeemed_at = ? WHERE code = ? AND redeemed_at = 0");
-    sqlite3_bind_int64(upd.get(), 1, now_seconds());
-    bind_text(upd.get(), 2, transient_key(code));
-    if (sqlite3_step(upd.get()) == SQLITE_DONE && sqlite3_changes(db_) > 0) return CodeClaim::Claimed;
-    auto have = prepare(db_, "SELECT 1 FROM auth_codes WHERE code = ?");
-    bind_text(have.get(), 1, transient_key(code));
-    return sqlite3_step(have.get()) == SQLITE_ROW ? CodeClaim::AlreadyRedeemed : CodeClaim::Unknown;
-}
-
-void IdentityStore::record_auth_code_grant(const std::string& code, const std::string& family_id,
-                                           const std::string& access_token) {
-    std::lock_guard lock(mutex_);
-    auto upd = prepare(db_, "UPDATE auth_codes SET family_id = ?, access_token = ? WHERE code = ?");
-    bind_text(upd.get(), 1, family_id);
-    bind_text(upd.get(), 2, hash_token(access_token));
-    bind_text(upd.get(), 3, transient_key(code));
-    sqlite3_step(upd.get());
-}
-
-void IdentityStore::revoke_auth_code_grant(const std::string& code) {
-    std::lock_guard lock(mutex_);
-    Transaction txn(db_);
-    std::string family_id, access_hash;
-    {
-        auto stmt = prepare(db_,
-            "SELECT family_id, access_token FROM auth_codes WHERE code = ? AND redeemed_at != 0");
-        bind_text(stmt.get(), 1, transient_key(code));
-        if (sqlite3_step(stmt.get()) != SQLITE_ROW) return;
-        family_id = col_text(stmt.get(), 0);
-        access_hash = col_text(stmt.get(), 1);
-    }
-    if (!family_id.empty()) {
-        auto del = prepare(db_, "DELETE FROM refresh_tokens WHERE family_id = ?");
-        bind_text(del.get(), 1, family_id);
-        sqlite3_step(del.get());
-    }
-    if (!access_hash.empty()) {
-        auto del = prepare(db_, "DELETE FROM sessions WHERE session_id = ? AND token_type = ?");
-        bind_text(del.get(), 1, access_hash);
-        bind_text(del.get(), 2, token_type::kOidcAccess);
-        sqlite3_step(del.get());
-    }
-    txn.commit();
-}
-
 void IdentityStore::delete_expired_auth_codes() {
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_, "DELETE FROM auth_codes WHERE expires_at < ?");
@@ -1128,6 +1097,112 @@ bool insert_refresh_row(sqlite3* db, const RefreshToken& token) {
 }
 
 } // namespace
+
+RedeemResult IdentityStore::redeem_auth_code(const std::string& code,
+                                             const CodeRedemption& r) {
+    std::lock_guard lock(mutex_);
+    Transaction txn(db_);
+    RedeemResult result;
+    const auto key = transient_key(code);
+    const auto& family_id = r.refresh.family_id;
+
+    {
+        auto upd = prepare(db_,
+            "UPDATE auth_codes SET redeemed_at = ?, family_id = ?, access_token = ? "
+            "WHERE code = ? AND redeemed_at = 0");
+        sqlite3_bind_int64(upd.get(), 1, now_seconds());
+        bind_text(upd.get(), 2, family_id);
+        bind_text(upd.get(), 3, hash_token(r.access.session_id));
+        bind_text(upd.get(), 4, key);
+        if (sqlite3_step(upd.get()) != SQLITE_DONE) return result;
+        if (sqlite3_changes(db_) == 0) {
+            // Redeemed already. The store mutex serialises redemptions, so
+            // whatever the first one bought is fully stored by now and the
+            // revocation below cannot miss it (audit I2-4).
+            std::string won_family, won_access;
+            {
+                auto stmt = prepare(db_, "SELECT family_id, access_token FROM auth_codes WHERE code = ?");
+                bind_text(stmt.get(), 1, key);
+                if (sqlite3_step(stmt.get()) != SQLITE_ROW) return result; // Unknown
+                won_family = col_text(stmt.get(), 0);
+                won_access = col_text(stmt.get(), 1);
+            }
+            revoke_family_locked(won_family);
+            if (!won_access.empty()) {
+                auto del = prepare(db_, "DELETE FROM sessions WHERE session_id = ? AND token_type = ?");
+                bind_text(del.get(), 1, won_access);
+                bind_text(del.get(), 2, token_type::kOidcAccess);
+                sqlite3_step(del.get());
+            }
+            txn.commit();
+            result.claim = CodeClaim::AlreadyRedeemed;
+            return result;
+        }
+    }
+
+    if (family_id.empty() || !insert_refresh_row(db_, r.refresh)) return result;
+    {
+        auto ins = prepare(db_,
+            "INSERT INTO sessions (session_id, account_id, created_at, expires_at, token_type, scope, "
+            "client_id, family_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+        bind_text(ins.get(), 1, hash_token(r.access.session_id));
+        bind_text(ins.get(), 2, r.access.account_id);
+        sqlite3_bind_int64(ins.get(), 3, r.access.created_at);
+        sqlite3_bind_int64(ins.get(), 4, r.access.expires_at);
+        bind_text(ins.get(), 5, r.access.token_type);
+        bind_text(ins.get(), 6, r.access.scope);
+        bind_text(ins.get(), 7, r.access.client_id);
+        bind_text(ins.get(), 8, family_id);
+        if (sqlite3_step(ins.get()) != SQLITE_DONE) return result;
+    }
+    if (!r.consented_resource.empty()) {
+        auto ins = prepare(db_,
+            "INSERT OR IGNORE INTO family_consents (family_id, server_url, consented_at) "
+            "VALUES (?, ?, ?)");
+        bind_text(ins.get(), 1, family_id);
+        bind_text(ins.get(), 2, r.consented_resource);
+        sqlite3_bind_int64(ins.get(), 3, now_seconds());
+        sqlite3_step(ins.get());
+    }
+
+    if (!r.carry_from_refresh_token.empty()) {
+        // Only a LIVE token of the same account and client: whoever presents
+        // it could already mint for every server its family consented to.
+        std::string old_family;
+        {
+            auto stmt = prepare(db_, std::string(
+                "SELECT family_id FROM refresh_tokens WHERE token = ? AND account_id = ? "
+                "AND client_id = ? AND replaced_at = 0 AND expires_at >= ?4 "
+                "AND family_expires_at >= ?4") + account_enabled("refresh_tokens"));
+            bind_text(stmt.get(), 1, hash_token(r.carry_from_refresh_token));
+            bind_text(stmt.get(), 2, r.refresh.account_id);
+            bind_text(stmt.get(), 3, r.refresh.client_id);
+            sqlite3_bind_int64(stmt.get(), 4, now_seconds());
+            if (sqlite3_step(stmt.get()) == SQLITE_ROW) old_family = col_text(stmt.get(), 0);
+        }
+        if (!old_family.empty() && old_family != family_id) {
+            auto copy = prepare(db_,
+                "INSERT OR IGNORE INTO family_consents (family_id, server_url, consented_at) "
+                "SELECT ?, server_url, consented_at FROM family_consents WHERE family_id = ?");
+            bind_text(copy.get(), 1, family_id);
+            bind_text(copy.get(), 2, old_family);
+            sqlite3_step(copy.get());
+            // The app replaces its token with the new one: the old grant
+            // would only linger as an unused credential.
+            auto del = prepare(db_, "DELETE FROM refresh_tokens WHERE family_id = ?");
+            bind_text(del.get(), 1, old_family);
+            sqlite3_step(del.get());
+            auto delc = prepare(db_, "DELETE FROM family_consents WHERE family_id = ?");
+            bind_text(delc.get(), 1, old_family);
+            sqlite3_step(delc.get());
+            result.carried = true;
+        }
+    }
+
+    txn.commit();
+    result.claim = CodeClaim::Claimed;
+    return result;
+}
 
 bool IdentityStore::store_refresh_token(const RefreshToken& token) {
     std::lock_guard lock(mutex_);
@@ -1285,11 +1360,14 @@ void IdentityStore::revoke_family_locked(const std::string& family_id) {
     auto del = prepare(db_, "DELETE FROM refresh_tokens WHERE family_id = ?");
     bind_text(del.get(), 1, family_id);
     sqlite3_step(del.get());
-    // And every access token the grant minted (I2-4).
+    // And every access token the grant minted (I2-4), and its consents.
     auto acc = prepare(db_, "DELETE FROM sessions WHERE family_id = ? AND token_type = ?");
     bind_text(acc.get(), 1, family_id);
     bind_text(acc.get(), 2, token_type::kOidcAccess);
     sqlite3_step(acc.get());
+    auto con = prepare(db_, "DELETE FROM family_consents WHERE family_id = ?");
+    bind_text(con.get(), 1, family_id);
+    sqlite3_step(con.get());
 }
 
 void IdentityStore::wipe_stale_successors(int64_t grace_seconds) {
@@ -1781,6 +1859,14 @@ void IdentityStore::sweep_expired() {
     delete_expired_consent_requests();
     delete_expired_refresh_tokens();
     wipe_stale_successors(kMaxRefreshGraceSeconds);
+    delete_orphaned_family_consents();
+}
+
+void IdentityStore::delete_orphaned_family_consents() {
+    std::lock_guard lock(mutex_);
+    // Families whose last token expired or was deleted with its account.
+    exec("DELETE FROM family_consents WHERE family_id NOT IN "
+         "(SELECT DISTINCT family_id FROM refresh_tokens)");
 }
 
 // Server memberships
@@ -1875,6 +1961,16 @@ IdentityStore::list_server_memberships(const std::string& account_id) {
         out.push_back(std::move(m));
     }
     return out;
+}
+
+bool IdentityStore::family_signin_consented(const std::string& family_id,
+                                            const std::string& server_url) {
+    if (family_id.empty() || server_url.empty()) return false;
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "SELECT 1 FROM family_consents WHERE family_id = ? AND server_url = ?");
+    bind_text(stmt.get(), 1, family_id);
+    bind_text(stmt.get(), 2, server_url);
+    return sqlite3_step(stmt.get()) == SQLITE_ROW;
 }
 
 bool IdentityStore::server_signin_consented(const std::string& account_id,

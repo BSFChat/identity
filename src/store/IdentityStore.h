@@ -149,6 +149,26 @@ struct Session {
     std::string family_id;
 };
 
+// What an authorization-code redemption stores (see redeem_auth_code()).
+struct CodeRedemption {
+    RefreshToken refresh;           // first token of a new family (raw value)
+    Session access;                 // its access token (raw value)
+    // Canonical URL of the chat server the consent page named, or empty. It
+    // becomes the new family's consent (audit I2-2).
+    std::string consented_resource;
+    // Optional: a refresh token (raw) the client already holds for the same
+    // account and client. When it is live, the new family inherits that
+    // family's server consents and the old family is ended, so an app that
+    // signs in to a second server through the browser keeps the first one.
+    // Anything else (unknown, retired, another account or client) is ignored.
+    std::string carry_from_refresh_token;
+};
+
+struct RedeemResult {
+    CodeClaim claim = CodeClaim::Unknown;
+    bool carried = false;  // consents were inherited from carry_from_refresh_token
+};
+
 // A pending user-facing consent decision for an authorization request.
 struct ConsentRequest {
     std::string token;
@@ -272,18 +292,17 @@ public:
     // Atomically fetches and deletes an unredeemed authorization code inside
     // a single transaction, so two concurrent redemptions cannot both succeed.
     std::optional<AuthCode> consume_auth_code(const std::string& code);
-    // Audit I-9: the token endpoint reads the code with get_auth_code(),
-    // checks the client and PKCE, and only then claims it — so a wrong
-    // verifier no longer burns the code. Atomic: of two concurrent claims
-    // exactly one gets Claimed.
-    CodeClaim claim_auth_code(const std::string& code);
-    // After a Claimed code was exchanged: what it bought, so that a replay
-    // can revoke it (`access_token` raw; stored hashed).
-    void record_auth_code_grant(const std::string& code, const std::string& family_id,
-                                const std::string& access_token);
-    // A redeemed code came back: revokes the refresh-token family and the
-    // access token issued from its first redemption (RFC 6749 4.1.2).
-    void revoke_auth_code_grant(const std::string& code);
+    // Audit I-9 / I2-4: the token endpoint reads the code with
+    // get_auth_code(), checks the client and PKCE, and only then redeems it
+    // here — so a wrong verifier no longer burns the code. In ONE
+    // transaction this claims the code, records what it bought, and stores
+    // the new grant: its first refresh token, its access token, and its
+    // consent for the code's chat server (I2-2). Of two concurrent
+    // redemptions exactly one gets Claimed; the other gets AlreadyRedeemed
+    // and, in the same transaction, revokes the winner's whole grant (the
+    // family and every access token it minted, refreshes included) — which
+    // the winner has always finished storing by then (RFC 6749 4.1.2).
+    RedeemResult redeem_auth_code(const std::string& code, const CodeRedemption& redemption);
     void delete_expired_auth_codes();
 
     // Refresh tokens
@@ -316,6 +335,8 @@ public:
     // Forgets sealed successors (RefreshToken::successor_sealed) of tokens
     // retired more than `grace_seconds` ago. Part of sweep_expired().
     void wipe_stale_successors(int64_t grace_seconds);
+    // Drops family_consents rows whose family has no tokens left.
+    void delete_orphaned_family_consents();
 
     // Sessions / access tokens
     bool create_session(const Session& session);
@@ -422,6 +443,11 @@ public:
     // the app or portal merely added does not count: any first-party access
     // token can write the list, and a refresh token can mint one.
     bool server_signin_consented(const std::string& account_id, const std::string& server_url);
+    // Audit I2-2: consent is bound to the grant. True when THIS refresh
+    // family was created by (or inherited) an authorization-code sign-in to
+    // `server_url` (canonical). A refresh may mint a server token only when
+    // both this and server_signin_consented() hold.
+    bool family_signin_consented(const std::string& family_id, const std::string& server_url);
 
 private:
     void exec(const std::string& sql);

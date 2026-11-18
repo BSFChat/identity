@@ -659,6 +659,16 @@ protected:
         oidc->handle_token(req, res);
         return res;
     }
+    // A browser sign-in to `resource` by an app that already holds
+    // `held_refresh_token` and presents it at the code exchange (I2-2).
+    json login_carrying(const std::string& resource, const std::string& held_refresh_token) {
+        auto page = authorize({{"resource", resource}});
+        EXPECT_EQ(status_of(page), 200) << page.body;
+        auto code = approve(page);
+        auto tres = redeem(code, {{"refresh_token", held_refresh_token}});
+        EXPECT_EQ(status_of(tres), 200) << tres.body;
+        return json::parse(tres.body, nullptr, false);
+    }
     bool listed(const std::string& url) {
         for (const auto& m : store->list_server_memberships("acct-1")) {
             if (m.server_url == url) return true;
@@ -668,8 +678,10 @@ protected:
 };
 
 TEST_F(AuthFirstTest, RefreshNamesOneServerAndEchoesTheNonce) {
-    desktop_login({{"resource", kChat2}}); // consented once, on another grant
-    auto first = desktop_login({{"resource", kChat}});
+    // Consented for kChat2 on one sign-in; the app then signs in to kChat
+    // presenting the grant it holds, so the new grant keeps kChat2 (I2-2).
+    auto earlier = desktop_login({{"resource", kChat2}});
+    auto first = login_carrying(kChat, earlier["refresh_token"].get<std::string>());
     auto res = refresh_for(first["refresh_token"].get<std::string>(),
                            {{"resource", kChat2}, {"nonce", "n-join-2"}});
     ASSERT_EQ(status_of(res), 200) << res.body;
@@ -750,12 +762,80 @@ TEST_F(AuthFirstTest, I1_RefreshForAServerNeverConsentedToIsRefused) {
     EXPECT_EQ(body["error"], "invalid_target");
     EXPECT_EQ(body.value("error_description", ""), "consent required for this server");
     EXPECT_FALSE(listed(kChat2)) << "a refused refresh added the server to the list";
-    // The app falls back to /authorize, the user approves, and from then on
-    // the refresh grant may mint for it — from any of the account's grants.
-    desktop_login({{"resource", kChat2}});
-    auto again = refresh_for(rt, {{"resource", kChat2}, {"nonce", "n-3"}});
+    // The app falls back to /authorize presenting the grant it holds, the
+    // user approves, and from then on its (new) grant may mint for both.
+    auto next = login_carrying(kChat2, rt)["refresh_token"].get<std::string>();
+    auto again = refresh_for(next, {{"resource", kChat2}, {"nonce", "n-3"}});
     ASSERT_EQ(status_of(again), 200) << again.body;
     EXPECT_EQ(jwt_payload(json::parse(again.body)["id_token"].get<std::string>())["aud"], kChat2);
+    auto rotated = json::parse(again.body)["refresh_token"].get<std::string>();
+    EXPECT_EQ(status_of(refresh_for(rotated, {{"resource", kChat}, {"nonce", "n-4"}})), 200);
+    // The grant it replaced is gone.
+    EXPECT_EQ(status_of(refresh_for(rt, {})), 400);
+}
+
+// Audit I2-2. Consent is bound to the grant. A sign-in the user approved for
+// one (possibly hostile) server must not mint tokens for another server the
+// user once approved on a different grant.
+TEST_F(AuthFirstTest, I2_2_AnotherGrantsConsentIsNotThisGrants) {
+    desktop_login({{"resource", kChat}});          // the user's real app
+    const auto evil = desktop_login({{"resource", kChat2}})["refresh_token"].get<std::string>();
+    auto res = refresh_for(evil, {{"resource", kChat}, {"nonce", "n-evil"}});
+    ASSERT_EQ(status_of(res), 400) << res.body;
+    EXPECT_EQ(json::parse(res.body)["error"], "invalid_target");
+    EXPECT_EQ(json::parse(res.body).value("error_description", ""), "consent required for this server");
+    // Its own server still works.
+    EXPECT_EQ(status_of(refresh_for(evil, {{"resource", kChat2}, {"nonce", "n-own"}})), 200);
+}
+
+// Consent survives rotation: it belongs to the family, not the token.
+TEST_F(AuthFirstTest, I2_2_ConsentFollowsTheGrantThroughRotation) {
+    auto rt = desktop_login({{"resource", kChat}})["refresh_token"].get<std::string>();
+    for (int i = 0; i < 3; ++i) {
+        auto res = refresh_for(rt, {});
+        ASSERT_EQ(status_of(res), 200) << res.body;
+        rt = json::parse(res.body)["refresh_token"].get<std::string>();
+    }
+    EXPECT_EQ(status_of(refresh_for(rt, {{"resource", kChat}, {"nonce", "n-r"}})), 200);
+}
+
+// Only a live token of the same account and client carries consent over.
+TEST_F(AuthFirstTest, I2_2_ASpentOrForeignTokenCarriesNothing) {
+    auto first = desktop_login({{"resource", kChat}})["refresh_token"].get<std::string>();
+    auto rotated = refresh_for(first, {});
+    ASSERT_EQ(status_of(rotated), 200);
+    auto live = json::parse(rotated.body)["refresh_token"].get<std::string>();
+    // `first` is retired: presenting it at a sign-in is not proof of the grant.
+    auto next = login_carrying(kChat2, first)["refresh_token"].get<std::string>();
+    EXPECT_EQ(status_of(refresh_for(next, {{"resource", kChat}, {"nonce", "n-x"}})), 400);
+    // And the grant it named was not ended by it.
+    EXPECT_EQ(status_of(refresh_for(live, {{"resource", kChat}, {"nonce", "n-y"}})), 200);
+    // Garbage is ignored, not an error.
+    auto other = login_carrying(kChat2, "not-a-token");
+    EXPECT_FALSE(other.value("refresh_token", "").empty());
+}
+
+// The upgrade: an existing grant (no family consents yet) asks once per
+// server, even for one the account approved before.
+TEST_F(AuthFirstTest, I2_2_AGrantFromBeforeTheUpgradeAsksOncePerServer) {
+    store->record_server_signin("acct-1", kChat, "chat", kMaxServerMemberships);
+    auto now = now_seconds();
+    RefreshToken old;
+    old.token = "pre-upgrade-token";
+    old.client_id = "bsfchat-desktop";
+    old.account_id = "acct-1";
+    old.scope = "openid profile";
+    old.family_id = "pre-upgrade-family";
+    old.created_at = now - 86400;
+    old.family_expires_at = now + 86400 * 30;
+    old.expires_at = now + 86400 * 30;
+    ASSERT_TRUE(store->store_refresh_token(old));
+    auto res = refresh_for("pre-upgrade-token", {{"resource", kChat}, {"nonce", "n-up"}});
+    EXPECT_EQ(status_of(res), 400);
+    EXPECT_EQ(json::parse(res.body)["error"], "invalid_target");
+    // One browser trip, presenting the old grant, and it is settled.
+    auto next = login_carrying(kChat, "pre-upgrade-token")["refresh_token"].get<std::string>();
+    EXPECT_EQ(status_of(refresh_for(next, {{"resource", kChat}, {"nonce", "n-up2"}})), 200);
 }
 
 // Any first-party access token can write the list, and a refresh token mints

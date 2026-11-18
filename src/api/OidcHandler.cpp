@@ -1030,53 +1030,21 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
             return;
         }
 
-        // Every check passed: claim the code. A code that was already
-        // redeemed and is presented again WITH the right verifier means two
-        // parties hold the code and the verifier, and one of them already has
-        // tokens: revoke what the first redemption bought (RFC 6749 4.1.2;
-        // audit I-9). Requiring the checks first keeps someone who only saw
-        // the code from signing the real client out with it.
-        switch (store_.claim_auth_code(code)) {
-            case CodeClaim::Claimed:
-                break;
-            case CodeClaim::AlreadyRedeemed:
-                store_.revoke_auth_code_grant(code);
-                log->warn("Authorization code replayed for account {} (client {}); the tokens "
-                          "from its first redemption were revoked",
-                          auth_code->account_id, auth_code->client_id);
-                oauth_error(res, 400, "invalid_grant", "Authorization code already used");
-                return;
-            case CodeClaim::Unknown:
-                oauth_error(res, 400, "invalid_grant", "Invalid authorization code");
-                return;
-        }
-
-        // Generate tokens
+        // Every check passed: redeem the code. Everything it buys is built
+        // first and stored in the same transaction as the claim (audit
+        // I2-4), so a concurrent second redemption — two parties holding the
+        // code AND the verifier — always finds the first one's grant in
+        // place and revokes it, refreshes included (RFC 6749 4.1.2; I-9).
+        // Requiring the checks first keeps someone who only saw the code
+        // from signing the real client out with it.
         auto access_token = create_access_token();
-        auto id_token = create_id_token(*account, auth_code->client_id, auth_code->scope,
-                                        auth_code->resource, auth_code->nonce);
-        if (!auth_code->resource.empty()) {
-            record_first_party_signin(account->id, auth_code->client_id, auth_code->resource);
-        }
         auto refresh_token = random_hex(32);
-
         auto now = now_seconds();
 
-        // Access tokens live in the sessions table but are tagged as OIDC
-        // credentials, so they cannot act as account-portal session cookies.
-        Session access_session;
-        access_session.session_id = access_token;
-        access_session.account_id = account->id;
-        access_session.created_at = now;
-        access_session.expires_at = now + 3600; // 1 hour
-        access_session.token_type = token_type::kOidcAccess;
-        access_session.scope = auth_code->scope;
-        access_session.client_id = auth_code->client_id;
-        store_.create_session(access_session);
-
-        // Store refresh token: the first of a new family, whose absolute
-        // expiry no later rotation can move (security audit H4).
-        RefreshToken rt;
+        CodeRedemption redemption;
+        // The first token of a new family, whose absolute expiry no later
+        // rotation can move (security audit H4).
+        RefreshToken& rt = redemption.refresh;
         rt.token = refresh_token;
         rt.client_id = auth_code->client_id;
         rt.account_id = account->id;
@@ -1086,8 +1054,53 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
         rt.expires_at = std::min(now + int64_t{86400} * config_.refresh_token_idle_days,
                                  rt.family_expires_at);
         rt.created_at = now;
-        store_.store_refresh_token(rt);
-        store_.record_auth_code_grant(code, rt.family_id, access_token);
+
+        // Access tokens live in the sessions table but are tagged as OIDC
+        // credentials, so they cannot act as account-portal session cookies.
+        Session& access_session = redemption.access;
+        access_session.session_id = access_token;
+        access_session.account_id = account->id;
+        access_session.created_at = now;
+        access_session.expires_at = now + 3600; // 1 hour
+        access_session.token_type = token_type::kOidcAccess;
+        access_session.scope = auth_code->scope;
+        access_session.client_id = auth_code->client_id;
+        access_session.family_id = rt.family_id;
+
+        // Audit I2-2: the consent page named this server, so THIS grant may
+        // later mint sign-in tokens for it on refresh — and only this grant.
+        redemption.consented_resource = auth_code->resource;
+        // A first-party app signing in to one more server presents the
+        // refresh token it already holds, so the new grant keeps the servers
+        // that one was approved for (see CodeRedemption).
+        if (is_first_party_client(auth_code->client_id)) {
+            redemption.carry_from_refresh_token = refresh_token_str;
+        }
+
+        const auto redeemed = store_.redeem_auth_code(code, redemption);
+        switch (redeemed.claim) {
+            case CodeClaim::Claimed:
+                break;
+            case CodeClaim::AlreadyRedeemed:
+                log->warn("Authorization code replayed for account {} (client {}); the grant "
+                          "from its first redemption was revoked",
+                          auth_code->account_id, auth_code->client_id);
+                oauth_error(res, 400, "invalid_grant", "Authorization code already used");
+                return;
+            case CodeClaim::Unknown:
+                oauth_error(res, 400, "invalid_grant", "Invalid authorization code");
+                return;
+        }
+        if (redeemed.carried) {
+            log->info("Sign-in for account {} (client {}) replaced the app's previous grant and "
+                      "kept its server approvals", account->id, auth_code->client_id);
+        }
+
+        auto id_token = create_id_token(*account, auth_code->client_id, auth_code->scope,
+                                        auth_code->resource, auth_code->nonce);
+        if (!auth_code->resource.empty()) {
+            record_first_party_signin(account->id, auth_code->client_id, auth_code->resource);
+        }
 
         json response = {
             {"access_token", access_token},
@@ -1172,7 +1185,12 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
                             "nonce is required with resource on refresh");
                 return;
             }
-            if (!store_.server_signin_consented(account->id, *canonical)) {
+            // Audit I2-2: consented on THIS grant, not merely by the account
+            // on some other one — or a grant the user approved for one
+            // server would sign in at every server they ever approved. Still
+            // also on the list: removing a server there withdraws it.
+            if (!store_.family_signin_consented(rt->family_id, *canonical) ||
+                !store_.server_signin_consented(account->id, *canonical)) {
                 log->info("Refused a server token on refresh for account {} to {}: not consented",
                           account->id, *canonical);
                 oauth_error(res, 400, "invalid_target", "consent required for this server");

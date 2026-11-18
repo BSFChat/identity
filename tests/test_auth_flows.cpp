@@ -5,6 +5,9 @@
 
 #include <gtest/gtest.h>
 
+#include <thread>
+#include <vector>
+
 #include "api/AccountHandler.h"
 #include "api/OidcHandler.h"
 #include "core/Config.h"
@@ -658,6 +661,77 @@ TEST_F(AuthFlowTest, I9_ReplayingARedeemedCodeRevokesItsTokens) {
     httplib::Response ures;
     oidc->handle_userinfo(ureq, ures);
     EXPECT_EQ(status_of(ures), 401) << "the access token from the first redemption survived";
+}
+
+// Audit I2-4. A replay also ends the access tokens the grant minted by
+// refreshing, not just the one the code itself bought.
+TEST_F(AuthFlowTest, I2_4_ACodeReplayEndsRefreshDerivedAccessTokens) {
+    auto location = authorize_and_consent("bsfchat-desktop", "http://localhost:41234/oauth/callback",
+                                          s256_challenge(kVerifier));
+    auto code = query_param(location, "code");
+    ASSERT_FALSE(code.empty());
+    std::map<std::string, std::string> params = {
+        {"grant_type", "authorization_code"},
+        {"code", code},
+        {"redirect_uri", "http://localhost:41234/oauth/callback"},
+        {"client_id", "bsfchat-desktop"},
+        {"code_verifier", kVerifier},
+    };
+    httplib::Response fres;
+    oidc->handle_token(form_request(params), fres);
+    ASSERT_EQ(status_of(fres), 200) << fres.body;
+    auto rreq = form_request({{"grant_type", "refresh_token"},
+                              {"refresh_token", json::parse(fres.body)["refresh_token"].get<std::string>()},
+                              {"client_id", "bsfchat-desktop"}});
+    httplib::Response refres;
+    oidc->handle_token(rreq, refres);
+    ASSERT_EQ(status_of(refres), 200) << refres.body;
+    const auto refreshed_access = json::parse(refres.body)["access_token"].get<std::string>();
+    ASSERT_TRUE(store->get_oidc_access_token(refreshed_access));
+
+    httplib::Response rres;
+    oidc->handle_token(form_request(params), rres);
+    EXPECT_EQ(status_of(rres), 400);
+    EXPECT_FALSE(store->get_oidc_access_token(refreshed_access))
+        << "an access token minted by refreshing the replayed grant survived";
+}
+
+// Audit I2-4. Two simultaneous correct redemptions: the claim and the grant
+// it buys are one transaction, so the loser always finds the winner's grant
+// stored and revokes it. Before, the loser could run between the winner's
+// claim and its write, revoke nothing, and leave the winner signed in.
+TEST_F(AuthFlowTest, I2_4_SimultaneousCorrectRedemptionsLeaveNoGrant) {
+    for (int round = 0; round < 5; ++round) {
+        auto location = authorize_and_consent("bsfchat-desktop",
+                                              "http://localhost:41234/oauth/callback",
+                                              s256_challenge(kVerifier));
+        auto code = query_param(location, "code");
+        ASSERT_FALSE(code.empty());
+        const std::map<std::string, std::string> params = {
+            {"grant_type", "authorization_code"},
+            {"code", code},
+            {"redirect_uri", "http://localhost:41234/oauth/callback"},
+            {"client_id", "bsfchat-desktop"},
+            {"code_verifier", kVerifier},
+        };
+        std::vector<httplib::Response> results(4);
+        std::vector<std::thread> threads;
+        for (size_t i = 0; i < results.size(); ++i) {
+            threads.emplace_back([&, i] { oidc->handle_token(form_request(params), results[i]); });
+        }
+        for (auto& t : threads) t.join();
+        int won = 0;
+        for (const auto& r : results) {
+            if (status_of(r) != 200) continue;
+            ++won;
+            auto tokens = json::parse(r.body);
+            EXPECT_FALSE(store->get_oidc_access_token(tokens["access_token"].get<std::string>()))
+                << "the winner's access token survived a simultaneous redemption";
+            EXPECT_FALSE(store->get_refresh_token(tokens["refresh_token"].get<std::string>()))
+                << "the winner's grant survived a simultaneous redemption";
+        }
+        EXPECT_EQ(won, 1);
+    }
 }
 
 // Only a replay that passes PKCE revokes: someone who merely saw the code
