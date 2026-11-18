@@ -117,4 +117,13 @@ mobile_redirect_uri = "https://bsfchat.com/oauth/callback"
 # the https callback. ANY app on a phone can claim that scheme and sign in as
 # BSFChat with one tap of Allow, so leave this off unless you are deliberately
 # giving users time to update, and turn it off again afterwards.
+#
+# Upgrading with this off removes bsfchat://oauth/callback from the
+# bsfchat-desktop registration, which ends sign-in for mobile builds from
+# before the https callback (old TestFlight and store builds). The service
+# logs a WARNING at startup when it removes it, and on every start while a
+# hand-edited client registration still lists a bsfchat:// redirect. Note the
+# https callback also needs the real Team ID / signing-key fingerprint in the
+# web .well-known files (apple-app-site-association, assetlinks.json) before
+# the current mobile app can use it.
 allow_legacy_mobile_scheme = false

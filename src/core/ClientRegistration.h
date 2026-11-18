@@ -4,6 +4,7 @@
 #include "store/IdentityStore.h"
 
 #include <string>
+#include <vector>
 
 namespace bsfchat::id {
 
@@ -34,6 +35,12 @@ bool is_first_party_client(const std::string& client_id);
 // Create the client if it is absent; otherwise upgrade a registration that
 // still holds one of the exact values this project shipped previously. An
 // operator's customised list is left alone.
-void ensure_first_party_client(IdentityStore& store, const Config& config);
+//
+// Audit I2-3: with [apps] allow_legacy_mobile_scheme off, also returns (and
+// logs, once, as WARNINGs) what the operator should know about bsfchat://
+// — that this start just dropped it from bsfchat-desktop, so mobile builds
+// from before bsfchat-mobile (old TestFlight builds) can no longer sign in,
+// or that a hand-edited registration still lists it. Empty otherwise.
+std::vector<std::string> ensure_first_party_client(IdentityStore& store, const Config& config);
 
 } // namespace bsfchat::id

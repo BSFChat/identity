@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <string>
+#include <vector>
 
 namespace bsfchat::id {
 
@@ -48,6 +49,9 @@ constexpr const char* kDesktopWithLegacySchemeRedirectUris =
 // The bare-localhost one matched any path on any localhost port.
 constexpr const char* kLegacyDesktopRedirectUris = R"(["http://localhost"])";
 
+// The private-use scheme the I2-3 warnings look for.
+constexpr const char* kLegacyScheme = "bsfchat://";
+
 std::string json_string_array_of_one(const std::string& uri) {
     // The value has passed Config's https/no-fragment check; quote and
     // backslash are escaped anyway so the stored JSON is always well formed.
@@ -76,8 +80,9 @@ bool is_first_party_client(const std::string& client_id) {
     return client_id == kDesktopClientId || client_id == kMobileClientId;
 }
 
-void ensure_first_party_client(IdentityStore& store, const Config& config) {
+std::vector<std::string> ensure_first_party_client(IdentityStore& store, const Config& config) {
     auto log = get_logger();
+    std::vector<std::string> warnings;
 
     // --- bsfchat-desktop ----------------------------------------------------
     const char* desktop_uris = config.allow_legacy_mobile_scheme
@@ -102,6 +107,15 @@ void ensure_first_party_client(IdentityStore& store, const Config& config) {
         // transition. A list an operator wrote by hand is left alone.
         store.update_oauth_client_redirect_uris(kDesktopClientId, desktop_uris);
         log->info("Set bsfchat-desktop redirect_uris to {}", desktop_uris);
+        if (!config.allow_legacy_mobile_scheme &&
+            desktop->redirect_uris.find(kLegacyScheme) != std::string::npos) {
+            warnings.push_back(
+                "bsfchat://oauth/callback was removed from bsfchat-desktop's redirects "
+                "([apps] allow_legacy_mobile_scheme = false). Mobile app builds from before "
+                "the bsfchat-mobile client (old TestFlight or store builds) can no longer sign "
+                "in. Set allow_legacy_mobile_scheme = true for a transition period if anyone "
+                "still uses one.");
+        }
     }
 
     // --- bsfchat-mobile -----------------------------------------------------
@@ -123,6 +137,21 @@ void ensure_first_party_client(IdentityStore& store, const Config& config) {
         store.update_oauth_client_redirect_uris(kMobileClientId, mobile_uris);
         log->info("Set bsfchat-mobile redirect_uris to {}", mobile_uris);
     }
+
+    // A registration an operator wrote by hand is never rewritten above, so
+    // it can keep the scheme the switch says is off. Say so.
+    if (!config.allow_legacy_mobile_scheme) {
+        for (const auto& client : store.list_oauth_clients()) {
+            if (client.redirect_uris.find(kLegacyScheme) == std::string::npos) continue;
+            warnings.push_back(
+                "OAuth client '" + client.client_id + "' still lists a bsfchat:// redirect "
+                "although [apps] allow_legacy_mobile_scheme = false. Any app on a phone can "
+                "claim that scheme; remove it from the registration unless you mean to keep it.");
+        }
+    }
+
+    for (const auto& w : warnings) log->warn("{}", w);
+    return warnings;
 }
 
 } // namespace bsfchat::id

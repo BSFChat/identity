@@ -1286,6 +1286,46 @@ TEST(FirstPartyClientTest, TheShippedCustomSchemeIsRemovedFromDesktop) {
               std::string::npos);
 }
 
+// Audit I2-3. Dropping bsfchat:// ends sign-in for old mobile builds, so the
+// operator is told, once, on the start that drops it — and on every start
+// while a hand-edited registration still lists it.
+TEST(FirstPartyClientTest, I2_3_DroppingTheCustomSchemeIsWarnedAbout) {
+    IdentityStore store(":memory:");
+    store.initialize();
+    OAuthClient existing;
+    existing.client_id = "bsfchat-desktop";
+    existing.client_secret = "";
+    existing.name = "BSFChat Desktop";
+    existing.redirect_uris =
+        R"(["http://127.0.0.1/oauth/callback","http://localhost/oauth/callback","bsfchat://oauth/callback"])";
+    existing.created_at = now_seconds();
+    ASSERT_TRUE(store.create_oauth_client(existing));
+
+    auto warnings = ensure_first_party_client(store, Config{});
+    ASSERT_EQ(warnings.size(), 1u);
+    EXPECT_NE(warnings[0].find("TestFlight"), std::string::npos) << warnings[0];
+    // Already dropped: nothing more to say on the next start.
+    EXPECT_TRUE(ensure_first_party_client(store, Config{}).empty());
+
+    // With the switch on there is nothing to warn about.
+    Config legacy;
+    legacy.allow_legacy_mobile_scheme = true;
+    EXPECT_TRUE(ensure_first_party_client(store, legacy).empty());
+
+    // A hand-written registration keeping the scheme is named every start.
+    OAuthClient custom;
+    custom.client_id = "my-old-app";
+    custom.client_secret = "";
+    custom.name = "Old app";
+    custom.redirect_uris = R"(["bsfchat://oauth/callback"])";
+    custom.created_at = now_seconds();
+    ASSERT_TRUE(store.create_oauth_client(custom));
+    ensure_first_party_client(store, Config{}); // drops it from desktop again
+    warnings = ensure_first_party_client(store, Config{});
+    ASSERT_EQ(warnings.size(), 1u);
+    EXPECT_NE(warnings[0].find("my-old-app"), std::string::npos) << warnings[0];
+}
+
 TEST(FirstPartyClientTest, ACustomisedRegistrationIsLeftAlone) {
     // Only the exact values this project shipped are rewritten. An operator
     // who narrowed or extended the list keeps what they wrote.
