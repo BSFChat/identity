@@ -16,6 +16,7 @@ struct PasswordResetResult {
     enum class Status {
         Reset,          // new password stored, every credential revoked
         NoSuchAccount,
+        Deleted,        // a tombstone: refused, it must stay without a password
         PolicyRejected, // the new password fails password_policy_error()
         StoreFailed,
     };
@@ -32,7 +33,8 @@ struct PasswordResetResult {
 // access tokens, refresh tokens, pending codes and consent prompts — exactly
 // as a password change does, except that no session is kept: the operator's
 // terminal has none, and whoever knew the old password must not stay in.
-// 2FA is left as it is; a disabled account stays disabled.
+// 2FA is left as it is; a disabled account stays disabled. A deleted
+// account (tombstone) is refused (audit I2-4).
 PasswordResetResult reset_account_password(IdentityStore& store, const std::string& username,
                                            const std::string& new_password, int hash_iterations);
 

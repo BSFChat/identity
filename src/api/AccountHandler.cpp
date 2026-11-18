@@ -853,6 +853,12 @@ void AccountHandler::handle_update_profile(const httplib::Request& req, httplib:
 
 // Session management
 
+namespace {
+constexpr const char* kLastAdminMessage =
+    "You are the only administrator of this BSFChat ID. Make another account an administrator "
+    "before deleting this one.";
+} // namespace
+
 void AccountHandler::handle_delete_account(const httplib::Request& req, httplib::Response& res) {
     auto log = get_logger();
     // A browser session only: an app's access token must not be able to
@@ -870,6 +876,14 @@ void AccountHandler::handle_delete_account(const httplib::Request& req, httplib:
     auto account = store_.get_account_by_id(account_id);
     if (!account || account->deleted()) {
         json_error(res, 404, "Account not found");
+        return;
+    }
+
+    // Audit I2-4: not the last administrator. Checked again, atomically, by
+    // delete_account(); asked first so nobody types a password (or spends a
+    // backup code) for a deletion that cannot happen.
+    if (store_.is_last_admin(account_id)) {
+        json_error(res, 409, kLastAdminMessage);
         return;
     }
 
@@ -915,9 +929,15 @@ void AccountHandler::handle_delete_account(const httplib::Request& req, httplib:
         totp_failures_.clear(key);
     }
 
-    if (!store_.delete_account(account_id)) {
-        json_error(res, 500, "The account could not be deleted");
-        return;
+    switch (store_.delete_account(account_id)) {
+        case IdentityStore::DeleteAccountResult::Deleted:
+            break;
+        case IdentityStore::DeleteAccountResult::LastAdmin:
+            json_error(res, 409, kLastAdminMessage);
+            return;
+        case IdentityStore::DeleteAccountResult::NoSuchAccount:
+            json_error(res, 500, "The account could not be deleted");
+            return;
     }
     // The audit record. The username is kept in the tombstone anyway, so
     // logging it reveals nothing that is not still stored.

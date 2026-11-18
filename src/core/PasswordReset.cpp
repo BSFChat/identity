@@ -16,6 +16,12 @@ PasswordResetResult reset_account_password(IdentityStore& store, const std::stri
     }
     result.account_id = account->id;
     result.account_disabled = account->disabled();
+    if (account->deleted()) {
+        result.status = PasswordResetResult::Status::Deleted;
+        result.message = "The account '" + username + "' was deleted; a deleted account cannot "
+                         "be given a password";
+        return result;
+    }
 
     if (auto err = password_policy_error(new_password)) {
         result.status = PasswordResetResult::Status::PolicyRejected;

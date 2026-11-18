@@ -1434,3 +1434,46 @@ TEST_F(AccountDeletionTest, TheOperatorCommandDeletesByUsername) {
     accounts->handle_get_profile(cookie_request(browser_session), pres);
     EXPECT_EQ(status_of(pres), 401);
 }
+
+// Audit I2-4. The last administrator cannot be deleted — not from the
+// account page, not by the operator command, not by the store.
+TEST_F(AccountDeletionTest, I2_4_TheLastAdminCannotBeDeleted) {
+    auto now = now_seconds();
+    Account root;
+    root.id = "acct-root";
+    root.username = "root";
+    root.password_hash = hash_password(kPassword, config.password_hash_iterations);
+    root.is_admin = true;
+    root.created_at = now;
+    root.updated_at = now;
+    ASSERT_TRUE(store->create_account(root));
+    auto root_session = new_browser_session("acct-root");
+
+    auto res = delete_account(root_session, {{"confirm_username", "root"}, {"password", kPassword}});
+    EXPECT_EQ(status_of(res), 409) << res.body;
+    EXPECT_NE(json::parse(res.body).value("error", "").find("only administrator"), std::string::npos)
+        << res.body;
+    auto cli = delete_account_by_username(*store, "root");
+    EXPECT_EQ(cli.status, AccountDeletionResult::Status::LastAdmin) << cli.message;
+    EXPECT_EQ(store->delete_account("acct-root"), IdentityStore::DeleteAccountResult::LastAdmin);
+    EXPECT_FALSE(store->get_account_by_id("acct-root")->deleted());
+    EXPECT_TRUE(store->get_browser_session(root_session)) << "a refused deletion signed root out";
+
+    // A disabled admin does not count as another administrator...
+    Account second = root;
+    second.id = "acct-root2";
+    second.username = "root2";
+    ASSERT_TRUE(store->create_account(second));
+    ASSERT_TRUE(store->disable_account("acct-root2"));
+    EXPECT_EQ(delete_account_by_username(*store, "root").status,
+              AccountDeletionResult::Status::LastAdmin);
+    // ...an enabled one does, and then either may go, but not both.
+    ASSERT_TRUE(store->enable_account("acct-root2"));
+    res = delete_account(root_session, {{"confirm_username", "root"}, {"password", kPassword}});
+    EXPECT_EQ(status_of(res), 200) << res.body;
+    EXPECT_EQ(delete_account_by_username(*store, "root2").status,
+              AccountDeletionResult::Status::LastAdmin);
+    // Non-admins are unaffected.
+    EXPECT_EQ(delete_account_by_username(*store, "alice").status,
+              AccountDeletionResult::Status::Deleted);
+}

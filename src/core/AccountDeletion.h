@@ -16,6 +16,8 @@ struct AccountDeletionResult {
         Deleted,
         NoSuchAccount,
         AlreadyDeleted,
+        // The only administrator left: refused, nothing changed (audit I2-4).
+        LastAdmin,
         StoreFailed,
     };
     Status status = Status::StoreFailed;

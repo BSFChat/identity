@@ -154,6 +154,21 @@ TEST(PasswordResetTest, AppliesThePasswordPolicyAndChangesNothingOnRefusal) {
     EXPECT_TRUE(store.get_browser_session("rita-laptop"));
 }
 
+// Audit I2-4. A deleted account's tombstone must stay without a password.
+TEST(PasswordResetTest, I2_4_ADeletedAccountIsRefused) {
+    IdentityStore store(":memory:");
+    store.initialize();
+    ASSERT_TRUE(store.create_account(make_account("acct-r", "rita", "old password here")));
+    ASSERT_EQ(store.delete_account("acct-r"), IdentityStore::DeleteAccountResult::Deleted);
+
+    auto result = reset_account_password(store, "rita", "brand new password", kMinPbkdf2Iterations);
+    EXPECT_EQ(result.status, PasswordResetResult::Status::Deleted) << result.message;
+    EXPECT_TRUE(store.get_account_by_username("rita")->password_hash.empty());
+    // And the store refuses it on its own too.
+    EXPECT_FALSE(store.update_password_hash("acct-r", hash_password("x y z w v", kMinPbkdf2Iterations)));
+    EXPECT_TRUE(store.get_account_by_username("rita")->password_hash.empty());
+}
+
 TEST(PasswordResetTest, UnknownUsernameIsReported) {
     IdentityStore store(":memory:");
     store.initialize();

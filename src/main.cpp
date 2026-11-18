@@ -159,6 +159,12 @@ int run_delete_account(const bsfchat::id::Config& config, const std::string& use
         std::cerr << "bsfchat-id: no account is named '" << username << "'\n";
         return 1;
     }
+    // Asked before the confirmation prompt; delete_account() re-checks it.
+    if (store->is_last_admin(account->id)) {
+        std::cerr << "bsfchat-id: '" << account->username << "' is the only administrator "
+                     "left; make another account an administrator first. Nothing was changed\n";
+        return 1;
+    }
     // On a terminal, the same "type the name" confirmation the web page asks
     // for. Piped (a script), the command line is taken as the decision.
     if (isatty(STDIN_FILENO)) {
@@ -197,8 +203,15 @@ int run_reset_password(const bsfchat::id::Config& config, const std::string& use
 
     // Look the account up before asking for a password, so a typo in the
     // username is reported before anyone types a secret.
-    if (!store->get_account_by_username(username)) {
+    auto account = store->get_account_by_username(username);
+    if (!account) {
         std::cerr << "bsfchat-id: no account is named '" << username << "'\n";
+        return 1;
+    }
+    // A tombstone stays without a password (audit I2-4).
+    if (account->deleted()) {
+        std::cerr << "bsfchat-id: the account '" << username
+                  << "' was deleted and cannot be given a password; nothing was changed\n";
         return 1;
     }
 

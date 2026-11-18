@@ -249,6 +249,7 @@ public:
     std::optional<Account> get_account_by_id(const std::string& id);
     std::optional<Account> get_account_by_username(const std::string& username);
     bool update_account(const Account& account);
+    // Never on a deleted account (a tombstone holds no password).
     bool update_password_hash(const std::string& id, const std::string& password_hash);
     std::vector<Account> list_accounts(int limit = 100, int offset = 0);
     // Marks the account disabled and, in the same transaction, deletes every
@@ -261,9 +262,15 @@ public:
     // deleted and disabled, ends every credential (sessions, access and
     // refresh tokens, auth codes, login tokens, consent prompts), and deletes
     // its 2FA secret and backup codes, SSO links and server list. Irreversible;
-    // enable_account() refuses a deleted account. False when there is no such
-    // account or it was already deleted.
-    bool delete_account(const std::string& id);
+    // enable_account() refuses a deleted account. NoSuchAccount when there is
+    // no such account or it was already deleted; LastAdmin (nothing changed)
+    // when it is the only enabled administrator left (audit I2-4) — the
+    // check and the delete are one transaction.
+    enum class DeleteAccountResult { Deleted, NoSuchAccount, LastAdmin };
+    DeleteAccountResult delete_account(const std::string& id);
+    // True when `id` is an administrator and no other enabled, undeleted
+    // account is one.
+    bool is_last_admin(const std::string& id);
     bool enable_account(const std::string& id);
     // Account id whose username_skeleton equals `skeleton`, if any.
     std::optional<std::string> find_account_by_username_skeleton(const std::string& skeleton);
@@ -457,6 +464,7 @@ private:
     void migrate_locked();
     bool has_column_locked(const std::string& table, const std::string& column);
     int revoke_credentials_locked(const std::string& account_id, const std::string& keep_hash);
+    bool is_last_admin_locked(const std::string& id);
     // Deletes a refresh-token family and the access tokens minted from it.
     void revoke_family_locked(const std::string& family_id);
 

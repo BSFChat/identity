@@ -725,7 +725,8 @@ bool IdentityStore::update_account(const Account& account) {
 
 bool IdentityStore::update_password_hash(const std::string& id, const std::string& password_hash) {
     std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_, "UPDATE accounts SET password_hash = ?, updated_at = ? WHERE id = ?");
+    auto stmt = prepare(db_,
+        "UPDATE accounts SET password_hash = ?, updated_at = ? WHERE id = ? AND deleted_at = 0");
     bind_text(stmt.get(), 1, password_hash);
     sqlite3_bind_int64(stmt.get(), 2, now_seconds());
     bind_text(stmt.get(), 3, id);
@@ -793,9 +794,27 @@ bool IdentityStore::disable_account(const std::string& id) {
     return true;
 }
 
-bool IdentityStore::delete_account(const std::string& id) {
+bool IdentityStore::is_last_admin_locked(const std::string& id) {
+    auto stmt = prepare(db_,
+        "SELECT is_admin, (SELECT COUNT(*) FROM accounts WHERE id != ?1 AND is_admin != 0 "
+        "AND deleted_at = 0 AND disabled_at = 0) FROM accounts WHERE id = ?1");
+    bind_text(stmt.get(), 1, id);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return false;
+    return sqlite3_column_int(stmt.get(), 0) != 0 && sqlite3_column_int64(stmt.get(), 1) == 0;
+}
+
+bool IdentityStore::is_last_admin(const std::string& id) {
+    std::lock_guard lock(mutex_);
+    return is_last_admin_locked(id);
+}
+
+IdentityStore::DeleteAccountResult IdentityStore::delete_account(const std::string& id) {
     std::lock_guard lock(mutex_);
     Transaction txn(db_);
+    // Audit I2-4: never the last administrator. Nobody could then disable
+    // an abusive account or register a client, short of editing the
+    // database by hand.
+    if (is_last_admin_locked(id)) return DeleteAccountResult::LastAdmin;
     // The username and its skeleton stay, which is the point of a tombstone:
     // a freed name could be registered by someone else and, on every chat
     // server that still shows the old owner's messages under it, read as
@@ -806,7 +825,9 @@ bool IdentityStore::delete_account(const std::string& id) {
         "deleted_at = ?1, updated_at = ?1 WHERE id = ?2 AND deleted_at = 0");
     sqlite3_bind_int64(stmt.get(), 1, now_seconds());
     bind_text(stmt.get(), 2, id);
-    if (sqlite3_step(stmt.get()) != SQLITE_DONE || sqlite3_changes(db_) == 0) return false;
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE || sqlite3_changes(db_) == 0) {
+        return DeleteAccountResult::NoSuchAccount;
+    }
     revoke_credentials_locked(id, "");
     for (const char* table : {"user_totp", "sso_links", "server_memberships", "consent_requests"}) {
         auto del = prepare(db_, std::string("DELETE FROM ") + table + " WHERE account_id = ?");
@@ -814,7 +835,7 @@ bool IdentityStore::delete_account(const std::string& id) {
         sqlite3_step(del.get());
     }
     txn.commit();
-    return true;
+    return DeleteAccountResult::Deleted;
 }
 
 bool IdentityStore::enable_account(const std::string& id) {
