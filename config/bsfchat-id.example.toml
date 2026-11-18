@@ -91,9 +91,10 @@ totp_max_attempts = 5        # wrong 2FA codes before the login token is burned
 # again.
 refresh_token_idle_days = 30
 refresh_token_max_lifetime_days = 90
-# Seconds after a refresh token is used in which the app may present it once
-# more (two refreshes racing, or a reply lost) and get a fresh token instead
-# of being signed out by replay detection. 0 to 120; 0 turns it off.
+# Seconds after a refresh token is used in which the app may present it again
+# (refreshes racing, or a reply lost) and get the SAME successor back instead
+# of being signed out by replay detection. Retries never create a second
+# live token. 0 to 120; 0 turns it off.
 refresh_reuse_grace_seconds = 30
 
 [housekeeping]
