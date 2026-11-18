@@ -5,6 +5,8 @@
 #include "crypto/PasswordHash.h"
 #include "crypto/Secrets.h"
 
+#include <openssl/sha.h>
+
 #include <algorithm>
 #include <chrono>
 #include <set>
@@ -574,6 +576,25 @@ void IdentityStore::migrate_locked() {
     if (!has_column_locked("refresh_tokens", "grace_used")) {
         exec("ALTER TABLE refresh_tokens ADD COLUMN grace_used INTEGER NOT NULL DEFAULT 0");
     }
+
+    // --- audit 2026-11-18 (I2) ----------------------------------------------
+    // refresh_tokens.successor_sealed (I2-1): the successor of a retired
+    // token, sealed under a key only that token's raw value opens, so a
+    // retry inside the grace window is answered with the same successor
+    // instead of a second live chain. grace_used is no longer read. Rows
+    // retired before the upgrade have none; their retry replaces the unused
+    // successor instead (see rotate_refresh_token()).
+    if (!has_column_locked("refresh_tokens", "successor_sealed")) {
+        exec("ALTER TABLE refresh_tokens ADD COLUMN successor_sealed TEXT NOT NULL DEFAULT ''");
+    }
+    // sessions.family_id (I2-4): the grant an access token came from, so a
+    // replayed code or refresh token ends the access tokens of that grant
+    // too, including those minted by refreshes. Empty on older rows; they
+    // expire within the hour anyway.
+    if (!has_column_locked("sessions", "family_id")) {
+        exec("ALTER TABLE sessions ADD COLUMN family_id TEXT NOT NULL DEFAULT ''");
+    }
+    exec("CREATE INDEX IF NOT EXISTS idx_sessions_family ON sessions(family_id)");
     // accounts.deleted_at (I-12): a deleted account's tombstone. See
     // delete_account().
     if (!has_column_locked("accounts", "deleted_at")) {
@@ -1013,7 +1034,7 @@ namespace {
 
 constexpr const char* kRefreshColumns =
     "SELECT token, client_id, account_id, scope, expires_at, family_id, family_expires_at, "
-    "created_at, replaced_at, replaced_by, grace_used FROM refresh_tokens ";
+    "created_at, replaced_at, replaced_by, successor_sealed FROM refresh_tokens ";
 
 RefreshToken read_refresh_row(sqlite3_stmt* stmt) {
     RefreshToken rt;
@@ -1027,8 +1048,66 @@ RefreshToken read_refresh_row(sqlite3_stmt* stmt) {
     rt.created_at = sqlite3_column_int64(stmt, 7);
     rt.replaced_at = sqlite3_column_int64(stmt, 8);
     rt.replaced_by = col_text(stmt, 9);
-    rt.grace_used = sqlite3_column_int(stmt, 10) != 0;
+    rt.successor_sealed = col_text(stmt, 10);
     return rt;
+}
+
+// Audit I2-1. Seals `plain` (the successor's raw value) under a keystream
+// derived from `key_token`, the raw value of the token it replaced:
+// block i = SHA-256(domain || key_token || i). The store keeps only the hash
+// of key_token, so the sealed value is useless to anyone holding just the
+// database; whoever presents key_token is exactly who may have the
+// successor. Every key_token seals one value, so no keystream is reused.
+std::string successor_keystream(const std::string& key_token, size_t len) {
+    static const std::string kDomain = std::string("bsfchat-id refresh successor v1") + '\0';
+    std::string out;
+    for (uint32_t block = 0; out.size() < len; ++block) {
+        std::string input = kDomain + key_token;
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            input += static_cast<char>((block >> shift) & 0xff);
+        }
+        unsigned char digest[SHA256_DIGEST_LENGTH];
+        SHA256(reinterpret_cast<const unsigned char*>(input.data()), input.size(), digest);
+        out.append(reinterpret_cast<const char*>(digest), SHA256_DIGEST_LENGTH);
+    }
+    out.resize(len);
+    return out;
+}
+
+std::string seal_successor(const std::string& key_token, const std::string& plain) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    const auto pad = successor_keystream(key_token, plain.size());
+    std::string out;
+    out.reserve(plain.size() * 2);
+    for (size_t i = 0; i < plain.size(); ++i) {
+        auto c = static_cast<unsigned char>(plain[i] ^ pad[i]);
+        out += kHex[c >> 4];
+        out += kHex[c & 0x0f];
+    }
+    return out;
+}
+
+// Empty when `sealed` is malformed or does not open to the successor whose
+// hash is `successor_hash` (a wrong key, or a corrupted row).
+std::string open_successor(const std::string& key_token, const std::string& sealed,
+                           const std::string& successor_hash) {
+    if (sealed.empty() || sealed.size() % 2 != 0) return {};
+    const auto nibble = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        return -1;
+    };
+    const auto pad = successor_keystream(key_token, sealed.size() / 2);
+    std::string plain;
+    plain.reserve(sealed.size() / 2);
+    for (size_t i = 0; i < sealed.size(); i += 2) {
+        int hi = nibble(sealed[i]), lo = nibble(sealed[i + 1]);
+        if (hi < 0 || lo < 0) return {};
+        plain += static_cast<char>(static_cast<unsigned char>((hi << 4) | lo) ^
+                                   static_cast<unsigned char>(pad[i / 2]));
+    }
+    if (hash_token(plain) != successor_hash) return {};
+    return plain;
 }
 
 bool insert_refresh_row(sqlite3* db, const RefreshToken& token) {
@@ -1073,7 +1152,8 @@ void IdentityStore::delete_refresh_token(const std::string& token) {
 
 RotateResult IdentityStore::rotate_refresh_token(const std::string& old_token,
                                                  const RefreshToken& replacement,
-                                                 int64_t grace_seconds) {
+                                                 int64_t grace_seconds,
+                                                 std::string* successor_out) {
     std::lock_guard lock(mutex_);
     Transaction txn(db_);
 
@@ -1099,16 +1179,19 @@ RotateResult IdentityStore::rotate_refresh_token(const std::string& old_token,
     next.scope = current->scope;
     if (next.expires_at > next.family_expires_at) next.expires_at = next.family_expires_at;
 
-    // Audit I-16: two refreshes racing with the same token (or a retry after
-    // a lost reply) used to revoke the family, signing the app out. A
-    // retired token is a retry, not a replay, when all of these hold: it was
-    // retired within the grace window, its one retry is unspent, and the
-    // token that replaced it has not been used yet — i.e. it is the token
-    // immediately before the live one. The retry gets a fresh token of the
-    // same family (the successor's raw value is not kept, so it cannot be
-    // handed out again); both stay live, and either being replayed later
-    // still kills the family.
-    if (current->replaced_at != 0 && grace_seconds > 0 && !current->grace_used &&
+    // Audit I-16: refreshes racing with the same token (or a retry after a
+    // lost reply) used to revoke the family, signing the app out. A retired
+    // token is a retry, not a replay, when it was retired within the grace
+    // window and the token that replaced it has not been used yet — i.e. it
+    // is the token immediately before the live one.
+    //
+    // Audit I2-1: the retry used to get a fresh sibling, so a thief replaying
+    // inside the window walked away with a chain of their own that no later
+    // replay check would ever see. Now every retry is answered with the SAME
+    // successor, opened from successor_sealed, however many come (I2-4: three
+    // parallel refreshes). Whoever holds it, there is one chain, and the
+    // first replay of a spent token by either party revokes it.
+    if (current->replaced_at != 0 && grace_seconds > 0 &&
         now - current->replaced_at <= grace_seconds && !current->replaced_by.empty() &&
         current->family_expires_at >= now) {
         bool successor_unused = false;
@@ -1121,13 +1204,31 @@ RotateResult IdentityStore::rotate_refresh_token(const std::string& old_token,
                                sqlite3_column_int64(stmt.get(), 0) == 0;
         }
         if (successor_unused) {
-            auto upd = prepare(db_,
-                "UPDATE refresh_tokens SET grace_used = 1 WHERE token = ? AND grace_used = 0");
-            bind_text(upd.get(), 1, current->token);
-            if (sqlite3_step(upd.get()) != SQLITE_DONE || sqlite3_changes(db_) == 0) {
-                return RotateResult::Invalid;
+            auto successor = open_successor(old_token, current->successor_sealed,
+                                            current->replaced_by);
+            if (!successor.empty()) {
+                if (successor_out) *successor_out = successor;
+                txn.commit();
+                return RotateResult::RetriedInGrace;
+            }
+            // Not recoverable (retired before this build, say). Replace the
+            // unused successor rather than add a sibling: still one chain.
+            {
+                auto del = prepare(db_, "DELETE FROM refresh_tokens WHERE token = ? AND family_id = ?");
+                bind_text(del.get(), 1, current->replaced_by);
+                bind_text(del.get(), 2, current->family_id);
+                sqlite3_step(del.get());
             }
             if (!insert_refresh_row(db_, next)) return RotateResult::Invalid;
+            {
+                auto upd = prepare(db_,
+                    "UPDATE refresh_tokens SET replaced_by = ?, successor_sealed = ? WHERE token = ?");
+                bind_text(upd.get(), 1, hash_token(next.token));
+                bind_text(upd.get(), 2, seal_successor(old_token, next.token));
+                bind_text(upd.get(), 3, current->token);
+                sqlite3_step(upd.get());
+            }
+            if (successor_out) *successor_out = next.token;
             txn.commit();
             return RotateResult::RetriedInGrace;
         }
@@ -1138,47 +1239,79 @@ RotateResult IdentityStore::rotate_refresh_token(const std::string& old_token,
         // the response and retried — its family is dead to it anyway, since it
         // never received the successor) or somebody else holds a copy. Kill
         // the family so the copy stops working too (OAuth 2.0 Security BCP,
-        // refresh token rotation).
-        auto del = prepare(db_, "DELETE FROM refresh_tokens WHERE family_id = ?");
-        bind_text(del.get(), 1, current->family_id);
-        sqlite3_step(del.get());
+        // refresh token rotation), and the access tokens it minted.
+        revoke_family_locked(current->family_id);
         txn.commit();
         return RotateResult::Reused;
     }
 
     if (current->expires_at < now || current->family_expires_at < now) {
-        auto del = prepare(db_, "DELETE FROM refresh_tokens WHERE family_id = ?");
-        bind_text(del.get(), 1, current->family_id);
-        sqlite3_step(del.get());
+        revoke_family_locked(current->family_id);
         txn.commit();
         return RotateResult::Invalid;
     }
 
     {
         auto upd = prepare(db_,
-            "UPDATE refresh_tokens SET replaced_at = ?, replaced_by = ? "
+            "UPDATE refresh_tokens SET replaced_at = ?, replaced_by = ?, successor_sealed = ? "
             "WHERE token = ? AND replaced_at = 0");
         sqlite3_bind_int64(upd.get(), 1, now);
         bind_text(upd.get(), 2, hash_token(next.token));
-        bind_text(upd.get(), 3, current->token); // already the stored hash
+        bind_text(upd.get(), 3, seal_successor(old_token, next.token));
+        bind_text(upd.get(), 4, current->token); // already the stored hash
         if (sqlite3_step(upd.get()) != SQLITE_DONE || sqlite3_changes(db_) == 0) {
             return RotateResult::Invalid;
         }
     }
+    {
+        // `current` has now been used, so its predecessor can no longer be
+        // retried: nothing needs that sealed copy any more.
+        auto wipe = prepare(db_,
+            "UPDATE refresh_tokens SET successor_sealed = '' WHERE replaced_by = ? AND family_id = ?");
+        bind_text(wipe.get(), 1, current->token);
+        bind_text(wipe.get(), 2, current->family_id);
+        sqlite3_step(wipe.get());
+    }
 
     if (!insert_refresh_row(db_, next)) return RotateResult::Invalid;
 
+    if (successor_out) *successor_out = next.token;
     txn.commit();
     return RotateResult::Rotated;
 }
 
-void IdentityStore::revoke_refresh_token_family(const std::string& token) {
+void IdentityStore::revoke_family_locked(const std::string& family_id) {
+    if (family_id.empty()) return;
+    auto del = prepare(db_, "DELETE FROM refresh_tokens WHERE family_id = ?");
+    bind_text(del.get(), 1, family_id);
+    sqlite3_step(del.get());
+    // And every access token the grant minted (I2-4).
+    auto acc = prepare(db_, "DELETE FROM sessions WHERE family_id = ? AND token_type = ?");
+    bind_text(acc.get(), 1, family_id);
+    bind_text(acc.get(), 2, token_type::kOidcAccess);
+    sqlite3_step(acc.get());
+}
+
+void IdentityStore::wipe_stale_successors(int64_t grace_seconds) {
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_,
-        "DELETE FROM refresh_tokens WHERE family_id = "
-        "(SELECT family_id FROM refresh_tokens WHERE token = ?)");
-    bind_text(stmt.get(), 1, hash_token(token));
+        "UPDATE refresh_tokens SET successor_sealed = '' "
+        "WHERE successor_sealed != '' AND replaced_at != 0 AND replaced_at < ?");
+    sqlite3_bind_int64(stmt.get(), 1, now_seconds() - grace_seconds);
     sqlite3_step(stmt.get());
+}
+
+void IdentityStore::revoke_refresh_token_family(const std::string& token) {
+    std::lock_guard lock(mutex_);
+    Transaction txn(db_);
+    std::string family_id;
+    {
+        auto stmt = prepare(db_, "SELECT family_id FROM refresh_tokens WHERE token = ?");
+        bind_text(stmt.get(), 1, hash_token(token));
+        if (sqlite3_step(stmt.get()) == SQLITE_ROW) family_id = col_text(stmt.get(), 0);
+    }
+    revoke_family_locked(family_id);
+    txn.commit();
 }
 
 std::vector<RefreshToken> IdentityStore::list_refresh_tokens_for_account(const std::string& account_id) {
@@ -1199,10 +1332,14 @@ std::vector<RefreshToken> IdentityStore::list_refresh_tokens_for_account(const s
 bool IdentityStore::delete_refresh_family(const std::string& account_id, const std::string& family_id) {
     if (family_id.empty()) return false;
     std::lock_guard lock(mutex_);
+    Transaction txn(db_);
     auto stmt = prepare(db_, "DELETE FROM refresh_tokens WHERE account_id = ? AND family_id = ?");
     bind_text(stmt.get(), 1, account_id);
     bind_text(stmt.get(), 2, family_id);
-    return sqlite3_step(stmt.get()) == SQLITE_DONE && sqlite3_changes(db_) > 0;
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE || sqlite3_changes(db_) == 0) return false;
+    revoke_family_locked(family_id);
+    txn.commit();
+    return true;
 }
 
 void IdentityStore::delete_expired_refresh_tokens() {
@@ -1217,8 +1354,8 @@ void IdentityStore::delete_expired_refresh_tokens() {
 bool IdentityStore::create_session(const Session& session) {
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_,
-        "INSERT INTO sessions (session_id, account_id, created_at, expires_at, token_type, scope, client_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)");
+        "INSERT INTO sessions (session_id, account_id, created_at, expires_at, token_type, scope, client_id, "
+        "family_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
     bind_text(stmt.get(), 1, hash_token(session.session_id));
     bind_text(stmt.get(), 2, session.account_id);
     sqlite3_bind_int64(stmt.get(), 3, session.created_at);
@@ -1226,6 +1363,7 @@ bool IdentityStore::create_session(const Session& session) {
     bind_text(stmt.get(), 5, session.token_type);
     bind_text(stmt.get(), 6, session.scope);
     bind_text(stmt.get(), 7, session.client_id);
+    bind_text(stmt.get(), 8, session.family_id);
     return sqlite3_step(stmt.get()) == SQLITE_DONE;
 }
 
@@ -1642,6 +1780,7 @@ void IdentityStore::sweep_expired() {
     delete_expired_login_tokens();
     delete_expired_consent_requests();
     delete_expired_refresh_tokens();
+    wipe_stale_successors(kMaxRefreshGraceSeconds);
 }
 
 // Server memberships

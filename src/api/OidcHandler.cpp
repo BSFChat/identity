@@ -1188,19 +1188,24 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
         // retired and its successor stored in one transaction, and nothing is
         // minted unless that succeeded. Expiry (idle and absolute) and replay
         // of an already-rotated token are decided inside the same transaction.
-        auto new_refresh_token = random_hex(32);
-        auto now = now_seconds();
         RefreshToken new_rt;
-        new_rt.token = new_refresh_token;
+        new_rt.token = random_hex(32);
+        auto now = now_seconds();
         new_rt.expires_at = now + int64_t{86400} * config_.refresh_token_idle_days;
+        // What the client is handed: the token just stored, or on a retry
+        // inside the grace window the successor the first request already
+        // got (audit I2-1).
+        std::string new_refresh_token;
         switch (store_.rotate_refresh_token(refresh_token_str, new_rt,
-                                            config_.refresh_reuse_grace_seconds)) {
+                                            config_.refresh_reuse_grace_seconds,
+                                            &new_refresh_token)) {
             case RotateResult::Rotated:
                 break;
             case RotateResult::RetriedInGrace:
-                // Audit I-16: two refreshes raced, or a reply was lost.
+                // Audit I-16: refreshes raced, or a reply was lost. Answered
+                // with the same successor, so the grant stays one chain.
                 log->info("Refresh token retried inside the grace window for account {} "
-                          "(client {}); issued a second token of the same grant",
+                          "(client {}); returned the same successor",
                           rt->account_id, rt->client_id);
                 break;
             case RotateResult::Reused:
@@ -1211,6 +1216,10 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
             case RotateResult::Invalid:
                 oauth_error(res, 400, "invalid_grant", "Refresh token expired");
                 return;
+        }
+        if (new_refresh_token.empty()) {
+            oauth_error(res, 500, "server_error", "Refresh failed");
+            return;
         }
 
         // Generate new tokens.
@@ -1240,6 +1249,7 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
         access_session.token_type = token_type::kOidcAccess;
         access_session.scope = rt->scope;
         access_session.client_id = rt->client_id;
+        access_session.family_id = rt->family_id;
         store_.create_session(access_session);
 
         json response = {

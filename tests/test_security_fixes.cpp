@@ -24,6 +24,7 @@
 #include "TempPaths.h"
 
 #include <nlohmann/json.hpp>
+#include <sqlite3.h>
 #include <openssl/sha.h>
 
 #include <sys/stat.h>
@@ -32,6 +33,8 @@
 #include <filesystem>
 #include <fstream>
 #include <regex>
+#include <set>
+#include <thread>
 
 using namespace bsfchat::id;
 using json = nlohmann::json;
@@ -533,8 +536,9 @@ TEST_F(SecurityFixTest, ReplayingARotatedTokenRevokesTheGrant) {
 }
 
 // Audit I-16. Two refreshes racing with one token (or a retry after a lost
-// reply) must not sign the app out.
-TEST_F(SecurityFixTest, I16_ARetryInsideTheGraceWindowGetsAFreshToken) {
+// reply) must not sign the app out. Audit I2-1: and the retry must not fork
+// the grant — it gets the very successor the first request got.
+TEST_F(SecurityFixTest, I2_1_ARetryInsideTheGraceWindowGetsTheSameSuccessor) {
     auto first = desktop_login(browser_session)["refresh_token"].get<std::string>();
     auto res = refresh(first);
     ASSERT_EQ(status_of(res), 200);
@@ -542,24 +546,55 @@ TEST_F(SecurityFixTest, I16_ARetryInsideTheGraceWindowGetsAFreshToken) {
 
     auto retry = refresh(first);
     ASSERT_EQ(status_of(retry), 200) << retry.body;
-    auto sibling = json::parse(retry.body)["refresh_token"].get<std::string>();
-    EXPECT_NE(sibling, second);
-    // Whichever reply the app kept, it keeps working.
+    EXPECT_EQ(json::parse(retry.body)["refresh_token"].get<std::string>(), second);
+    // A fresh access token, though: that is not part of the chain.
+    EXPECT_NE(json::parse(retry.body)["access_token"], json::parse(res.body)["access_token"]);
     EXPECT_EQ(status_of(refresh(second)), 200);
-    EXPECT_EQ(status_of(refresh(sibling)), 200);
-    // Still one app grant as the user sees it.
     EXPECT_EQ(store->list_refresh_tokens_for_account("acct-1").size(), 1u);
 }
 
-TEST_F(SecurityFixTest, I16_TheGraceRetryIsSpentOnce) {
+// The audit's attack: a thief replaying the previous token inside the window
+// used to walk away with an independent live chain that no replay check
+// would ever see. Now they get the client's own successor, so whichever of
+// the two refreshes second presents a spent token and kills the grant.
+TEST_F(SecurityFixTest, I2_1_AThiefReplayingInsideTheWindowGetsNoChainOfTheirOwn) {
+    auto stolen = desktop_login(browser_session)["refresh_token"].get<std::string>();
+    auto client = refresh(stolen);
+    ASSERT_EQ(status_of(client), 200);
+    auto client_token = json::parse(client.body)["refresh_token"].get<std::string>();
+
+    auto thief = refresh(stolen);
+    ASSERT_EQ(status_of(thief), 200);
+    auto thief_token = json::parse(thief.body)["refresh_token"].get<std::string>();
+    EXPECT_EQ(thief_token, client_token) << "the retry minted an independent sibling";
+
+    // The client moves on; the thief's copy is now spent and, its successor
+    // having been used, past forgiving: presenting it revokes the grant.
+    auto moved = refresh(client_token);
+    ASSERT_EQ(status_of(moved), 200);
+    auto live = json::parse(moved.body)["refresh_token"].get<std::string>();
+    EXPECT_EQ(status_of(refresh(stolen)), 400);
+    EXPECT_EQ(status_of(refresh(live)), 400) << "the grant survived a replay";
+}
+
+// Audit I2-4: three or more parallel refreshes of one token all succeed,
+// all with the same answer, and leave one live token.
+TEST_F(SecurityFixTest, I2_4_ParallelRetriesAllGetTheSameAnswer) {
     auto first = desktop_login(browser_session)["refresh_token"].get<std::string>();
-    auto res = refresh(first);
-    ASSERT_EQ(status_of(res), 200);
-    auto second = json::parse(res.body)["refresh_token"].get<std::string>();
-    ASSERT_EQ(status_of(refresh(first)), 200);
-    // A third presentation is a replay: the whole grant goes.
-    EXPECT_EQ(status_of(refresh(first)), 400);
-    EXPECT_EQ(status_of(refresh(second)), 400);
+    std::vector<std::thread> threads;
+    std::vector<httplib::Response> results(5);
+    for (size_t i = 0; i < results.size(); ++i) {
+        threads.emplace_back([&, i] { results[i] = refresh(first); });
+    }
+    for (auto& t : threads) t.join();
+    std::set<std::string> tokens;
+    for (const auto& r : results) {
+        ASSERT_EQ(status_of(r), 200) << r.body;
+        tokens.insert(json::parse(r.body)["refresh_token"].get<std::string>());
+    }
+    ASSERT_EQ(tokens.size(), 1u) << "parallel retries forked the grant";
+    EXPECT_EQ(store->list_refresh_tokens_for_account("acct-1").size(), 1u);
+    EXPECT_EQ(status_of(refresh(*tokens.begin())), 200);
 }
 
 TEST_F(SecurityFixTest, I16_NoGraceOnceTheSuccessorWasUsed) {
@@ -613,6 +648,126 @@ TEST_F(SecurityFixTest, I16_OutsideTheWindowARetiredTokenIsAReplay) {
     again.expires_at = now + 86400;
     EXPECT_EQ(store->rotate_refresh_token("grace-old", again, 0), RotateResult::Reused);
     EXPECT_FALSE(store->get_refresh_token("grace-new")) << "replay outside the window kept the family";
+}
+
+// I2-1 on a database file, so the test can age the rotation past the window
+// the way time would.
+TEST(RefreshGraceStoreTest, I2_1_SuccessorIsSealedAtRestAndForgottenAfterTheWindow) {
+    auto dir = bsfchat::test::unique_temp_dir("bsfchat_id_grace");
+    std::filesystem::create_directories(dir);
+    const auto db_path = (dir / "identity.db").string();
+    {
+        IdentityStore store(db_path);
+        store.initialize();
+        auto now = now_seconds();
+        RefreshToken rt;
+        rt.token = "sealed-old";
+        rt.client_id = "bsfchat-desktop";
+        rt.account_id = "acct-x";
+        rt.family_id = "fam-sealed";
+        rt.created_at = now;
+        rt.family_expires_at = now + 86400;
+        rt.expires_at = now + 86400;
+        ASSERT_TRUE(store.store_refresh_token(rt));
+        RefreshToken next;
+        next.token = "sealed-successor-raw-value";
+        next.expires_at = now + 86400;
+        std::string handed;
+        ASSERT_EQ(store.rotate_refresh_token("sealed-old", next, 30, &handed), RotateResult::Rotated);
+        EXPECT_EQ(handed, next.token);
+
+        // Nothing at rest gives the successor away to someone holding the file.
+        auto old_row = store.get_refresh_token("sealed-old");
+        ASSERT_TRUE(old_row);
+        EXPECT_FALSE(old_row->successor_sealed.empty());
+        EXPECT_EQ(old_row->successor_sealed.find(next.token), std::string::npos);
+
+        RefreshToken unused;
+        unused.token = "never-handed-out";
+        unused.expires_at = now + 86400;
+        std::string again;
+        ASSERT_EQ(store.rotate_refresh_token("sealed-old", unused, 30, &again),
+                  RotateResult::RetriedInGrace);
+        EXPECT_EQ(again, next.token);
+        EXPECT_FALSE(store.get_refresh_token("never-handed-out"));
+    }
+    {
+        // Age the rotation past the window.
+        sqlite3* db = nullptr;
+        ASSERT_EQ(sqlite3_open(db_path.c_str(), &db), SQLITE_OK);
+        ASSERT_EQ(sqlite3_exec(db, "UPDATE refresh_tokens SET replaced_at = replaced_at - 300 "
+                                   "WHERE replaced_at != 0", nullptr, nullptr, nullptr), SQLITE_OK);
+        sqlite3_close(db);
+    }
+    {
+        IdentityStore store(db_path);
+        store.initialize();
+        store.sweep_expired();
+        auto old_row = store.get_refresh_token("sealed-old");
+        ASSERT_TRUE(old_row);
+        EXPECT_TRUE(old_row->successor_sealed.empty()) << "the sweep kept the sealed successor";
+
+        // Replay after the window still revokes the grant.
+        RefreshToken late;
+        late.token = "late";
+        late.expires_at = now_seconds() + 86400;
+        EXPECT_EQ(store.rotate_refresh_token("sealed-old", late, 30), RotateResult::Reused);
+        EXPECT_FALSE(store.get_refresh_token("sealed-successor-raw-value"));
+    }
+    std::filesystem::remove_all(dir);
+}
+
+// A token retired before successors were sealed (an older build) cannot
+// hand the same successor back. Its retry replaces the unused successor
+// instead of adding a sibling: still one live chain.
+TEST(RefreshGraceStoreTest, I2_1_WithoutASealedSuccessorTheRetryReplacesIt) {
+    auto dir = bsfchat::test::unique_temp_dir("bsfchat_id_grace_legacy");
+    std::filesystem::create_directories(dir);
+    const auto db_path = (dir / "identity.db").string();
+    auto now = now_seconds();
+    {
+        IdentityStore store(db_path);
+        store.initialize();
+        RefreshToken rt;
+        rt.token = "legacy-old";
+        rt.client_id = "bsfchat-desktop";
+        rt.account_id = "acct-x";
+        rt.family_id = "fam-legacy";
+        rt.created_at = now;
+        rt.family_expires_at = now + 86400;
+        rt.expires_at = now + 86400;
+        ASSERT_TRUE(store.store_refresh_token(rt));
+        RefreshToken next;
+        next.token = "legacy-first-successor";
+        next.expires_at = now + 86400;
+        ASSERT_EQ(store.rotate_refresh_token("legacy-old", next, 30), RotateResult::Rotated);
+    }
+    {
+        sqlite3* db = nullptr;
+        ASSERT_EQ(sqlite3_open(db_path.c_str(), &db), SQLITE_OK);
+        ASSERT_EQ(sqlite3_exec(db, "UPDATE refresh_tokens SET successor_sealed = ''", nullptr,
+                               nullptr, nullptr), SQLITE_OK);
+        sqlite3_close(db);
+    }
+    IdentityStore store(db_path);
+    store.initialize();
+    for (const char* attempt : {"legacy-retry-1", "legacy-retry-2"}) {
+        RefreshToken retry;
+        retry.token = attempt;
+        retry.expires_at = now + 86400;
+        std::string handed;
+        ASSERT_EQ(store.rotate_refresh_token("legacy-old", retry, 30, &handed),
+                  RotateResult::RetriedInGrace);
+        // The first retry replaces the successor; the second gets that same
+        // replacement back, now that it is sealed.
+        EXPECT_EQ(handed, "legacy-retry-1");
+    }
+    EXPECT_FALSE(store.get_refresh_token("legacy-first-successor"))
+        << "the unrecoverable successor stayed live next to its replacement";
+    EXPECT_FALSE(store.get_refresh_token("legacy-retry-2"));
+    ASSERT_TRUE(store.get_refresh_token("legacy-retry-1"));
+    EXPECT_EQ(store.get_refresh_token("legacy-retry-1")->replaced_at, 0);
+    std::filesystem::remove_all(dir);
 }
 
 TEST_F(SecurityFixTest, RefreshTokensAreVisibleAndRevocable) {

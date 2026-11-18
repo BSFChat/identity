@@ -94,18 +94,27 @@ struct RefreshToken {
     // is kept until it expires so a second presentation is recognised as a
     // replay rather than as an unknown token.
     int64_t replaced_at = 0;
-    // Hash of the token that replaced this one, and whether its one retry
-    // inside the grace window was spent (audit I-16).
+    // Hash of the token that replaced this one (audit I-16).
     std::string replaced_by;
-    bool grace_used = false;
+    // Audit I2-1: the successor's raw value, sealed under a key derived from
+    // THIS token's raw value (which the store never holds), so a retry of
+    // this token inside the grace window gets the very same successor back
+    // and nobody holding only the database can open it. Wiped as soon as the
+    // successor is used and by the sweep once the grace window is over.
+    std::string successor_sealed;
 };
+
+// Upper bound of [auth] refresh_reuse_grace_seconds (Config clamps to it).
+// The sweep wipes sealed successors older than this.
+inline constexpr int64_t kMaxRefreshGraceSeconds = 120;
 
 enum class RotateResult {
     Rotated,  // old token retired, replacement stored
     Reused,   // old token had already been rotated: the family was revoked
     // The token immediately before the live one came back inside the grace
-    // window, once: `replacement` was stored as a second live token of the
-    // family (audit I-16).
+    // window while its successor was still unused (audit I-16). The caller
+    // is handed that SAME successor (audit I2-1), however many times the
+    // retry comes: the family never has more than one live token.
     RetriedInGrace,
     Invalid,  // unknown, expired, or its account is disabled
 };
@@ -134,6 +143,10 @@ struct Session {
     std::string scope;
     // Issuing OAuth client, for OIDC access tokens only.
     std::string client_id;
+    // The refresh-token family (grant) an OIDC access token was minted from,
+    // so revoking the grant ends its access tokens too (audit I2-4). Written,
+    // not read back.
+    std::string family_id;
 };
 
 // A pending user-facing consent decision for an authorization request.
@@ -283,17 +296,26 @@ public:
     // concurrent refreshes of one token cannot both succeed and fork it
     // (security audit L4). Presenting a token that was already rotated
     // revokes its whole family: one of the two presenters is not the client.
-    // Except (audit I-16) within `grace_seconds` of its rotation, once, and
-    // only while its successor is still unused: then it is a retry — two
-    // refreshes racing, or a reply lost — and gets RetriedInGrace.
+    // Except (audit I-16) within `grace_seconds` of its rotation and only
+    // while its successor is still unused: then it is a retry — refreshes
+    // racing, or a reply lost — and gets RetriedInGrace with the existing
+    // successor's raw value in `*successor_out` (audit I2-1: idempotent, no
+    // second chain). If that value cannot be recovered, the unused successor
+    // is replaced by `replacement` instead, so still only one chain lives.
+    // On Rotated, `*successor_out` is `replacement.token`.
     RotateResult rotate_refresh_token(const std::string& old_token, const RefreshToken& replacement,
-                                      int64_t grace_seconds = 0);
-    // Deletes the family `token` belongs to (RFC 7009 revocation).
+                                      int64_t grace_seconds = 0,
+                                      std::string* successor_out = nullptr);
+    // Deletes the family `token` belongs to (RFC 7009 revocation), and the
+    // access tokens minted from it.
     void revoke_refresh_token_family(const std::string& token);
     // The live token of each family, newest first (one per family, even
     // while a grace retry has left two).
     std::vector<RefreshToken> list_refresh_tokens_for_account(const std::string& account_id);
     bool delete_refresh_family(const std::string& account_id, const std::string& family_id);
+    // Forgets sealed successors (RefreshToken::successor_sealed) of tokens
+    // retired more than `grace_seconds` ago. Part of sweep_expired().
+    void wipe_stale_successors(int64_t grace_seconds);
 
     // Sessions / access tokens
     bool create_session(const Session& session);
@@ -409,6 +431,8 @@ private:
     void migrate_locked();
     bool has_column_locked(const std::string& table, const std::string& column);
     int revoke_credentials_locked(const std::string& account_id, const std::string& keep_hash);
+    // Deletes a refresh-token family and the access tokens minted from it.
+    void revoke_family_locked(const std::string& family_id);
 
     sqlite3* db_ = nullptr;
     std::mutex mutex_;
