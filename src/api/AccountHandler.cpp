@@ -52,6 +52,26 @@ void json_error(httplib::Response& res, int status, const std::string& error) {
     res.set_content(json{{"error", error}}.dump(), "application/json");
 }
 
+// "45 seconds", "1 minute", "15 minutes": how long until a limit lifts,
+// rounded up so nobody retries a few seconds early.
+std::string wait_phrase(int64_t seconds) {
+    if (seconds < 1) seconds = 1;
+    if (seconds < 60) return std::to_string(seconds) + (seconds == 1 ? " second" : " seconds");
+    const auto minutes = (seconds + 59) / 60;
+    return std::to_string(minutes) + (minutes == 1 ? " minute" : " minutes");
+}
+
+// A 429 that says how long (audit 3): Retry-After is the time actually left
+// on the limit, and the message repeats it for the person reading it.
+void too_many(httplib::Response& res, int64_t retry_after, const std::string& what) {
+    if (retry_after < 1) retry_after = 1;
+    res.status = 429;
+    res.set_header("Retry-After", std::to_string(retry_after));
+    res.set_content(json{{"error", what + " Try again in " + wait_phrase(retry_after) + "."},
+                         {"retry_after", retry_after}}.dump(),
+                    "application/json");
+}
+
 // Reads the `session` cookie with a real cookie parser. The previous
 // `cookie.find("session=")` substring search also matched "mysession=".
 std::string extract_session_id(const httplib::Request& req) {
@@ -413,8 +433,8 @@ void AccountHandler::handle_register(const httplib::Request& req, httplib::Respo
     // a CPU exhaustion vector as well as an account-spam one.
     auto ip_key = client_key(req);
     if (!ip_key.empty() && !login_limiter_.allow("register:" + ip_key)) {
-        res.set_header("Retry-After", std::to_string(config_.login_rate_window));
-        json_error(res, 429, "Too many registration attempts, please slow down");
+        too_many(res, login_limiter_.retry_after("register:" + ip_key),
+                 "Too many accounts were created from your network.");
         return;
     }
 
@@ -507,11 +527,13 @@ bool AccountHandler::recheck_password(const httplib::Request& req, httplib::Resp
                                       const Account& account, const std::string& password,
                                       const char* wrong_message) {
     // Volume first, before any PBKDF2: the same per-address budget /api/login
-    // spends, under its own prefix so the two do not starve each other.
+    // spends, under its own prefix so the two do not starve each other. Only
+    // wrong passwords spend it.
     const auto ip_key = client_key(req);
-    if (!ip_key.empty() && !login_limiter_.allow("recheck:" + ip_key)) {
-        res.set_header("Retry-After", std::to_string(config_.login_rate_window));
-        json_error(res, 429, "Too many attempts, please slow down");
+    const auto ip_budget = "recheck:" + ip_key;
+    if (!ip_key.empty() && !login_limiter_.would_allow(ip_budget)) {
+        too_many(res, login_limiter_.retry_after(ip_budget),
+                 "Too many incorrect passwords from your network.");
         return false;
     }
     // Then a per-ACCOUNT lockout, because the caller here already holds a
@@ -520,11 +542,11 @@ bool AccountHandler::recheck_password(const httplib::Request& req, httplib::Resp
     // so this cannot be used to lock the owner out of signing in.
     const auto key = "recheck-user:" + account.id;
     if (account_failures_.is_locked(key)) {
-        res.set_header("Retry-After", std::to_string(account_failures_.retry_after(key)));
-        json_error(res, 429, "Too many failed attempts, try again later");
+        too_many(res, account_failures_.retry_after(key), "Too many incorrect passwords.");
         return false;
     }
     if (password.empty() || !verify_password(password, account.password_hash)) {
+        if (!ip_key.empty()) login_limiter_.record(ip_budget);
         if (account_failures_.record_failure(key)) {
             get_logger()->warn("Password re-check lockout engaged for account {}", account.id);
         }
@@ -541,11 +563,14 @@ void AccountHandler::handle_login(const httplib::Request& req, httplib::Response
     if (!reject_unsafe_request(req, res)) return;
 
     // Throttle before doing any work, so an unauthenticated caller cannot
-    // spend our CPU on PBKDF2 or enumerate accounts at speed.
+    // spend our CPU on PBKDF2 or enumerate accounts at speed. Only failed
+    // sign-ins spend this budget (audit 3): everybody in an office behind one
+    // NAT address shares it, and their successful sign-ins used to use it up.
     auto ip_key = client_key(req);
-    if (!ip_key.empty() && !login_limiter_.allow("login:" + ip_key)) {
-        res.set_header("Retry-After", std::to_string(config_.login_rate_window));
-        json_error(res, 429, "Too many login attempts, please slow down");
+    const auto ip_budget = "login:" + ip_key;
+    if (!ip_key.empty() && !login_limiter_.would_allow(ip_budget)) {
+        too_many(res, login_limiter_.retry_after(ip_budget),
+                 "Too many failed sign-in attempts from your network.");
         return;
     }
 
@@ -602,10 +627,9 @@ void AccountHandler::handle_login(const httplib::Request& req, httplib::Response
         int64_t retry = account_failures_.retry_after(name_key);
         if (!pair_key.empty()) retry = std::max(retry, login_failures_.retry_after(pair_key));
         if (account) retry = std::max(retry, totp_failures_.retry_after("2fa-user:" + account->id));
-        res.set_header("Retry-After", std::to_string(retry));
         // One message for every cause: naming which lock fired would tell a
         // sprayer which usernames other people are attacking.
-        json_error(res, 429, "Too many failed attempts, try again later");
+        too_many(res, retry, "Too many failed sign-in attempts.");
         return;
     }
 
@@ -623,6 +647,7 @@ void AccountHandler::handle_login(const httplib::Request& req, httplib::Response
     if (ok && account->disabled()) ok = false;
 
     if (!ok) {
+        if (!ip_key.empty()) login_limiter_.record(ip_budget);
         if (!pair_key.empty() && login_failures_.record_failure(pair_key)) {
             log->warn("Login lockout engaged for a username from {}", redact_ip_for_log(ip_key));
         }
@@ -916,8 +941,7 @@ void AccountHandler::handle_delete_account(const httplib::Request& req, httplib:
     if (auto totp = store_.get_totp(account_id); totp && totp->enabled) {
         const auto key = "2fa-user:" + account_id;
         if (totp_failures_.is_locked(key)) {
-            res.set_header("Retry-After", std::to_string(totp_failures_.retry_after(key)));
-            json_error(res, 429, "Too many incorrect codes, try again later");
+            too_many(res, totp_failures_.retry_after(key), "Too many incorrect codes.");
             return;
         }
         auto code = string_field(*body, "code");
@@ -1137,8 +1161,7 @@ void AccountHandler::handle_2fa_verify(const httplib::Request& req, httplib::Res
     // it gets the same throttling as the login-time check.
     const auto enrol_key = "2fa-enrol:" + account_id;
     if (totp_failures_.is_locked(enrol_key)) {
-        res.set_header("Retry-After", std::to_string(totp_failures_.retry_after(enrol_key)));
-        json_error(res, 429, "Too many incorrect codes, try again later");
+        too_many(res, totp_failures_.retry_after(enrol_key), "Too many incorrect codes.");
         return;
     }
 
@@ -1208,10 +1231,12 @@ void AccountHandler::handle_login_2fa(const httplib::Request& req, httplib::Resp
 
     if (!reject_unsafe_request(req, res)) return;
 
+    // Wrong codes only, like the password step's budget.
     auto ip_key = client_key(req);
-    if (!ip_key.empty() && !login_limiter_.allow("2fa:" + ip_key)) {
-        res.set_header("Retry-After", std::to_string(config_.login_rate_window));
-        json_error(res, 429, "Too many attempts, please slow down");
+    const auto ip_budget = "2fa:" + ip_key;
+    if (!ip_key.empty() && !login_limiter_.would_allow(ip_budget)) {
+        too_many(res, login_limiter_.retry_after(ip_budget),
+                 "Too many incorrect codes from your network.");
         return;
     }
 
@@ -1242,8 +1267,7 @@ void AccountHandler::handle_login_2fa(const httplib::Request& req, httplib::Resp
     const auto account_key = "2fa-user:" + *account_id;
     if (totp_failures_.is_locked(account_key)) {
         store_.delete_login_token(login_token);
-        res.set_header("Retry-After", std::to_string(totp_failures_.retry_after(account_key)));
-        json_error(res, 429, "Too many incorrect codes, try again later");
+        too_many(res, totp_failures_.retry_after(account_key), "Too many incorrect codes.");
         return;
     }
 
@@ -1263,6 +1287,7 @@ void AccountHandler::handle_login_2fa(const httplib::Request& req, httplib::Resp
         code_valid = store_.consume_backup_code(*account_id, code);
     }
     if (!code_valid) {
+        if (!ip_key.empty()) login_limiter_.record(ip_budget);
         if (totp_failures_.record_failure(account_key)) {
             log->warn("Second-factor lockout engaged for account {} (from {})", *account_id,
                       redact_ip_for_log(ip_key));

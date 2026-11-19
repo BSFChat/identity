@@ -6,7 +6,7 @@
 // as "Unexpected token '<'".
 function friendlyHttpError(status) {
     if (status === 413) return 'That was too large to send.';
-    if (status === 429) return 'Too many attempts. Wait a minute and try again.';
+    if (status === 429) return 'Too many attempts. Wait a few minutes and try again.';
     if (status === 502 || status === 503 || status === 504) {
         return 'BSFChat ID is not reachable right now. Try again in a moment.';
     }

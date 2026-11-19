@@ -10,6 +10,7 @@
 #include "core/ClientRegistration.h"
 #include "core/Config.h"
 #include "core/OperatorCommands.h"
+#include "core/RateLimiter.h"
 #include "core/WebUtil.h"
 #include "crypto/KeyManager.h"
 #include "crypto/PasswordHash.h"
@@ -168,4 +169,78 @@ TEST(Audit3Admin, OperatorCanRemoveTwoFactorForRecovery) {
     EXPECT_FALSE(store.get_totp("acct-t").has_value());
     EXPECT_FALSE(store.get_browser_session("tina-browser").has_value());
     EXPECT_FALSE(disable_2fa_by_username(store, "nobody").ok);
+}
+
+// ---------------------------------------------------------------------------
+// Sign-in limits: failures only, and they say how long
+// ---------------------------------------------------------------------------
+
+TEST(Audit3Limits, RateLimiterRetryAfterIsTheTimeLeft) {
+    RateLimiter limiter(2, std::chrono::seconds(300));
+    EXPECT_TRUE(limiter.would_allow("k"));
+    EXPECT_EQ(limiter.retry_after("k"), 0);
+    limiter.record("k");
+    limiter.record("k");
+    EXPECT_FALSE(limiter.would_allow("k"));
+    const auto left = limiter.retry_after("k");
+    EXPECT_GT(left, 290);
+    EXPECT_LE(left, 300);
+}
+
+namespace {
+
+struct LimitsFixture {
+    Config config;
+    std::unique_ptr<IdentityStore> store;
+    std::unique_ptr<AccountHandler> accounts;
+
+    explicit LimitsFixture(int rate_limit) {
+        config.password_hash_iterations = kMinPbkdf2Iterations;
+        config.login_rate_limit = rate_limit;
+        config.login_max_failures = 100;
+        store = std::make_unique<IdentityStore>(":memory:");
+        store->initialize();
+        store->create_account(make_account("acct-1", "alice"));
+        accounts = std::make_unique<AccountHandler>(*store, config);
+    }
+
+    httplib::Response login(const std::string& password) {
+        httplib::Response res;
+        accounts->handle_login(json_request({{"username", "alice"}, {"password", password}},
+                                            "192.0.2.10"),
+                               res);
+        return res;
+    }
+};
+
+} // namespace
+
+TEST(Audit3Limits, SuccessfulSignInsDoNotSpendTheAddressBudget) {
+    LimitsFixture f(3);
+    // A busy office behind one address: many successful sign-ins.
+    for (int i = 0; i < 10; ++i) {
+        EXPECT_EQ(status_of(f.login("correct horse battery")), 200) << i;
+    }
+    // Failures still do.
+    for (int i = 0; i < 3; ++i) EXPECT_EQ(status_of(f.login("wrong")), 401);
+    auto res = f.login("correct horse battery");
+    EXPECT_EQ(status_of(res), 429);
+    const auto retry = std::stoll(header_of(res, "Retry-After"));
+    EXPECT_GT(retry, 0);
+    EXPECT_LE(retry, f.config.login_rate_window);
+    EXPECT_NE(json::parse(res.body)["error"].get<std::string>().find("Try again in"),
+              std::string::npos);
+}
+
+TEST(Audit3Limits, LockoutMessageNamesTheDuration) {
+    LimitsFixture f(1000);
+    f.config.login_max_failures = 2;
+    f.accounts = std::make_unique<AccountHandler>(*f.store, f.config);
+    f.login("wrong");
+    f.login("wrong");
+    auto res = f.login("correct horse battery");
+    ASSERT_EQ(status_of(res), 429);
+    EXPECT_EQ(header_of(res, "Retry-After"), std::to_string(json::parse(res.body)["retry_after"].get<int64_t>()));
+    EXPECT_NE(json::parse(res.body)["error"].get<std::string>().find("15 minutes"), std::string::npos)
+        << res.body;
 }

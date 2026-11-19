@@ -20,6 +20,17 @@ public:
     // Records an attempt and returns true if it is within the limit.
     bool allow(const std::string& key);
 
+    // The two halves of allow(), for a budget that only some outcomes spend
+    // (audit 3: sign-in failures, not successes, so a busy office behind one
+    // NAT address is not refused for signing in a lot). `would_allow` records
+    // nothing; `record` spends one unit whatever the count.
+    bool would_allow(const std::string& key);
+    void record(const std::string& key);
+
+    // Seconds until `key` has room again: when its oldest event in the
+    // window drops out. 0 when it has room now.
+    int64_t retry_after(const std::string& key);
+
     // Drops the recorded history for a key (e.g. after a successful login).
     void reset(const std::string& key);
 

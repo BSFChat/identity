@@ -29,6 +29,38 @@ bool RateLimiter::allow(const std::string& key) {
     return true;
 }
 
+bool RateLimiter::would_allow(const std::string& key) {
+    std::lock_guard lock(mutex_);
+    auto it = events_.find(key);
+    if (it == events_.end()) return true;
+    auto cutoff = now_seconds() - window_.count();
+    auto& q = it->second;
+    while (!q.empty() && q.front() <= cutoff) q.pop_front();
+    return static_cast<int>(q.size()) < max_events_;
+}
+
+void RateLimiter::record(const std::string& key) {
+    std::lock_guard lock(mutex_);
+    auto now = now_seconds();
+    auto& q = events_[key];
+    while (!q.empty() && q.front() <= now - window_.count()) q.pop_front();
+    q.push_back(now);
+}
+
+int64_t RateLimiter::retry_after(const std::string& key) {
+    std::lock_guard lock(mutex_);
+    auto it = events_.find(key);
+    if (it == events_.end()) return 0;
+    auto now = now_seconds();
+    auto& q = it->second;
+    while (!q.empty() && q.front() <= now - window_.count()) q.pop_front();
+    if (static_cast<int>(q.size()) < max_events_) return 0;
+    // The event that has to age out for there to be room again.
+    auto blocking = q[q.size() - static_cast<size_t>(max_events_)];
+    auto remaining = blocking + window_.count() - now;
+    return remaining > 0 ? remaining : 1;
+}
+
 void RateLimiter::reset(const std::string& key) {
     std::lock_guard lock(mutex_);
     events_.erase(key);
