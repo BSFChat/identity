@@ -109,6 +109,11 @@ std::string notice_page_html(const std::string& title, const std::string& detail
 // the consent page's redirect to the desktop client's loopback URI.
 const std::vector<std::pair<std::string, std::string>>& default_security_headers();
 
+// A short, human description of a User-Agent for the session list
+// ("Firefox on Windows", "Safari on iPhone"), or "" when nothing is
+// recognised. Only this summary is stored, never the header itself.
+std::string describe_user_agent(const std::string& user_agent);
+
 // ---------------------------------------------------------------------------
 // Cookies
 // ---------------------------------------------------------------------------

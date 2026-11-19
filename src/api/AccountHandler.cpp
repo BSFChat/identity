@@ -370,7 +370,8 @@ const std::string& AccountHandler::dummy_password_hash() {
     return dummy_hash_;
 }
 
-void AccountHandler::start_session(const Account& account, httplib::Response& res, int status) {
+void AccountHandler::start_session(const Account& account, const httplib::Request& req,
+                                   httplib::Response& res, int status) {
     auto now = now_seconds();
     auto session_id = generate_session_id();
     Session session;
@@ -378,15 +379,27 @@ void AccountHandler::start_session(const Account& account, httplib::Response& re
     session.account_id = account.id;
     session.created_at = now;
     session.expires_at = now + kSessionLifetimeSeconds;
+    session.device = describe_user_agent(req.get_header_value("User-Agent"));
+    // client_key() is already a /64 for IPv6; an IPv4 address becomes /24.
+    if (auto addr = client_key(req); !addr.empty()) {
+        session.ip = addr.find('/') != std::string::npos ? addr : redact_ip_for_log(addr);
+    }
     if (!store_.create_session(session)) {
         json_error(res, 500, "Failed to create session");
         return;
     }
 
+    // The cookie this browser had, if any: replaced, so it does not linger in
+    // the session list as a second "browser session" nobody can use.
+    if (auto previous = extract_session_id(req); !previous.empty()) {
+        if (store_.get_browser_session(previous)) store_.delete_session(previous);
+    }
+
+    // No session_id in the body (audit 3): the cookie is HttpOnly so page
+    // script cannot read it, and the body was the one place it could.
     json response = {
         {"user_id", account.id},
-        {"username", account.username},
-        {"session_id", session_id}
+        {"username", account.username}
     };
     res.set_header("Set-Cookie", session_cookie(session_id, kSessionLifetimeSeconds));
     res.status = status;
@@ -405,10 +418,10 @@ std::string AccountHandler::get_session_account(const httplib::Request& req) {
         }
     }
 
-    // A browser session id may also be presented as a bearer token: /api/login
-    // returns it in the JSON body precisely so non-browser callers can use it.
-    // get_browser_session() filters on token_type, so an OIDC access token
-    // presented here resolves to nothing.
+    // A browser session id may also be presented as a bearer token (a
+    // non-browser caller holding the cookie value). get_browser_session()
+    // filters on token_type, so an OIDC access token presented here resolves
+    // to nothing.
     auto token = extract_bearer_token(req);
     if (!token.empty()) {
         auto session = store_.get_browser_session(token);
@@ -551,7 +564,7 @@ void AccountHandler::handle_register(const httplib::Request& req, httplib::Respo
                   "--grant-admin / --revoke-admin to change who is.", username, account.id);
     }
 
-    start_session(account, res, 201);
+    start_session(account, req, res, 201);
 }
 
 bool AccountHandler::recheck_password(const httplib::Request& req, httplib::Response& res,
@@ -736,7 +749,7 @@ void AccountHandler::handle_login(const httplib::Request& req, httplib::Response
     }
 
     log->info("Login successful: account {}", account->id);
-    start_session(*account, res);
+    start_session(*account, req, res);
 }
 
 void AccountHandler::handle_logout(const httplib::Request& req, httplib::Response& res) {
@@ -1073,7 +1086,9 @@ void AccountHandler::handle_list_sessions(const httplib::Request& req, httplib::
             {"session_id", session_handle(s.session_id)},
             {"created_at", s.created_at},
             {"expires_at", s.expires_at},
-            {"is_current", s.session_id == current_hash}
+            {"is_current", s.session_id == current_hash},
+            {"device", s.device},
+            {"ip", s.ip}
         });
     }
     res.set_content(result.dump(), "application/json");
@@ -1448,7 +1463,7 @@ void AccountHandler::handle_login_2fa(const httplib::Request& req, httplib::Resp
     }
     log->info("Login 2FA successful: account {}", account->id);
 
-    start_session(*account, res);
+    start_session(*account, req, res);
 }
 
 // Server memberships

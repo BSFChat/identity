@@ -110,7 +110,10 @@ public:
 
 private:
     // Creates a browser session, sets the cookie, and writes the login reply.
-    void start_session(const Account& account, httplib::Response& res, int status = 200);
+    // A browser session `req` already carried is ended (audit 3: signing in
+    // again used to orphan it, still listed and still valid).
+    void start_session(const Account& account, const httplib::Request& req,
+                       httplib::Response& res, int status = 200);
     // A PBKDF2 hash of nothing in particular, at the configured cost, so an
     // unknown username costs the same as a wrong password (security audit L2).
     const std::string& dummy_password_hash();

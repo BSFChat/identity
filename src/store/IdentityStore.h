@@ -147,6 +147,12 @@ struct Session {
     // so revoking the grant ends its access tokens too (audit I2-4). Written,
     // not read back.
     std::string family_id;
+    // Browser sessions only (audit 3: the list could not tell sessions
+    // apart). A short description of the browser ("Firefox on Windows"),
+    // never the raw User-Agent, and the sign-in address coarsened to /24 or
+    // /64 (redact_ip_for_log).
+    std::string device;
+    std::string ip;
 };
 
 // What an authorization-code redemption stores (see redeem_auth_code()).

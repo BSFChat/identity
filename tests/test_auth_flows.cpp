@@ -1110,7 +1110,9 @@ TEST_F(TwoFactorTest, CorrectTotpCodeCompletesLogin) {
     accounts->handle_login_2fa(req, res);
 
     ASSERT_EQ(status_of(res), 200) << res.body;
-    EXPECT_FALSE(json::parse(res.body)["session_id"].get<std::string>().empty());
+    // The session is the cookie; the body no longer carries it (audit 3).
+    EXPECT_NE(res.get_header_value("Set-Cookie").find("session="), std::string::npos);
+    EXPECT_FALSE(json::parse(res.body).contains("session_id"));
     // Login token consumed on success.
     EXPECT_FALSE(store->validate_login_token(login_token).has_value());
 }

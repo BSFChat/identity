@@ -527,3 +527,66 @@ TEST_F(Audit3Profile, DisabledAccountIsToldSoOnlyWithTheRightPassword) {
     EXPECT_EQ(status_of(right), 403);
     EXPECT_NE(json::parse(right.body)["error"].get<std::string>().find("disabled"), std::string::npos);
 }
+
+// ---------------------------------------------------------------------------
+// Sessions: tell them apart; signing in again replaces the old one
+// ---------------------------------------------------------------------------
+
+TEST(Audit3Sessions, UserAgentSummaries) {
+    EXPECT_EQ(describe_user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) "
+                                  "Gecko/20100101 Firefox/132.0"),
+              "Firefox on Windows");
+    EXPECT_EQ(describe_user_agent("Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) "
+                                  "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 "
+                                  "Mobile/15E148 Safari/604.1"),
+              "Safari on iPhone");
+    EXPECT_EQ(describe_user_agent("Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 "
+                                  "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"),
+              "Chrome on Android");
+    EXPECT_EQ(describe_user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                  "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"),
+              "Edge on Windows");
+    EXPECT_EQ(describe_user_agent(""), "");
+}
+
+TEST(Audit3Sessions, ListShowsDeviceAndCoarseAddressAndReloginReplacesTheSession) {
+    Config config;
+    config.password_hash_iterations = kMinPbkdf2Iterations;
+    config.login_rate_limit = 1000;
+    IdentityStore store(":memory:");
+    store.initialize();
+    ASSERT_TRUE(store.create_account(make_account("acct-1", "alice")));
+    AccountHandler accounts(store, config);
+
+    auto login = [&](const std::string& cookie) {
+        auto req = json_request({{"username", "alice"}, {"password", "correct horse battery"}},
+                                "203.0.113.77");
+        req.set_header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 "
+                                     "Firefox/132.0");
+        if (!cookie.empty()) req.set_header("Cookie", cookie);
+        httplib::Response res;
+        accounts.handle_login(req, res);
+        EXPECT_EQ(status_of(res), 200) << res.body;
+        EXPECT_FALSE(json::parse(res.body).contains("session_id"));
+        auto set_cookie = header_of(res, "Set-Cookie");
+        return set_cookie.substr(0, set_cookie.find(';'));
+    };
+    const auto first = login("");
+    const auto second = login(first);  // signing in again in the same browser
+    ASSERT_NE(first, second);
+
+    httplib::Request list;
+    list.set_header("Cookie", second);
+    httplib::Response res;
+    accounts.handle_list_sessions(list, res);
+    auto sessions = json::parse(res.body);
+    ASSERT_EQ(sessions.size(), 1u) << "the replaced session is still listed: " << res.body;
+    EXPECT_EQ(sessions[0]["device"], "Firefox on Linux");
+    EXPECT_EQ(sessions[0]["ip"], "203.0.113.0/24");
+
+    httplib::Request old_cookie;
+    old_cookie.set_header("Cookie", first);
+    httplib::Response pres;
+    accounts.handle_get_profile(old_cookie, pres);
+    EXPECT_EQ(status_of(pres), 401);
+}

@@ -222,6 +222,35 @@ const std::vector<std::pair<std::string, std::string>>& default_security_headers
     return headers;
 }
 
+std::string describe_user_agent(const std::string& ua) {
+    const auto has = [&](const char* needle) { return ua.find(needle) != std::string::npos; };
+    if (ua.empty()) return {};
+    // Order matters: Edge and Opera say "Chrome", Chrome says "Safari".
+    std::string browser;
+    if (has("BSFChat")) browser = "BSFChat app";
+    else if (has("Edg/") || has("EdgA/") || has("EdgiOS/")) browser = "Edge";
+    else if (has("OPR/") || has("Opera")) browser = "Opera";
+    else if (has("SamsungBrowser/")) browser = "Samsung Internet";
+    else if (has("Firefox/") || has("FxiOS/")) browser = "Firefox";
+    else if (has("Chrome/") || has("CriOS/") || has("Chromium/")) browser = "Chrome";
+    else if (has("Safari/")) browser = "Safari";
+    else if (has("curl/")) browser = "curl";
+
+    std::string os;
+    if (has("iPhone")) os = "iPhone";
+    else if (has("iPad")) os = "iPad";
+    else if (has("Android")) os = "Android";
+    else if (has("CrOS")) os = "ChromeOS";
+    else if (has("Windows")) os = "Windows";
+    else if (has("Mac OS X") || has("Macintosh")) os = "macOS";
+    else if (has("Linux")) os = "Linux";
+
+    if (browser.empty() && os.empty()) return "Unknown browser";
+    if (browser.empty()) return "Browser on " + os;
+    if (os.empty()) return browser;
+    return browser + " on " + os;
+}
+
 std::optional<std::string> get_cookie(const std::string& cookie_header, const std::string& name) {
     std::istringstream ss(cookie_header);
     std::string pair;

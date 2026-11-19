@@ -632,6 +632,16 @@ void IdentityStore::migrate_locked() {
     if (!has_column_locked("accounts", "deleted_at")) {
         exec("ALTER TABLE accounts ADD COLUMN deleted_at INTEGER NOT NULL DEFAULT 0");
     }
+
+    // --- audit 3 (2026-11-19) ------------------------------------------------
+    // sessions.device / ip: what the session list shows so a person can tell
+    // their sessions apart. Empty on older rows ("Unknown browser").
+    if (!has_column_locked("sessions", "device")) {
+        exec("ALTER TABLE sessions ADD COLUMN device TEXT NOT NULL DEFAULT ''");
+    }
+    if (!has_column_locked("sessions", "ip")) {
+        exec("ALTER TABLE sessions ADD COLUMN ip TEXT NOT NULL DEFAULT ''");
+    }
 }
 
 // Accounts
@@ -1510,7 +1520,7 @@ bool IdentityStore::create_session(const Session& session) {
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_,
         "INSERT INTO sessions (session_id, account_id, created_at, expires_at, token_type, scope, client_id, "
-        "family_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+        "family_id, device, ip) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     bind_text(stmt.get(), 1, hash_token(session.session_id));
     bind_text(stmt.get(), 2, session.account_id);
     sqlite3_bind_int64(stmt.get(), 3, session.created_at);
@@ -1519,6 +1529,8 @@ bool IdentityStore::create_session(const Session& session) {
     bind_text(stmt.get(), 6, session.scope);
     bind_text(stmt.get(), 7, session.client_id);
     bind_text(stmt.get(), 8, session.family_id);
+    bind_text(stmt.get(), 9, session.device);
+    bind_text(stmt.get(), 10, session.ip);
     return sqlite3_step(stmt.get()) == SQLITE_DONE;
 }
 
@@ -1534,11 +1546,14 @@ std::optional<Session> read_session_row(sqlite3_stmt* stmt) {
     s.token_type = col_text(stmt, 4);
     s.scope = col_text(stmt, 5);
     s.client_id = col_text(stmt, 6);
+    s.device = col_text(stmt, 7);
+    s.ip = col_text(stmt, 8);
     return s;
 }
 
 constexpr const char* kSessionColumns =
-    "SELECT session_id, account_id, created_at, expires_at, token_type, scope, client_id FROM sessions ";
+    "SELECT session_id, account_id, created_at, expires_at, token_type, scope, client_id, device, ip "
+    "FROM sessions ";
 
 } // namespace
 
