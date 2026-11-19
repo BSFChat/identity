@@ -56,7 +56,13 @@ public:
     void handle_2fa_status(const httplib::Request& req, httplib::Response& res);
     void handle_2fa_setup(const httplib::Request& req, httplib::Response& res);
     void handle_2fa_verify(const httplib::Request& req, httplib::Response& res);
+    // Body {"password", "code"}: the password AND a current code (TOTP or a
+    // backup code) when 2FA is enabled; a pending, unconfirmed setup is
+    // cancelled with the password alone.
     void handle_2fa_disable(const httplib::Request& req, httplib::Response& res);
+    // POST /api/user/2fa/backup-codes {"password", "code"}: replaces every
+    // backup code with a fresh set, returned once as {"backup_codes": [...]}.
+    void handle_2fa_regenerate_backup_codes(const httplib::Request& req, httplib::Response& res);
     void handle_login_2fa(const httplib::Request& req, httplib::Response& res);
 
     // Server memberships
@@ -117,6 +123,14 @@ private:
     bool recheck_password(const httplib::Request& req, httplib::Response& res,
                           const Account& account, const std::string& password,
                           const char* wrong_message);
+
+    // Checks a second-factor `code` (TOTP or backup code) for an account
+    // whose 2FA is enabled, under the per-account second-factor lock. True
+    // when it is good (a backup code is spent); otherwise a 400/403/429 has
+    // been written. A TOTP code that was already used gets its own message
+    // ("wait for the next code") and is not counted as a wrong guess.
+    bool check_second_factor(httplib::Response& res, const std::string& account_id,
+                             const TotpInfo& totp, const std::string& code);
 
     IdentityStore& store_;
     const Config& config_;

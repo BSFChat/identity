@@ -181,25 +181,48 @@ std::string totp_provisioning_uri(const std::string& secret, const std::string& 
          + "&issuer=" + url_encode(issuer);
 }
 
-std::vector<std::string> generate_backup_codes(int count) {
-    static constexpr char ALPHANUM[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    constexpr int CODE_LEN = 8;
+namespace {
+// Backup codes are read off paper and typed by hand, so the alphabet leaves
+// out the characters people confuse: O/0, I/L/1 (audit 3). Upper case only;
+// what is typed is upper-cased before it is compared.
+constexpr char kBackupAlphabet[] = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+constexpr unsigned kBackupAlphabetSize = sizeof(kBackupAlphabet) - 1;  // 31
+constexpr int kBackupCodeHalf = 5;
+} // namespace
 
+std::vector<std::string> generate_backup_codes(int count) {
     std::vector<std::string> codes;
     codes.reserve(count);
 
     for (int i = 0; i < count; ++i) {
-        unsigned char bytes[CODE_LEN];
-        if (RAND_bytes(bytes, sizeof(bytes)) != 1) {
-            throw std::runtime_error("RAND_bytes failed");
-        }
-        std::string code(CODE_LEN, '\0');
-        for (int j = 0; j < CODE_LEN; ++j) {
-            code[j] = ALPHANUM[bytes[j] % 62];
+        // Ten characters from 31 (~49.5 bits), shown as XXXXX-XXXXX.
+        std::string code;
+        while (code.size() < 2 * kBackupCodeHalf + 1) {
+            if (code.size() == kBackupCodeHalf) {
+                code.push_back('-');
+                continue;
+            }
+            unsigned char byte = 0;
+            if (RAND_bytes(&byte, 1) != 1) throw std::runtime_error("RAND_bytes failed");
+            // Rejection sampling: 248 is the largest multiple of 31 <= 256,
+            // so every character is equally likely.
+            if (byte >= 248) continue;
+            code.push_back(kBackupAlphabet[byte % kBackupAlphabetSize]);
         }
         codes.push_back(std::move(code));
     }
     return codes;
+}
+
+std::string normalize_backup_code(const std::string& code) {
+    std::string out;
+    out.reserve(code.size());
+    for (char c : code) {
+        if (c == '-' || c == ' ' || c == '\t') continue;
+        if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
+        out.push_back(c);
+    }
+    return out;
 }
 
 } // namespace bsfchat

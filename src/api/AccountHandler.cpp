@@ -894,6 +894,47 @@ constexpr const char* kLastAdminMessage =
     "'bsfchat-id --grant-admin <username>'; then delete this one.";
 } // namespace
 
+namespace {
+constexpr const char* kCodeAlreadyUsedMessage =
+    "That code was already used. Wait for your authenticator to show the next code, then "
+    "enter that one.";
+} // namespace
+
+bool AccountHandler::check_second_factor(httplib::Response& res, const std::string& account_id,
+                                         const TotpInfo& totp, const std::string& raw_code) {
+    const auto key = "2fa-user:" + account_id;
+    if (totp_failures_.is_locked(key)) {
+        too_many(res, totp_failures_.retry_after(key), "Too many incorrect codes.");
+        return false;
+    }
+    // "123 456" from an authenticator that groups digits.
+    std::string code;
+    for (char c : raw_code) {
+        if (c != ' ') code.push_back(c);
+    }
+    if (code.empty()) {
+        json_error(res, 400, "Enter a code from your authenticator app, or a backup code");
+        return false;
+    }
+    if (auto step = bsfchat::verify_totp_step(totp.secret, code)) {
+        if (store_.accept_totp_step(account_id, *step)) {
+            totp_failures_.clear(key);
+            return true;
+        }
+        // A right code, already spent: typically the one just used to turn
+        // 2FA on or to sign in. Not a guess, so not counted.
+        json_error(res, 403, kCodeAlreadyUsedMessage);
+        return false;
+    }
+    if (store_.consume_backup_code(account_id, code)) {
+        totp_failures_.clear(key);
+        return true;
+    }
+    totp_failures_.record_failure(key);
+    json_error(res, 403, "That code is incorrect");
+    return false;
+}
+
 void AccountHandler::handle_delete_account(const httplib::Request& req, httplib::Response& res) {
     auto log = get_logger();
     // A browser session only: an app's access token must not be able to
@@ -939,28 +980,7 @@ void AccountHandler::handle_delete_account(const httplib::Request& req, httplib:
     // sign this account in, so it must not delete it either. Counted against
     // the same per-account lockout as the login prompt.
     if (auto totp = store_.get_totp(account_id); totp && totp->enabled) {
-        const auto key = "2fa-user:" + account_id;
-        if (totp_failures_.is_locked(key)) {
-            too_many(res, totp_failures_.retry_after(key), "Too many incorrect codes.");
-            return;
-        }
-        auto code = string_field(*body, "code");
-        if (code.empty()) {
-            json_error(res, 400, "Your two-factor code is required");
-            return;
-        }
-        bool code_valid = false;
-        if (auto step = bsfchat::verify_totp_step(totp->secret, code)) {
-            code_valid = store_.accept_totp_step(account_id, *step);
-        } else {
-            code_valid = store_.consume_backup_code(account_id, code);
-        }
-        if (!code_valid) {
-            totp_failures_.record_failure(key);
-            json_error(res, 403, "Invalid two-factor code");
-            return;
-        }
-        totp_failures_.clear(key);
+        if (!check_second_factor(res, account_id, *totp, string_field(*body, "code"))) return;
     }
 
     switch (store_.delete_account(account_id)) {
@@ -1094,7 +1114,12 @@ void AccountHandler::handle_2fa_status(const httplib::Request& req, httplib::Res
 
     auto totp = store_.get_totp(account_id);
     bool enabled = totp && totp->enabled;
-    res.set_content(json{{"enabled", enabled}}.dump(), "application/json");
+    json response = {{"enabled", enabled}};
+    if (enabled) {
+        auto codes = json::parse(totp->backup_codes_json, nullptr, false);
+        response["backup_codes_remaining"] = codes.is_array() ? codes.size() : 0;
+    }
+    res.set_content(response.dump(), "application/json");
 }
 
 void AccountHandler::handle_2fa_setup(const httplib::Request& req, httplib::Response& res) {
@@ -1214,7 +1239,14 @@ void AccountHandler::handle_2fa_disable(const httplib::Request& req, httplib::Re
         return;
     }
 
-    if (!recheck_password(req, res, *account, password, "Invalid password")) return;
+    if (!recheck_password(req, res, *account, password, "Your password is incorrect")) return;
+
+    // Audit 3: the password alone used to be enough, so a stolen session plus
+    // the password stripped the second factor. With 2FA on, a current code
+    // (or a backup code) as well. A setup never confirmed is just cancelled.
+    if (auto totp = store_.get_totp(account_id); totp && totp->enabled) {
+        if (!check_second_factor(res, account_id, *totp, string_field(*body, "code"))) return;
+    }
 
     store_.disable_totp(account_id);
 
@@ -1224,6 +1256,45 @@ void AccountHandler::handle_2fa_disable(const httplib::Request& req, httplib::Re
     if (current.empty()) current = extract_bearer_token(req);
     auto ended = store_.revoke_account_credentials(account_id, current);
     res.set_content(json{{"success", true}, {"signed_out_elsewhere", ended}}.dump(), "application/json");
+}
+
+void AccountHandler::handle_2fa_regenerate_backup_codes(const httplib::Request& req,
+                                                        httplib::Response& res) {
+    auto account_id = get_session_account(req);
+    if (account_id.empty()) {
+        json_error(res, 401, "Not authenticated");
+        return;
+    }
+    if (!reject_unsafe_request(req, res)) return;
+
+    auto body = parse_object(req, res);
+    if (!body) return;
+
+    auto account = store_.get_account_by_id(account_id);
+    if (!account) {
+        json_error(res, 404, "Account not found");
+        return;
+    }
+    auto totp = store_.get_totp(account_id);
+    if (!totp || !totp->enabled) {
+        json_error(res, 409, "Two-factor authentication is not enabled");
+        return;
+    }
+    auto password = string_field(*body, "password");
+    if (password.empty()) {
+        json_error(res, 400, "Password is required");
+        return;
+    }
+    if (!recheck_password(req, res, *account, password, "Your password is incorrect")) return;
+    if (!check_second_factor(res, account_id, *totp, string_field(*body, "code"))) return;
+
+    auto codes = bsfchat::generate_backup_codes(8);
+    if (!store_.replace_backup_codes(account_id, codes)) {
+        json_error(res, 500, "New backup codes could not be saved");
+        return;
+    }
+    get_logger()->info("Backup codes regenerated for account {}", account_id);
+    res.set_content(json{{"backup_codes", codes}}.dump(), "application/json");
 }
 
 void AccountHandler::handle_login_2fa(const httplib::Request& req, httplib::Response& res) {
@@ -1254,9 +1325,16 @@ void AccountHandler::handle_login_2fa(const httplib::Request& req, httplib::Resp
     // The per-address 2FA lockout is gone for the same reason as the login
     // one (security audit H2); the limit that matters is per ACCOUNT, below.
     // A login token is 256 bits, so guessing tokens is not a strategy.
+    // Audit 3: a token that is gone (expired, or burned by wrong codes) used
+    // to leave the page asking for codes nothing could accept. `restart`
+    // tells it to go back to the password step.
+    const auto restart = [&](const std::string& message) {
+        res.status = 401;
+        res.set_content(json{{"error", message}, {"restart", true}}.dump(), "application/json");
+    };
     auto account_id = store_.validate_login_token(login_token);
     if (!account_id) {
-        json_error(res, 401, "Invalid or expired login token");
+        restart("This sign-in took too long or was ended. Enter your password again.");
         return;
     }
 
@@ -1281,8 +1359,10 @@ void AccountHandler::handle_login_2fa(const httplib::Request& req, httplib::Resp
     // time-step is later than the last one this account used, so a captured
     // code cannot be replayed within its ~90 s window (security audit M2).
     bool code_valid = false;
+    bool replayed = false;
     if (auto step = bsfchat::verify_totp_step(totp->secret, code)) {
         code_valid = store_.accept_totp_step(*account_id, *step);
+        replayed = !code_valid;
     } else {
         code_valid = store_.consume_backup_code(*account_id, code);
     }
@@ -1299,10 +1379,10 @@ void AccountHandler::handle_login_2fa(const httplib::Request& req, httplib::Resp
         if (destroyed) {
             log->warn("2FA login token destroyed after {} failed codes (account {}, from {})",
                       config_.totp_max_attempts, *account_id, redact_ip_for_log(ip_key));
-            json_error(res, 401, "Too many incorrect codes — please sign in again");
+            restart("Too many incorrect codes. Enter your password again to get a new try.");
             return;
         }
-        json_error(res, 401, "Invalid 2FA code");
+        json_error(res, 401, replayed ? kCodeAlreadyUsedMessage : "That code is incorrect");
         return;
     }
 
@@ -1313,7 +1393,7 @@ void AccountHandler::handle_login_2fa(const httplib::Request& req, httplib::Resp
 
     auto account = store_.get_account_by_id(*account_id);
     if (!account || account->disabled()) {
-        json_error(res, 401, "Invalid or expired login token");
+        restart("This sign-in took too long or was ended. Enter your password again.");
         return;
     }
     log->info("Login 2FA successful: account {}", account->id);

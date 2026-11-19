@@ -14,11 +14,13 @@
 #include "core/WebUtil.h"
 #include "crypto/KeyManager.h"
 #include "crypto/PasswordHash.h"
+#include "crypto/Totp.h"
 #include "http/HttpServer.h"
 #include "store/IdentityStore.h"
 #include "TempPaths.h"
 
 #include <nlohmann/json.hpp>
+#include <sqlite3.h>
 
 #include <chrono>
 #include <filesystem>
@@ -243,4 +245,173 @@ TEST(Audit3Limits, LockoutMessageNamesTheDuration) {
     EXPECT_EQ(header_of(res, "Retry-After"), std::to_string(json::parse(res.body)["retry_after"].get<int64_t>()));
     EXPECT_NE(json::parse(res.body)["error"].get<std::string>().find("15 minutes"), std::string::npos)
         << res.body;
+}
+
+// ---------------------------------------------------------------------------
+// Two-factor: backup codes, disabling, replayed codes, burned login tokens
+// ---------------------------------------------------------------------------
+
+TEST(Audit3BackupCodes, NewCodesAvoidLookalikesAndIgnoreCase) {
+    for (const auto& code : bsfchat::generate_backup_codes(50)) {
+        ASSERT_EQ(code.size(), 11u) << code;
+        EXPECT_EQ(code[5], '-');
+        EXPECT_EQ(code.find_first_of("O0IL1ilo"), std::string::npos) << code;
+    }
+    EXPECT_EQ(bsfchat::normalize_backup_code(" abcde-fghjk "), "ABCDEFGHJK");
+
+    IdentityStore store(":memory:");
+    store.initialize();
+    ASSERT_TRUE(store.create_account(make_account("acct-1", "alice")));
+    store.set_totp_secret("acct-1", "JBSWY3DPEHPK3PXP", {"ABCDE-FGHJK", "MNPQR-STUVW"});
+    EXPECT_TRUE(store.consume_backup_code("acct-1", "abcde fghjk"));
+    EXPECT_FALSE(store.consume_backup_code("acct-1", "ABCDEFGHJK"));  // spent
+    EXPECT_TRUE(store.consume_backup_code("acct-1", "mnpqrstuvw"));
+}
+
+TEST(Audit3BackupCodes, CodesIssuedBeforeTheChangeAreStillComparedExactly) {
+    auto path = bsfchat::test::unique_temp_file("bsfchat_id_old_codes", ".db");
+    {
+        IdentityStore store(path.string());
+        store.initialize();
+        ASSERT_TRUE(store.create_account(make_account("acct-1", "alice")));
+        store.set_totp_secret("acct-1", "JBSWY3DPEHPK3PXP", {});
+    }
+    {
+        // What an older build stored: a hash of the exact, mixed-case code.
+        sqlite3* raw = nullptr;
+        ASSERT_EQ(sqlite3_open(path.string().c_str(), &raw), SQLITE_OK);
+        const auto codes = json::array({hash_password("aB3dE5gH", kMinPbkdf2Iterations)}).dump();
+        sqlite3_stmt* stmt = nullptr;
+        sqlite3_prepare_v2(raw, "UPDATE user_totp SET backup_codes = ?", -1, &stmt, nullptr);
+        sqlite3_bind_text(stmt, 1, codes.c_str(), -1, SQLITE_TRANSIENT);
+        ASSERT_EQ(sqlite3_step(stmt), SQLITE_DONE);
+        sqlite3_finalize(stmt);
+        sqlite3_close(raw);
+    }
+    IdentityStore store(path.string());
+    store.initialize();
+    EXPECT_FALSE(store.consume_backup_code("acct-1", "AB3DE5GH"));
+    EXPECT_TRUE(store.consume_backup_code("acct-1", "aB3dE5gH"));
+    std::filesystem::remove(path);
+}
+
+namespace {
+
+class Audit3TwoFactor : public ::testing::Test {
+protected:
+    void SetUp() override {
+        config.password_hash_iterations = kMinPbkdf2Iterations;
+        config.login_rate_limit = 1000;
+        config.totp_max_attempts = 2;
+        store = std::make_unique<IdentityStore>(":memory:");
+        store->initialize();
+        ASSERT_TRUE(store->create_account(make_account("acct-1", "alice", kPassword)));
+        store->set_totp_secret("acct-1", kSecret, {"ABCDE-FGHJK", "MNPQR-STUVW", "XYZ23-45678"});
+        store->enable_totp("acct-1");
+        Session s;
+        s.session_id = "alice-browser";
+        s.account_id = "acct-1";
+        s.created_at = now_seconds();
+        s.expires_at = s.created_at + 3600;
+        ASSERT_TRUE(store->create_session(s));
+        accounts = std::make_unique<AccountHandler>(*store, config);
+    }
+
+    httplib::Request with_session(const json& body) {
+        auto req = json_request(body);
+        req.set_header("Cookie", "session=alice-browser");
+        return req;
+    }
+
+    std::string current_code() {
+        return bsfchat::compute_totp(kSecret, static_cast<uint64_t>(now_seconds()) / 30);
+    }
+
+    static constexpr const char* kPassword = "correct horse battery";
+    static constexpr const char* kSecret = "JBSWY3DPEHPK3PXP";
+    Config config;
+    std::unique_ptr<IdentityStore> store;
+    std::unique_ptr<AccountHandler> accounts;
+};
+
+} // namespace
+
+TEST_F(Audit3TwoFactor, StatusReportsRemainingBackupCodes) {
+    httplib::Request req;
+    req.set_header("Cookie", "session=alice-browser");
+    httplib::Response res;
+    accounts->handle_2fa_status(req, res);
+    EXPECT_EQ(json::parse(res.body)["backup_codes_remaining"], 3);
+    ASSERT_TRUE(store->consume_backup_code("acct-1", "ABCDE-FGHJK"));
+    httplib::Response again;
+    accounts->handle_2fa_status(req, again);
+    EXPECT_EQ(json::parse(again.body)["backup_codes_remaining"], 2);
+}
+
+TEST_F(Audit3TwoFactor, DisablingNeedsTheCodeAsWellAsThePassword) {
+    httplib::Response no_code;
+    accounts->handle_2fa_disable(with_session({{"password", kPassword}}), no_code);
+    EXPECT_EQ(status_of(no_code), 400) << no_code.body;
+    httplib::Response wrong_code;
+    accounts->handle_2fa_disable(with_session({{"password", kPassword}, {"code", "XXXXX-XXXXX"}}),
+                                 wrong_code);
+    EXPECT_EQ(status_of(wrong_code), 403);
+    EXPECT_TRUE(store->get_totp("acct-1")->enabled);
+
+    httplib::Response ok;
+    accounts->handle_2fa_disable(with_session({{"password", kPassword}, {"code", current_code()}}),
+                                 ok);
+    EXPECT_EQ(status_of(ok), 200) << ok.body;
+    EXPECT_FALSE(store->get_totp("acct-1").has_value());
+}
+
+TEST_F(Audit3TwoFactor, AnAlreadyUsedCodeSaysToWaitAndIsNotCountedAsAGuess) {
+    const auto code = current_code();
+    ASSERT_TRUE(store->accept_totp_step("acct-1", static_cast<uint64_t>(now_seconds()) / 30 + 1));
+    for (int i = 0; i < 10; ++i) {
+        httplib::Response res;
+        accounts->handle_2fa_disable(with_session({{"password", kPassword}, {"code", code}}), res);
+        ASSERT_EQ(status_of(res), 403) << res.body;
+        EXPECT_NE(json::parse(res.body)["error"].get<std::string>().find("already used"),
+                  std::string::npos);
+    }
+    // Not locked: a backup code still works.
+    httplib::Response res;
+    accounts->handle_2fa_disable(with_session({{"password", kPassword}, {"code", "abcde-fghjk"}}), res);
+    EXPECT_EQ(status_of(res), 200) << res.body;
+}
+
+TEST_F(Audit3TwoFactor, BackupCodesCanBeRegenerated) {
+    httplib::Response refused;
+    accounts->handle_2fa_regenerate_backup_codes(with_session({{"password", kPassword}}), refused);
+    EXPECT_EQ(status_of(refused), 400);
+
+    httplib::Response res;
+    accounts->handle_2fa_regenerate_backup_codes(
+        with_session({{"password", kPassword}, {"code", current_code()}}), res);
+    ASSERT_EQ(status_of(res), 200) << res.body;
+    auto codes = json::parse(res.body)["backup_codes"];
+    ASSERT_EQ(codes.size(), 8u);
+    EXPECT_FALSE(store->consume_backup_code("acct-1", "MNPQR-STUVW")) << "old codes still work";
+    EXPECT_TRUE(store->consume_backup_code("acct-1", codes[0].get<std::string>()));
+}
+
+TEST_F(Audit3TwoFactor, ABurnedLoginTokenSendsThePageBackToThePasswordStep) {
+    httplib::Response lres;
+    accounts->handle_login(json_request({{"username", "alice"}, {"password", kPassword}}), lres);
+    const auto token = json::parse(lres.body).value("login_token", "");
+    ASSERT_FALSE(token.empty()) << lres.body;
+
+    httplib::Response first;
+    accounts->handle_login_2fa(json_request({{"login_token", token}, {"code", "000000"}}), first);
+    EXPECT_EQ(status_of(first), 401);
+    EXPECT_FALSE(json::parse(first.body).value("restart", false));
+    httplib::Response second;  // totp_max_attempts = 2: burned
+    accounts->handle_login_2fa(json_request({{"login_token", token}, {"code", "000000"}}), second);
+    EXPECT_EQ(status_of(second), 401);
+    EXPECT_TRUE(json::parse(second.body).value("restart", false)) << second.body;
+    httplib::Response third;
+    accounts->handle_login_2fa(json_request({{"login_token", token}, {"code", current_code()}}),
+                               third);
+    EXPECT_TRUE(json::parse(third.body).value("restart", false)) << third.body;
 }

@@ -4,6 +4,7 @@
 #include "core/Username.h"
 #include "crypto/PasswordHash.h"
 #include "crypto/Secrets.h"
+#include "crypto/Totp.h"
 
 #include <openssl/sha.h>
 
@@ -31,6 +32,21 @@ std::string transient_key(const std::string& raw) {
 // at most a handful of stored hashes, so a lighter KDF than the password one is
 // appropriate; this keeps a redemption well under a second.
 constexpr int kBackupCodeIterations = 100000;
+
+// Marks a backup-code hash taken over normalize_backup_code() of the code
+// (audit 3: case-insensitive, separators ignored). Entries without it were
+// hashed over the exact code and are still compared exactly, so codes
+// people printed before the change keep working.
+constexpr const char* kNormalizedCodePrefix = "ci:";
+
+nlohmann::json hash_backup_codes(const std::vector<std::string>& codes) {
+    nlohmann::json hashed = nlohmann::json::array();
+    for (const auto& code : codes) {
+        hashed.push_back(std::string(kNormalizedCodePrefix) +
+                         hash_password(bsfchat::normalize_backup_code(code), kBackupCodeIterations));
+    }
+    return hashed;
+}
 
 int64_t now_seconds() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -304,7 +320,7 @@ void IdentityStore::migrate_locked() {
             for (const auto& entry : codes) {
                 if (!entry.is_string()) continue;
                 auto value = entry.get<std::string>();
-                if (value.rfind("$pbkdf2", 0) == 0) {
+                if (value.rfind("$pbkdf2", 0) == 0 || value.rfind(kNormalizedCodePrefix, 0) == 0) {
                     hashed.push_back(value); // already hashed
                 } else {
                     hashed.push_back(hash_password(value, kBackupCodeIterations));
@@ -1589,11 +1605,7 @@ void IdentityStore::set_totp_secret(const std::string& account_id, const std::st
                                     const std::vector<std::string>& backup_codes) {
     // Hash outside the lock — PBKDF2 over eight codes is not something to hold
     // the store mutex for.
-    nlohmann::json hashed = nlohmann::json::array();
-    for (const auto& code : backup_codes) {
-        hashed.push_back(hash_password(code, kBackupCodeIterations));
-    }
-    auto hashed_json = hashed.dump();
+    auto hashed_json = hash_backup_codes(backup_codes).dump();
 
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_,
@@ -1617,6 +1629,16 @@ std::optional<TotpInfo> IdentityStore::get_totp(const std::string& account_id) {
         return info;
     }
     return std::nullopt;
+}
+
+bool IdentityStore::replace_backup_codes(const std::string& account_id,
+                                         const std::vector<std::string>& backup_codes) {
+    auto hashed_json = hash_backup_codes(backup_codes).dump();
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "UPDATE user_totp SET backup_codes = ? WHERE account_id = ? AND enabled = 1");
+    bind_text(stmt.get(), 1, hashed_json);
+    bind_text(stmt.get(), 2, account_id);
+    return sqlite3_step(stmt.get()) == SQLITE_DONE && sqlite3_changes(db_) > 0;
 }
 
 void IdentityStore::enable_totp(const std::string& account_id) {
@@ -1666,11 +1688,16 @@ bool IdentityStore::consume_backup_code(const std::string& account_id, const std
 
     // Compare against every entry without breaking early, so a wrong code
     // always costs the same work regardless of position.
+    const auto normalized = bsfchat::normalize_backup_code(code);
+    const std::string prefix = kNormalizedCodePrefix;
     size_t match_index = codes.size();
     for (size_t i = 0; i < codes.size(); ++i) {
         if (!codes[i].is_string()) continue;
         auto stored = codes[i].get<std::string>();
-        bool ok = stored.rfind("$pbkdf2", 0) == 0
+        bool ok = stored.rfind(prefix, 0) == 0
+                      ? verify_password(normalized, stored.substr(prefix.size()))
+                  : stored.rfind("$pbkdf2", 0) == 0
+                      // Issued before audit 3: compared exactly, as printed.
                       ? verify_password(code, stored)
                       // Legacy plaintext entry (pre-migration write from an
                       // older build); still accepted so nobody is locked out.

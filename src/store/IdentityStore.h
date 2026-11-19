@@ -378,6 +378,10 @@ public:
     void set_totp_secret(const std::string& account_id, const std::string& secret,
                          const std::vector<std::string>& backup_codes);
     std::optional<TotpInfo> get_totp(const std::string& account_id);
+    // Replaces the backup codes of an ENABLED second factor (regeneration);
+    // false when the account has none enabled.
+    bool replace_backup_codes(const std::string& account_id,
+                              const std::vector<std::string>& backup_codes);
     void enable_totp(const std::string& account_id);
     void disable_totp(const std::string& account_id);
     // Records `step` as the account's last accepted TOTP time-step, only if

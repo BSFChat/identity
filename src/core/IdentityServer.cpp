@@ -174,6 +174,8 @@ void IdentityServer::register_routes() {
              [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_2fa_verify(req, res); });
     svr.Post("/api/user/2fa/disable",
              [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_2fa_disable(req, res); });
+    svr.Post("/api/user/2fa/backup-codes",
+             [h = account_handler](const httplib::Request& req, httplib::Response& res) { h->handle_2fa_regenerate_backup_codes(req, res); });
 
     // Server memberships — track which BSFChat servers a user has joined
     // so the client can restore all connections from a single identity login.
