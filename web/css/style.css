@@ -1,4 +1,5 @@
 :root {
+    color-scheme: dark;
     --bg-primary: #1a1b2e;
     --bg-secondary: #242640;
     --bg-card: #2a2d4a;
@@ -505,7 +506,7 @@ pre {
 }
 
 .tab-btn.active {
-    color: var(--accent);
+    color: var(--link);
     border-bottom-color: var(--accent);
 }
 

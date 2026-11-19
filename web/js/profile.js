@@ -28,6 +28,8 @@ function activateTab(name, { focus = false, updateHash = true } = {}) {
         btn.tabIndex = selected ? 0 : -1;
         $('tab-' + btn.dataset.tab).classList.toggle('active', selected);
         if (selected && focus) btn.focus();
+        // On a phone the tab bar scrolls; keep the chosen tab in sight.
+        if (selected) btn.scrollIntoView({ block: 'nearest', inline: 'nearest' });
     });
     if (updateHash && window.location.hash.slice(1) !== name) {
         history.replaceState(null, '', '#' + name);
