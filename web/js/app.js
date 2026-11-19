@@ -41,6 +41,7 @@ async function apiRequest(method, url, body) {
     if (!res.ok) {
         const err = new Error((data && data.error) || friendlyHttpError(res.status));
         err.status = res.status;
+        err.data = data || {};
         throw err;
     }
     if (data === null) {
@@ -78,15 +79,39 @@ function getOidcRedirectUrl() {
 }
 
 // `path` with this page's query string, so a link between the sign-in pages
-// keeps the authorization request. Only ever a same-origin path.
+// keeps the authorization request (and `next`). Only ever a same-origin path.
 function withAuthRequest(path) {
     return path + window.location.search;
 }
 
+// The page to return to after signing in, from ?next= (audit 3: a link to
+// profile.html#delete lost the #delete across sign-in). Only a same-origin
+// path is honoured: it must start with one '/', and carry no backslash or
+// scheme, so ?next= cannot become an open redirect.
+function safeNextPath() {
+    const next = new URLSearchParams(window.location.search).get('next');
+    if (!next || next[0] !== '/' || next[1] === '/' || next.includes('\\')) return null;
+    try {
+        const url = new URL(next, window.location.origin);
+        if (url.origin !== window.location.origin) return null;
+        return url.pathname + url.search + url.hash;
+    } catch (e) {
+        return null;
+    }
+}
+
+// /login.html with ?next= naming the current page, hash included, for a page
+// that found it is signed out.
+function loginUrlReturningHere() {
+    const here = window.location.pathname + window.location.search + window.location.hash;
+    return '/login.html?next=' + encodeURIComponent(here);
+}
+
 // Where to go once this browser has a session: back into the app's
-// authorization request when there is one, otherwise the account page.
+// authorization request when there is one, else the page that sent us here,
+// otherwise the account page.
 function continueAfterSignIn() {
-    window.location.href = getOidcRedirectUrl() || '/profile.html';
+    window.location.href = getOidcRedirectUrl() || safeNextPath() || '/profile.html';
 }
 
 // Public facts about this deployment (GET /api/instance): whether sign-up
@@ -144,9 +169,26 @@ function revealBanner(node) {
     node.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
 }
 
-function showError(msg) {
-    const node = document.getElementById('error-msg');
+// The error box for `anchor` (a form or section), created on first use as
+// its first child, so an error shows next to what caused it (audit 3: it
+// used to appear at the top of the page, far from the form). Without an
+// anchor, the page's #error-msg banner.
+function errorNodeFor(anchor) {
+    if (!anchor) return document.getElementById('error-msg');
+    let node = anchor.querySelector(':scope > .form-error');
+    if (!node) {
+        node = el('div', 'error form-error hidden');
+        node.setAttribute('role', 'alert');
+        node.tabIndex = -1;
+        anchor.prepend(node);
+    }
+    return node;
+}
+
+function showError(msg, anchor) {
+    const node = errorNodeFor(anchor);
     if (!node) return;
+    clearErrors();
     const success = document.getElementById('success-msg');
     if (success) success.classList.add('hidden');
     node.textContent = msg;
@@ -156,19 +198,53 @@ function showError(msg) {
     if (!typing) node.focus({ preventScroll: true });
 }
 
+// Hides every error on the page: the banner and each form's own.
+function clearErrors() {
+    document.querySelectorAll('#error-msg, .form-error').forEach(node => node.classList.add('hidden'));
+}
+
+// Kept for the pages that call it by its old name.
 function clearError() {
-    const node = document.getElementById('error-msg');
-    if (node) node.classList.add('hidden');
+    clearErrors();
 }
 
 function showSuccess(msg) {
     const node = document.getElementById('success-msg');
     if (!node) return;
-    clearError();
+    clearErrors();
     node.textContent = msg;
     revealBanner(node);
     clearTimeout(successTimer);
     successTimer = setTimeout(() => node.classList.add('hidden'), 8000);
+}
+
+// Signs out (this browser, or everywhere) and goes to the sign-in page,
+// which confirms it.
+async function signOut(everywhere) {
+    try { await apiPost('/api/logout', everywhere ? { everywhere: true } : {}); } catch (err) { /* ignore */ }
+    window.location.href = '/login.html?signed_out=' + (everywhere ? 'everywhere' : '1');
+}
+
+// Copies text to the clipboard, falling back to selecting it.
+async function copyText(text) {
+    try {
+        await navigator.clipboard.writeText(text);
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+// Offers `text` as a downloaded file.
+function downloadText(filename, text) {
+    const url = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+    const a = el('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 // Escapes text for interpolation into HTML, attribute values included.

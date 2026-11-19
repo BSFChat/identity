@@ -896,7 +896,8 @@ void AccountHandler::handle_update_profile(const httplib::Request& req, httplib:
     int signed_out = -1;
     if (body->contains("new_password")) {
         auto old_password = string_field(*body, "old_password");
-        if (!recheck_password(req, res, *account, old_password, "Current password is incorrect")) {
+        if (!recheck_password(req, res, *account, old_password,
+                              "Your current password is incorrect")) {
             return;
         }
         auto new_password = string_field(*body, "new_password");
@@ -1037,7 +1038,7 @@ void AccountHandler::handle_delete_account(const httplib::Request& req, httplib:
         json_error(res, 400, "Password is required");
         return;
     }
-    if (!recheck_password(req, res, *account, password, "Password is incorrect")) return;
+    if (!recheck_password(req, res, *account, password, "Your password is incorrect")) return;
 
     // With 2FA on, the second factor as well: a password alone does not
     // sign this account in, so it must not delete it either. Counted against

@@ -5,8 +5,28 @@ function cell(text) {
     return el('td', null, text);
 }
 
+// Not signed in: sign in and come back. Signed in but not an administrator:
+// the account page. Decided on the HTTP status (audit 3: it used to look
+// for "403" in the message text, which never contains it).
+function handleAdminAuthError(err) {
+    if (err.status === 401) {
+        window.location.href = loginUrlReturningHere();
+        return true;
+    }
+    if (err.status === 403) {
+        window.location.href = '/profile.html';
+        return true;
+    }
+    return false;
+}
+
+// The signed-in administrator's own id, so their row offers no Disable
+// (the server refuses it anyway).
+let myUserId = null;
+
 async function loadUsers() {
     try {
+        if (myUserId === null) myUserId = (await apiGet('/api/profile')).user_id;
         const data = await apiGet('/api/admin/users');
         const tbody = document.getElementById('users-body');
         tbody.replaceChildren();
@@ -22,6 +42,8 @@ async function loadUsers() {
                 // A tombstone: the name is reserved, nothing else is left,
                 // and it cannot be re-enabled.
                 actions.appendChild(el('span', 'status-badge disabled', 'Deleted'));
+            } else if (user.id === myUserId) {
+                actions.appendChild(el('span', 'muted', 'You'));
             } else {
                 const btn = el('button', 'btn btn-small ' + (user.disabled ? 'btn-secondary' : 'btn-danger'),
                                user.disabled ? 'Enable' : 'Disable');
@@ -34,10 +56,7 @@ async function loadUsers() {
             tbody.appendChild(tr);
         }
     } catch (err) {
-        if (err.message.includes('403') || err.message.includes('401')) {
-            window.location.href = '/login.html';
-        }
-        showError(err.message);
+        if (!handleAdminAuthError(err)) showError(err.message, document.getElementById('users-section'));
     }
 }
 
@@ -57,7 +76,7 @@ async function loadClients() {
             tbody.appendChild(tr);
         }
     } catch (err) {
-        showError(err.message);
+        if (!handleAdminAuthError(err)) showError(err.message, document.getElementById('clients-section'));
     }
 }
 
@@ -70,7 +89,7 @@ async function setUserEnabled(userId, enable) {
         await apiPost(`/api/admin/users/${encodeURIComponent(userId)}/${enable ? 'enable' : 'disable'}`, {});
         loadUsers();
     } catch (err) {
-        showError(err.message);
+        if (!handleAdminAuthError(err)) showError(err.message, document.getElementById('users-section'));
     }
 }
 
@@ -85,15 +104,11 @@ document.getElementById('client-form').addEventListener('submit', async (e) => {
         document.getElementById('client-result-json').textContent = JSON.stringify(result, null, 2);
         loadClients();
     } catch (err) {
-        showError(err.message);
+        if (!handleAdminAuthError(err)) showError(err.message, e.target);
     }
 });
 
-document.getElementById('logout-btn').addEventListener('click', async (e) => {
-    e.preventDefault();
-    try { await apiPost('/api/logout', {}); } catch (err) { /* ignore */ }
-    window.location.href = '/login.html';
-});
+document.getElementById('logout-btn').addEventListener('click', () => signOut(false));
 
 loadUsers();
 loadClients();

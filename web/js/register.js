@@ -28,12 +28,13 @@ document.getElementById('register-form').addEventListener('submit', async (e) =>
     e.preventDefault();
     clearError();
     const username = document.getElementById('username').value.trim().toLowerCase();
-    const email = document.getElementById('email').value;
+    const email = document.getElementById('email').value.trim();
     const password = document.getElementById('password').value;
     const confirmPassword = document.getElementById('confirm-password').value;
 
     if (password !== confirmPassword) {
-        showError('Passwords do not match');
+        showError('The passwords do not match', e.target);
+        document.getElementById('confirm-password').focus();
         return;
     }
 
@@ -44,6 +45,6 @@ document.getElementById('register-form').addEventListener('submit', async (e) =>
         await apiPost('/register', { username, password, email });
         continueAfterSignIn();
     } catch (err) {
-        showError(err.message);
+        showError(err.message, e.target);
     }
 });
