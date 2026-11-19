@@ -491,6 +491,15 @@ void AccountHandler::handle_register(const httplib::Request& req, httplib::Respo
     // and cannot forge a log line.
     log->info("Account created: {} ({})", username, account.id);
 
+    // Audit 3, M3: a fresh deployment had no administrator and no way to
+    // make one. The first account ever registered becomes one; after that
+    // it is the operator's call (--grant-admin).
+    if (store_.promote_if_first_account(account.id)) {
+        account.is_admin = true;
+        log->warn("First account on this database: {} ({}) is now an administrator. Use "
+                  "--grant-admin / --revoke-admin to change who is.", username, account.id);
+    }
+
     start_session(account, res, 201);
 }
 
@@ -855,8 +864,9 @@ void AccountHandler::handle_update_profile(const httplib::Request& req, httplib:
 
 namespace {
 constexpr const char* kLastAdminMessage =
-    "You are the only administrator of this BSFChat ID. Make another account an administrator "
-    "before deleting this one.";
+    "You are the only administrator of this BSFChat ID, so this account cannot be deleted yet. "
+    "Whoever runs the server can make another account an administrator with "
+    "'bsfchat-id --grant-admin <username>'; then delete this one.";
 } // namespace
 
 void AccountHandler::handle_delete_account(const httplib::Request& req, httplib::Response& res) {

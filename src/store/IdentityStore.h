@@ -271,6 +271,16 @@ public:
     // True when `id` is an administrator and no other enabled, undeleted
     // account is one.
     bool is_last_admin(const std::string& id);
+    // Grants or revokes the administrator flag (audit 3, M3: nothing could
+    // make an account an administrator). Revoking is refused, nothing
+    // changed, when `id` is the last enabled administrator; granting is
+    // refused for a deleted account. One transaction.
+    enum class SetAdminResult { Changed, Unchanged, NoSuchAccount, Deleted, LastAdmin };
+    SetAdminResult set_admin(const std::string& id, bool admin);
+    // Makes `id` an administrator when it is the first account this database
+    // ever held and no administrator exists, so a fresh deployment's first
+    // sign-up can manage it. Atomic; true when it promoted.
+    bool promote_if_first_account(const std::string& id);
     bool enable_account(const std::string& id);
     // Account id whose username_skeleton equals `skeleton`, if any.
     std::optional<std::string> find_account_by_username_skeleton(const std::string& skeleton);

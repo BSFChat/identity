@@ -808,6 +808,42 @@ bool IdentityStore::is_last_admin(const std::string& id) {
     return is_last_admin_locked(id);
 }
 
+IdentityStore::SetAdminResult IdentityStore::set_admin(const std::string& id, bool admin) {
+    std::lock_guard lock(mutex_);
+    Transaction txn(db_);
+    int is_admin = 0;
+    {
+        auto stmt = prepare(db_, "SELECT is_admin, deleted_at FROM accounts WHERE id = ?");
+        bind_text(stmt.get(), 1, id);
+        if (sqlite3_step(stmt.get()) != SQLITE_ROW) return SetAdminResult::NoSuchAccount;
+        is_admin = sqlite3_column_int(stmt.get(), 0) != 0 ? 1 : 0;
+        if (admin && sqlite3_column_int64(stmt.get(), 1) != 0) return SetAdminResult::Deleted;
+    }
+    if ((is_admin != 0) == admin) return SetAdminResult::Unchanged;
+    if (!admin && is_last_admin_locked(id)) return SetAdminResult::LastAdmin;
+    auto upd = prepare(db_, "UPDATE accounts SET is_admin = ?, updated_at = ? WHERE id = ?");
+    sqlite3_bind_int(upd.get(), 1, admin ? 1 : 0);
+    sqlite3_bind_int64(upd.get(), 2, now_seconds());
+    bind_text(upd.get(), 3, id);
+    if (sqlite3_step(upd.get()) != SQLITE_DONE) return SetAdminResult::NoSuchAccount;
+    txn.commit();
+    return SetAdminResult::Changed;
+}
+
+bool IdentityStore::promote_if_first_account(const std::string& id) {
+    std::lock_guard lock(mutex_);
+    // "First" by insertion order (rowid), so a deployment that already has
+    // accounts but no administrator does not hand admin to its next sign-up;
+    // it is the operator's call (--grant-admin). Tombstones keep their rows,
+    // so a deleted first account still counts as the first.
+    auto stmt = prepare(db_,
+        "UPDATE accounts SET is_admin = 1 WHERE id = ?1 "
+        "AND id = (SELECT id FROM accounts ORDER BY rowid ASC LIMIT 1) "
+        "AND NOT EXISTS (SELECT 1 FROM accounts WHERE is_admin != 0)");
+    bind_text(stmt.get(), 1, id);
+    return sqlite3_step(stmt.get()) == SQLITE_DONE && sqlite3_changes(db_) > 0;
+}
+
 IdentityStore::DeleteAccountResult IdentityStore::delete_account(const std::string& id) {
     std::lock_guard lock(mutex_);
     Transaction txn(db_);

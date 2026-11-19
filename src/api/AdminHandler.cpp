@@ -91,8 +91,8 @@ void AdminHandler::handle_disable_user(const httplib::Request& req, httplib::Res
         return;
     }
     // Disabling yourself signs you out in the same transaction and leaves
-    // nobody who can undo it from the portal; accounts are made admin only by
-    // editing the database.
+    // nobody who can undo it from the portal (only the operator's
+    // --grant-admin can make another administrator).
     if (user_id == account_handler_.get_session_account(req)) {
         json_error(res, 400, "You cannot disable your own account");
         return;

@@ -23,6 +23,22 @@ issuer_url = "http://localhost:8480"
 # run if the database in this file cannot be opened, rather than creating an
 # empty one. Two-factor authentication is left as it is. Make sure the
 # account really is the requester's before you reset it.
+#
+# LOST SECOND FACTOR. A user who has lost both their authenticator and their
+# backup codes cannot sign in. After checking it is really them, run
+#
+#   bsfchat-id --config /etc/bsfchat/identity.toml --disable-2fa <username>
+#
+# which removes two-factor authentication from the account and signs it out
+# everywhere; they sign in with their password and can set it up again.
+#
+# ADMINISTRATORS. The first account registered on a new database becomes an
+# administrator automatically (the service logs it). After that:
+#
+#   bsfchat-id --config /etc/bsfchat/identity.toml --grant-admin <username>
+#   bsfchat-id --config /etc/bsfchat/identity.toml --revoke-admin <username>
+#
+# Revoking (or deleting) the last administrator is refused.
 
 [database]
 path = "./data/identity.db"

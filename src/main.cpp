@@ -1,6 +1,7 @@
 #include "core/AccountDeletion.h"
 #include "core/Config.h"
 #include "core/Logger.h"
+#include "core/OperatorCommands.h"
 #include "core/IdentityServer.h"
 #include "core/PasswordReset.h"
 #include "core/Version.h"
@@ -29,6 +30,9 @@ constexpr const char* kUsage =
     "usage: bsfchat-id [--config <file>]\n"
     "       bsfchat-id [--config <file>] --reset-password <username>\n"
     "       bsfchat-id [--config <file>] --delete-account <username>\n"
+    "       bsfchat-id [--config <file>] --grant-admin <username>\n"
+    "       bsfchat-id [--config <file>] --revoke-admin <username>\n"
+    "       bsfchat-id [--config <file>] --disable-2fa <username>\n"
     "\n"
     "  --config <file>              TOML configuration (default: built-in defaults)\n"
     "  --reset-password <username>  set a new password for <username>, read from stdin\n"
@@ -37,13 +41,29 @@ constexpr const char* kUsage =
     "  --delete-account <username>  delete <username>'s personal data, 2FA, sign-ins and\n"
     "                               server list, keep the name reserved, and exit.\n"
     "                               Irreversible; asks for the username again on a terminal.\n"
+    "  --grant-admin <username>     make <username> an administrator (the admin page and the\n"
+    "                               admin API). The first account registered on a new\n"
+    "                               database is made one automatically.\n"
+    "  --revoke-admin <username>    take administrator rights away; refused for the last one.\n"
+    "  --disable-2fa <username>     remove <username>'s two-factor authentication (lost\n"
+    "                               authenticator AND backup codes) and sign them out\n"
+    "                               everywhere. Check it is really them first.\n"
     "  --help                       show this help\n";
 
 struct Options {
     std::optional<std::string> config_path;
     std::optional<std::string> reset_username;
     std::optional<std::string> delete_username;
+    std::optional<std::string> grant_admin_username;
+    std::optional<std::string> revoke_admin_username;
+    std::optional<std::string> disable_2fa_username;
     bool help = false;
+
+    int command_count() const {
+        return int(reset_username.has_value()) + int(delete_username.has_value()) +
+               int(grant_admin_username.has_value()) + int(revoke_admin_username.has_value()) +
+               int(disable_2fa_username.has_value());
+    }
 };
 
 // Returns nullopt (after printing why) on a malformed command line.
@@ -70,6 +90,12 @@ std::optional<Options> parse_args(int argc, char* argv[]) {
             auto v = value("--delete-account");
             if (!v) return std::nullopt;
             opts.delete_username = *v;
+        } else if (arg == "--grant-admin" || arg == "--revoke-admin" || arg == "--disable-2fa") {
+            auto v = value(arg.c_str());
+            if (!v) return std::nullopt;
+            (arg == "--grant-admin"    ? opts.grant_admin_username
+             : arg == "--revoke-admin" ? opts.revoke_admin_username
+                                       : opts.disable_2fa_username) = *v;
         } else if (arg == "--help" || arg == "-h") {
             opts.help = true;
         } else {
@@ -77,8 +103,8 @@ std::optional<Options> parse_args(int argc, char* argv[]) {
             return std::nullopt;
         }
     }
-    if (opts.reset_username && opts.delete_username) {
-        std::cerr << "bsfchat-id: --reset-password and --delete-account cannot be combined\n";
+    if (opts.command_count() > 1) {
+        std::cerr << "bsfchat-id: give one operator command at a time\n";
         return std::nullopt;
     }
     return opts;
@@ -162,7 +188,8 @@ int run_delete_account(const bsfchat::id::Config& config, const std::string& use
     // Asked before the confirmation prompt; delete_account() re-checks it.
     if (store->is_last_admin(account->id)) {
         std::cerr << "bsfchat-id: '" << account->username << "' is the only administrator "
-                     "left; make another account an administrator first. Nothing was changed\n";
+                     "left; grant another account with --grant-admin <username> first. "
+                     "Nothing was changed\n";
         return 1;
     }
     // On a terminal, the same "type the name" confirmation the web page asks
@@ -248,6 +275,31 @@ int run_reset_password(const bsfchat::id::Config& config, const std::string& use
     return 0;
 }
 
+// --grant-admin, --revoke-admin, --disable-2fa (core/OperatorCommands.h).
+int run_operator_command(const bsfchat::id::Config& config, const Options& opts) {
+    auto store = open_existing_store(config);
+    if (!store) return 1;
+    bsfchat::id::OperatorResult result;
+    try {
+        if (opts.grant_admin_username) {
+            result = bsfchat::id::set_admin_by_username(*store, *opts.grant_admin_username, true);
+        } else if (opts.revoke_admin_username) {
+            result = bsfchat::id::set_admin_by_username(*store, *opts.revoke_admin_username, false);
+        } else {
+            result = bsfchat::id::disable_2fa_by_username(*store, *opts.disable_2fa_username);
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "bsfchat-id: " << e.what() << "\n";
+        return 1;
+    }
+    if (!result.ok) {
+        std::cerr << "bsfchat-id: " << result.message << "; nothing was changed\n";
+        return 1;
+    }
+    std::cout << result.message << ".\n";
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -257,7 +309,7 @@ int main(int argc, char* argv[]) {
         std::cout << kUsage;
         return 0;
     }
-    const bool reset_mode = opts->reset_username.has_value() || opts->delete_username.has_value();
+    const bool reset_mode = opts->command_count() > 0;
 
     // The operator command keeps stdout for its own answer; only warnings
     // and errors from loading the config are logged.
@@ -284,7 +336,8 @@ int main(int argc, char* argv[]) {
     }
 
     if (opts->delete_username) return run_delete_account(config, *opts->delete_username);
-    if (reset_mode) return run_reset_password(config, *opts->reset_username);
+    if (opts->reset_username) return run_reset_password(config, *opts->reset_username);
+    if (reset_mode) return run_operator_command(config, *opts);
 
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
