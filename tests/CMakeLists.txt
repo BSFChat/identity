@@ -20,6 +20,7 @@ add_executable(identity_tests
     test_security_fixes.cpp
     test_version.cpp
     test_signin_ux.cpp
+    test_audit3.cpp
 )
 
 target_include_directories(identity_tests PRIVATE
@@ -64,6 +65,7 @@ target_sources(identity_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/api/AccountHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/AdminHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/OidcHandler.cpp
+    ${CMAKE_SOURCE_DIR}/src/http/HttpServer.cpp
 )
 
 include(GoogleTest)
