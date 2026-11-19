@@ -174,6 +174,18 @@ bool nonce_acceptable(const std::string& nonce) {
 //
 // `action_href`, when given, becomes a button under the advice — always a
 // same-origin path built by this file (a restarted /authorize), html-escaped.
+// The service-wide CSP (default_security_headers), for the pages this file
+// renders itself. It already carries frame-ancestors 'none'.
+const std::string& default_csp() {
+    static const std::string csp = [] {
+        for (const auto& [name, value] : default_security_headers()) {
+            if (name == "Content-Security-Policy") return value;
+        }
+        return std::string("default-src 'self'; frame-ancestors 'none'");
+    }();
+    return csp;
+}
+
 void render_notice_page(httplib::Response& res, int status, const std::string& title,
                         const std::string& detail, const std::string& next_step,
                         const std::string& action_href = {},
@@ -181,7 +193,7 @@ void render_notice_page(httplib::Response& res, int status, const std::string& t
     res.status = status;
     res.set_header("Cache-Control", "no-store");
     res.set_header("X-Frame-Options", "DENY");
-    res.set_header("Content-Security-Policy", "frame-ancestors 'none'");
+    res.set_header("Content-Security-Policy", default_csp());
     res.set_content(notice_page_html(title, detail, next_step, action_href, action_label),
                     "text/html");
 }
@@ -223,6 +235,26 @@ void browser_or_json_error(const httplib::Request& req, httplib::Response& res, 
 constexpr const char* kBadAuthorizeNextStep =
     "Go back to the app and start signing in again. If this keeps happening, the app may need "
     "updating, or it may not be set up to use this BSFChat ID.";
+
+// The scopes this service knows (audit 3). Anything else in a request is
+// dropped (RFC 6749 3.3 lets the server grant less than asked; the token
+// response's `scope` says what was granted) rather than listed on the
+// consent page and stored in the grant as if it meant something.
+constexpr const char* kKnownScopes[] = {"openid", "profile", "email", "offline_access"};
+
+std::string known_scopes_only(const std::string& requested) {
+    std::string out;
+    std::istringstream in(requested);
+    std::string token;
+    while (in >> token) {
+        const bool known = std::find(std::begin(kKnownScopes), std::end(kKnownScopes), token) !=
+                           std::end(kKnownScopes);
+        if (!known || scope_contains(out, token)) continue;
+        if (!out.empty()) out += ' ';
+        out += token;
+    }
+    return out;
+}
 
 // A same-origin /authorize URL putting the given authorization request again.
 // Every value is re-encoded here; /authorize re-validates all of it, and it
@@ -289,8 +321,13 @@ void OidcHandler::handle_discovery(const httplib::Request&, httplib::Response& r
         {"userinfo_endpoint", issuer + "/userinfo"},
         {"jwks_uri", issuer + "/jwks"},
         {"revocation_endpoint", issuer + "/token/revoke"},
-        {"registration_endpoint", issuer + "/register"},
-        {"scopes_supported", json::array({"openid", "profile", "email"})},
+        // No registration_endpoint: that names RFC 7591 dynamic client
+        // registration, which this service does not do. /register is where a
+        // PERSON signs up, and advertising it here told clients otherwise.
+        {"scopes_supported", json::array({"openid", "profile", "email", "offline_access"})},
+        {"claims_supported",
+            json::array({"sub", "iss", "aud", "azp", "iat", "exp", "nonce", "name",
+                         "preferred_username", "picture", "email"})},
         {"response_types_supported", json::array({"code"})},
         {"grant_types_supported", json::array({"authorization_code", "refresh_token"})},
         {"subject_types_supported", json::array({"public"})},
@@ -334,7 +371,7 @@ void OidcHandler::handle_authorize(const httplib::Request& req, httplib::Respons
     auto client_id = req.get_param_value("client_id");
     auto redirect_uri = req.get_param_value("redirect_uri");
     auto response_type = req.get_param_value("response_type");
-    auto scope = req.get_param_value("scope");
+    auto scope = known_scopes_only(req.get_param_value("scope"));
     auto state = req.get_param_value("state");
     auto code_challenge = req.get_param_value("code_challenge");
     auto code_challenge_method = req.get_param_value("code_challenge_method");
@@ -519,11 +556,14 @@ void OidcHandler::render_consent_page(httplib::Response& res, const OAuthClient&
     std::istringstream scope_stream(scope);
     std::string token;
     while (scope_stream >> token) {
-        std::string label = token;
+        // Only known scopes reach here (known_scopes_only). Email is not
+        // listed for an account that has none: nothing would be shared.
+        std::string label;
         if (token == "openid") label = "Confirm your identity";
-        else if (token == "profile") label = "Your display name and avatar";
-        else if (token == "email") label = "Your email address";
-        scopes_html << "<li>" << html_escape(label) << "</li>";
+        else if (token == "profile") label = "Your username, display name and avatar";
+        else if (token == "email" && !account.email.empty()) label = "Your email address";
+        else if (token == "offline_access") label = "Stay signed in until you sign it out";
+        if (!label.empty()) scopes_html << "<li>" << html_escape(label) << "</li>";
     }
     if (scopes_html.str().empty()) {
         scopes_html << "<li>Confirm your identity</li>";
@@ -549,6 +589,7 @@ void OidcHandler::render_consent_page(httplib::Response& res, const OAuthClient&
     html << "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
          << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
          << "<title>Authorize - BSFChat ID</title>"
+         << "<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">"
          << "<link rel=\"stylesheet\" href=\"/css/style.css\"></head><body>"
          << "<div class=\"container\"><div class=\"card\">"
          << "<div class=\"logo\"><h1>BSFChat ID</h1>"
@@ -581,7 +622,10 @@ void OidcHandler::render_consent_page(httplib::Response& res, const OAuthClient&
     // This page must never be framed: a clickjacked "Allow" is the same as a
     // silent grant.
     res.set_header("X-Frame-Options", "DENY");
-    res.set_header("Content-Security-Policy", "frame-ancestors 'none'");
+    // The whole default policy (audit 3): this used to REPLACE it with only
+    // frame-ancestors, so the one page that grants access ran with no
+    // script-src at all. The default already forbids framing.
+    res.set_header("Content-Security-Policy", default_csp());
     res.set_content(html.str(), "text/html");
 }
 
@@ -1221,7 +1265,9 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
                 break;
             case RotateResult::RetriedInGrace:
                 // Audit I-16: refreshes raced, or a reply was lost. Answered
-                // with the same successor, so the grant stays one chain.
+                // with the same successor, so the grant stays one chain. The
+                // access token and id_token below are minted afresh, as on
+                // any refresh; both are short-lived and die with the family.
                 log->info("Refresh token retried inside the grace window for account {} "
                           "(client {}); returned the same successor",
                           rt->account_id, rt->client_id);
@@ -1288,15 +1334,21 @@ void OidcHandler::handle_token(const httplib::Request& req, httplib::Response& r
 }
 
 void OidcHandler::handle_userinfo(const httplib::Request& req, httplib::Response& res) {
-    // Extract access token from Authorization header
+    // RFC 6750 3: every 401 names the scheme, and says why when there was a
+    // token at all.
+    const auto unauthorized = [&](const char* challenge, const std::string& message) {
+        res.set_header("WWW-Authenticate", challenge);
+        res.set_header("Cache-Control", "no-store");
+        json_error(res, 401, message);
+    };
     if (!req.has_header("Authorization")) {
-        json_error(res, 401, "Missing Authorization header");
+        unauthorized("Bearer", "Missing Authorization header");
         return;
     }
 
     auto auth = req.get_header_value("Authorization");
     if (!auth.starts_with("Bearer ")) {
-        json_error(res, 401, "Invalid Authorization header");
+        unauthorized("Bearer error=\"invalid_request\"", "Invalid Authorization header");
         return;
     }
 
@@ -1306,8 +1358,7 @@ void OidcHandler::handle_userinfo(const httplib::Request& req, httplib::Response
     // value is not an OAuth credential and must not be usable as one.
     auto session = store_.get_oidc_access_token(token);
     if (!session || session->expires_at < now_seconds()) {
-        res.set_header("WWW-Authenticate", "Bearer error=\"invalid_token\"");
-        json_error(res, 401, "Invalid or expired access token");
+        unauthorized("Bearer error=\"invalid_token\"", "Invalid or expired access token");
         return;
     }
 
@@ -1319,19 +1370,20 @@ void OidcHandler::handle_userinfo(const httplib::Request& req, httplib::Response
 
     auto account = store_.get_account_by_id(session->account_id);
     if (!account) {
-        json_error(res, 404, "Account not found");
+        unauthorized("Bearer error=\"invalid_token\"", "Invalid or expired access token");
         return;
     }
 
     // Claims are released according to the granted scope rather than always
-    // being dumped in full.
+    // being dumped in full, and a claim with no value is left out rather
+    // than sent as "" (OIDC Core 5.3.2), as the id_token already did.
     json response = {{"sub", account->id}};
     if (scope_contains(session->scope, "profile")) {
-        response["name"] = account->display_name;
+        if (!account->display_name.empty()) response["name"] = account->display_name;
         response["preferred_username"] = account->username;
-        response["picture"] = account->avatar_url;
+        if (!account->avatar_url.empty()) response["picture"] = account->avatar_url;
     }
-    if (scope_contains(session->scope, "email")) {
+    if (scope_contains(session->scope, "email") && !account->email.empty()) {
         response["email"] = account->email;
     }
 
@@ -1344,23 +1396,28 @@ void OidcHandler::handle_jwks(const httplib::Request&, httplib::Response& res) {
 }
 
 void OidcHandler::handle_revoke(const httplib::Request& req, httplib::Response& res) {
+    // RFC 7009. The request is form-encoded (2.1); JSON is still read for
+    // older callers. Errors are RFC 6749 5.2 shaped, like /token's; an
+    // unknown or already-revoked token is NOT an error (2.2): 200, so the
+    // answer does not reveal whether a token existed.
     std::string token;
-
     if (req.get_header_value("Content-Type").find("application/x-www-form-urlencoded") != std::string::npos) {
         auto params = parse_form(req.body);
         token = params["token"];
     } else {
-        try {
-            auto body = json::parse(req.body);
-            token = body.value("token", "");
-        } catch (...) {
-            json_error(res, 400, "Invalid request body");
+        auto body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.is_object()) {
+            oauth_error(res, 400, "invalid_request",
+                        "The body must be application/x-www-form-urlencoded with a token");
             return;
+        }
+        if (body.contains("token") && body["token"].is_string()) {
+            token = body["token"].get<std::string>();
         }
     }
 
     if (token.empty()) {
-        json_error(res, 400, "token is required");
+        oauth_error(res, 400, "invalid_request", "token is required");
         return;
     }
 
@@ -1375,7 +1432,18 @@ void OidcHandler::handle_revoke(const httplib::Request& req, httplib::Response& 
     }
 
     res.set_header("Cache-Control", "no-store");
-    res.set_content(json{{"success", true}}.dump(), "application/json");
+    res.set_content("{}", "application/json");
+}
+
+void OidcHandler::handle_client_info(const httplib::Request& req, httplib::Response& res) {
+    auto client_id = req.get_param_value("client_id");
+    auto client = client_id.empty() ? std::nullopt : store_.get_oauth_client(client_id);
+    if (!client) {
+        json_error(res, 404, "Unknown client");
+        return;
+    }
+    res.set_content(json{{"name", client->name.empty() ? client->client_id : client->name}}.dump(),
+                    "application/json");
 }
 
 std::string OidcHandler::create_id_token(const Account& account, const std::string& client_id,

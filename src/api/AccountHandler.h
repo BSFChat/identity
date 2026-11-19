@@ -91,8 +91,8 @@ public:
     // Writes a 4xx and returns false when the request must be refused:
     //   * a body that is not application/json. A cross-site <form> can only
     //     send text/plain, urlencoded or multipart without a CORS preflight,
-    //     and the preflight cannot succeed with credentials against our
-    //     wildcard CORS policy — so requiring JSON is what actually stops a
+    //     and the preflight fails (the account API sends no CORS headers at
+    //     all) — so requiring JSON is what actually stops a
     //     foreign page from posting a login and collecting the Set-Cookie;
     //   * a browser saying the request is cross-site (Sec-Fetch-Site), or,
     //     from browsers that do not send that, an Origin that is not the

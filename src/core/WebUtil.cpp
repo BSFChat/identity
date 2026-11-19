@@ -210,6 +210,17 @@ bool is_json_content_type(const std::string& content_type) {
     return to_lower(trim(media)) == "application/json";
 }
 
+bool is_public_cors_path(const std::string& path) {
+    return path == "/.well-known/openid-configuration" || path == "/jwks" || path == "/token" ||
+           path == "/userinfo" || path == "/token/revoke";
+}
+
+bool wants_no_store(const std::string& path) {
+    return path.rfind("/api/", 0) == 0 || path == "/register" || path == "/token" ||
+           path == "/token/revoke" || path == "/userinfo" || path == "/authorize" ||
+           path == "/authorize/decision";
+}
+
 const std::vector<std::pair<std::string, std::string>>& default_security_headers() {
     static const std::vector<std::pair<std::string, std::string>> headers = {
         {"Content-Security-Policy",
@@ -289,6 +300,7 @@ std::string notice_page_html(const std::string& title, const std::string& detail
     html << "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
          << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
          << "<title>" << html_escape(title) << " - BSFChat ID</title>"
+         << "<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">"
          << "<link rel=\"stylesheet\" href=\"/css/style.css\"></head><body>"
          << "<div class=\"container\"><div class=\"card\">"
          << "<div class=\"logo\"><h1>BSFChat ID</h1>"

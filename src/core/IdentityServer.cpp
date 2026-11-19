@@ -3,6 +3,7 @@
 #include "api/AccountHandler.h"
 #include "api/OidcHandler.h"
 #include "api/AdminHandler.h"
+#include "core/Version.h"
 #include "core/WebUtil.h"
 
 #include <chrono>
@@ -67,21 +68,30 @@ void IdentityServer::stop_sweeper() {
 void IdentityServer::register_routes() {
     auto& svr = http_server_->server();
 
-    // Set CORS headers for all responses
-    svr.set_pre_routing_handler([](const httplib::Request&, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        res.set_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-        res.set_header("Access-Control-Allow-Headers", "Authorization, Content-Type");
+    // CORS (audit 3): only the OAuth/OIDC endpoints a browser-based relying
+    // party may call from its own origin get Access-Control-Allow-Origin.
+    // The account API (/api/...), sign-up and the pages are used by this
+    // origin's own pages and by native apps, neither of which needs CORS,
+    // and a wildcard on them only widened what a foreign page could read.
+    svr.set_pre_routing_handler([](const httplib::Request& req, httplib::Response& res) {
+        if (is_public_cors_path(req.path)) {
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+            res.set_header("Access-Control-Allow-Headers", "Authorization, Content-Type");
+        }
         return httplib::Server::HandlerResponse::Unhandled;
     });
 
     // Security headers on every response, static pages included (security
     // audit L7): login.html, profile.html and admin.html could be framed and
-    // had no CSP. A handler's own value wins — the consent page sets a
-    // stricter frame policy of its own. See default_security_headers().
-    svr.set_post_routing_handler([](const httplib::Request&, httplib::Response& res) {
+    // had no CSP. A handler's own value wins. Account API answers are never
+    // cached (audit 3): /api/profile and friends carry personal data.
+    svr.set_post_routing_handler([](const httplib::Request& req, httplib::Response& res) {
         for (const auto& [name, value] : default_security_headers()) {
             if (!res.has_header(name)) res.set_header(name, value);
+        }
+        if (wants_no_store(req.path) && !res.has_header("Cache-Control")) {
+            res.set_header("Cache-Control", "no-store");
         }
     });
 
@@ -106,12 +116,25 @@ void IdentityServer::register_routes() {
         return httplib::Server::HandlerResponse::Handled;
     });
 
-    // Handle CORS preflight
+    // CORS preflight. The headers (or their absence) come from the
+    // pre-routing handler above, so a preflight for /api/... fails.
     svr.Options(R"(.*)", [](const httplib::Request&, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        res.set_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-        res.set_header("Access-Control-Allow-Headers", "Authorization, Content-Type");
-        res.set_content("", "text/plain");
+        res.status = 204;
+    });
+
+    // Plain paths people type or links that dropped the extension (audit
+    // 3: /login was a 404). The query string goes along, so an
+    // authorization request survives; a #fragment stays in the browser.
+    for (const char* page : {"/login", "/register", "/profile", "/forgot-password", "/admin"}) {
+        svr.Get(page, [](const httplib::Request& req, httplib::Response& res) {
+            std::string target = req.path + ".html";
+            if (auto q = req.target.find('?'); q != std::string::npos) target += req.target.substr(q);
+            res.set_redirect(target);
+        });
+    }
+    // Browsers ask for /favicon.ico whatever the page says.
+    svr.Get("/favicon.ico", [](const httplib::Request&, httplib::Response& res) {
+        res.set_redirect("/favicon.svg", 301);
     });
 
     auto account_handler = std::make_shared<AccountHandler>(*store_, config_);
@@ -136,6 +159,8 @@ void IdentityServer::register_routes() {
             [h = oidc_handler](const httplib::Request& req, httplib::Response& res) { h->handle_jwks(req, res); });
     svr.Post("/token/revoke",
              [h = oidc_handler](const httplib::Request& req, httplib::Response& res) { h->handle_revoke(req, res); });
+    svr.Get("/api/authorize/client",
+            [h = oidc_handler](const httplib::Request& req, httplib::Response& res) { h->handle_client_info(req, res); });
 
     // Account endpoints
     svr.Post("/register",
@@ -205,7 +230,7 @@ void IdentityServer::register_routes() {
 
 void IdentityServer::start() {
     auto log = get_logger();
-    log->info("BSFChat ID service v{} starting", "0.1.0");
+    log->info("BSFChat ID service {} starting", build::describe());
     log->info("Server name: {}", config_.server_name);
     log->info("Issuer URL: {}", config_.issuer_url);
     log->info("Database: {}", config_.database_path);

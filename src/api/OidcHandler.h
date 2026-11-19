@@ -21,6 +21,10 @@ public:
     void handle_userinfo(const httplib::Request& req, httplib::Response& res);
     void handle_jwks(const httplib::Request& req, httplib::Response& res);
     void handle_revoke(const httplib::Request& req, httplib::Response& res);
+    // GET /api/authorize/client?client_id=... -> {"name": "..."}: lets the
+    // sign-in page say which app is asking (audit 3). Client names are shown
+    // on the consent page anyway; 404 for an unknown client.
+    void handle_client_info(const httplib::Request& req, httplib::Response& res);
 
 private:
     // When a first-party app signs in to a chat server through the consent

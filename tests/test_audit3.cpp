@@ -590,3 +590,153 @@ TEST(Audit3Sessions, ListShowsDeviceAndCoarseAddressAndReloginReplacesTheSession
     accounts.handle_get_profile(old_cookie, pres);
     EXPECT_EQ(status_of(pres), 401);
 }
+
+// ---------------------------------------------------------------------------
+// Protocol and discovery
+// ---------------------------------------------------------------------------
+
+namespace {
+
+class Audit3Oidc : public ::testing::Test {
+protected:
+    void SetUp() override {
+        keys_dir = bsfchat::test::unique_temp_dir("bsfchat_id_audit3_keys");
+        config.password_hash_iterations = kMinPbkdf2Iterations;
+        config.login_rate_limit = 1000;
+        store = std::make_unique<IdentityStore>(":memory:");
+        store->initialize();
+        key_manager = std::make_unique<KeyManager>(keys_dir.string());
+        accounts = std::make_unique<AccountHandler>(*store, config);
+        oidc = std::make_unique<OidcHandler>(*store, *key_manager, *accounts, config);
+
+        auto alice = make_account("acct-1", "alice");  // no email, no avatar
+        ASSERT_TRUE(store->create_account(alice));
+        OAuthClient client;
+        client.client_id = "web-app";
+        client.client_secret = "s3cr3t-value";
+        client.name = "Web App";
+        client.redirect_uris = R"(["https://app.example.com/cb"])";
+        client.created_at = now_seconds();
+        ASSERT_TRUE(store->create_oauth_client(client));
+        Session s;
+        s.session_id = "alice-browser";
+        s.account_id = "acct-1";
+        s.created_at = now_seconds();
+        s.expires_at = s.created_at + 3600;
+        ASSERT_TRUE(store->create_session(s));
+    }
+    void TearDown() override { std::filesystem::remove_all(keys_dir); }
+
+    httplib::Response authorize(const std::string& scope) {
+        httplib::Request req;
+        req.method = "GET";
+        req.set_header("Cookie", "session=alice-browser");
+        req.params.emplace("client_id", "web-app");
+        req.params.emplace("redirect_uri", "https://app.example.com/cb");
+        req.params.emplace("response_type", "code");
+        req.params.emplace("scope", scope);
+        httplib::Response res;
+        oidc->handle_authorize(req, res);
+        return res;
+    }
+
+    std::string access_token(const std::string& scope) {
+        const auto token = "access-" + scope;
+        Session s;
+        s.session_id = token;
+        s.account_id = "acct-1";
+        s.created_at = now_seconds();
+        s.expires_at = s.created_at + 3600;
+        s.token_type = token_type::kOidcAccess;
+        s.scope = scope;
+        s.client_id = "web-app";
+        EXPECT_TRUE(store->create_session(s));
+        return token;
+    }
+
+    std::filesystem::path keys_dir;
+    Config config;
+    std::unique_ptr<IdentityStore> store;
+    std::unique_ptr<KeyManager> key_manager;
+    std::unique_ptr<AccountHandler> accounts;
+    std::unique_ptr<OidcHandler> oidc;
+};
+
+} // namespace
+
+TEST_F(Audit3Oidc, DiscoveryHasNoRegistrationEndpoint) {
+    httplib::Response res;
+    oidc->handle_discovery(httplib::Request{}, res);
+    auto body = json::parse(res.body);
+    EXPECT_FALSE(body.contains("registration_endpoint"));
+    EXPECT_EQ(body["revocation_endpoint"], config.issuer_url + "/token/revoke");
+}
+
+TEST_F(Audit3Oidc, ConsentListsOnlyKnownScopesWithTheDefaultCsp) {
+    auto res = authorize("openid profile email admin:everything");
+    ASSERT_EQ(status_of(res), 200) << res.body;
+    EXPECT_EQ(res.body.find("admin:everything"), std::string::npos);
+    // alice has no email address, so none is offered.
+    EXPECT_EQ(res.body.find("email address"), std::string::npos);
+    const auto csp = header_of(res, "Content-Security-Policy");
+    EXPECT_NE(csp.find("script-src 'self'"), std::string::npos) << csp;
+    EXPECT_NE(csp.find("frame-ancestors 'none'"), std::string::npos) << csp;
+}
+
+TEST_F(Audit3Oidc, UserinfoOmitsEmptyClaimsAndChallengesEveryUnauthorizedCall) {
+    httplib::Request req;
+    req.set_header("Authorization", "Bearer " + access_token("openid profile email"));
+    httplib::Response res;
+    oidc->handle_userinfo(req, res);
+    ASSERT_EQ(status_of(res), 200) << res.body;
+    auto body = json::parse(res.body);
+    EXPECT_EQ(body["preferred_username"], "alice");
+    EXPECT_FALSE(body.contains("email"));
+    EXPECT_FALSE(body.contains("picture"));
+
+    httplib::Response bare;
+    oidc->handle_userinfo(httplib::Request{}, bare);
+    EXPECT_EQ(status_of(bare), 401);
+    EXPECT_EQ(header_of(bare, "WWW-Authenticate").rfind("Bearer", 0), 0u);
+}
+
+TEST_F(Audit3Oidc, RevocationErrorsAreOAuthShaped) {
+    httplib::Request empty;
+    empty.set_header("Content-Type", "application/x-www-form-urlencoded");
+    httplib::Response res;
+    oidc->handle_revoke(empty, res);
+    EXPECT_EQ(status_of(res), 400);
+    EXPECT_EQ(json::parse(res.body)["error"], "invalid_request");
+    EXPECT_EQ(header_of(res, "Cache-Control"), "no-store");
+
+    httplib::Request unknown;
+    unknown.set_header("Content-Type", "application/x-www-form-urlencoded");
+    unknown.body = "token=never-issued";
+    httplib::Response ok;
+    oidc->handle_revoke(unknown, ok);
+    EXPECT_EQ(status_of(ok), 200);  // RFC 7009 2.2
+}
+
+TEST_F(Audit3Oidc, LoginPageCanAskWhichAppIsSigningIn) {
+    httplib::Request req;
+    req.params.emplace("client_id", "web-app");
+    httplib::Response res;
+    oidc->handle_client_info(req, res);
+    EXPECT_EQ(json::parse(res.body)["name"], "Web App");
+    httplib::Request unknown;
+    unknown.params.emplace("client_id", "nope");
+    httplib::Response nres;
+    oidc->handle_client_info(unknown, nres);
+    EXPECT_EQ(status_of(nres), 404);
+}
+
+TEST(Audit3Http, CorsAndCachingRules) {
+    EXPECT_TRUE(is_public_cors_path("/token"));
+    EXPECT_TRUE(is_public_cors_path("/.well-known/openid-configuration"));
+    EXPECT_FALSE(is_public_cors_path("/api/profile"));
+    EXPECT_FALSE(is_public_cors_path("/api/servers"));
+    EXPECT_FALSE(is_public_cors_path("/register"));
+    EXPECT_TRUE(wants_no_store("/api/profile"));
+    EXPECT_TRUE(wants_no_store("/token"));
+    EXPECT_FALSE(wants_no_store("/css/style.css"));
+}

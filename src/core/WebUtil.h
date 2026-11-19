@@ -86,6 +86,15 @@ bool wants_html(const std::string& accept, const std::string& sec_fetch_mode);
 bool not_found_wants_page(const std::string& path, const std::string& accept,
                           const std::string& sec_fetch_mode);
 
+// Paths that answer cross-origin requests (Access-Control-Allow-Origin: *):
+// discovery, JWKS, /token, /userinfo and /token/revoke, which a browser-based
+// relying party calls from its own origin. Nothing else (audit 3).
+bool is_public_cors_path(const std::string& path);
+
+// Paths whose answers must not be cached unless the handler says otherwise:
+// the account API (/api/...), sign-up, and the token endpoints.
+bool wants_no_store(const std::string& path);
+
 // The HTML of a plain notice page in the service's style: a title, what
 // happened, what to do next, and optionally one button linking to
 // `action_href` (a same-origin path). Every value is escaped. Used for the
