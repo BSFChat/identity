@@ -52,12 +52,19 @@ bool is_reserved_username(std::string_view username) {
         "abuse", "postmaster", "webmaster", "hostmaster", "noreply", "info", "everyone",
         "here", "null", "undefined", "anonymous", "nobody",
     };
-    const auto skeleton = username_skeleton(username);
+    // Reserved names also fold i/l together ("adm1n" -> "admin"). Done here
+    // rather than in username_skeleton() so the skeletons stored for
+    // existing accounts keep matching.
+    auto fold = [](std::string sk) {
+        for (auto& c : sk) if (c == 'i') c = 'l';
+        return sk;
+    };
+    const auto skeleton = fold(username_skeleton(username));
     for (auto reserved : kReserved) {
-        if (skeleton == username_skeleton(reserved)) return true;
+        if (skeleton == fold(username_skeleton(reserved))) return true;
     }
     // "bsfchat-team", "bsfchatsupport": anything that starts with the name.
-    return skeleton.rfind(username_skeleton("bsfchat"), 0) == 0;
+    return skeleton.rfind(fold(username_skeleton("bsfchat")), 0) == 0;
 }
 
 std::string username_skeleton(std::string_view username) {
