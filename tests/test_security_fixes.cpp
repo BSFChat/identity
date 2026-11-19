@@ -412,7 +412,7 @@ TEST_F(SecurityFixTest, LookalikeUsernamesAreRefused) {
     };
     EXPECT_EQ(reg("a1ice"), 409);
     EXPECT_EQ(reg("a.lice"), 409);
-    EXPECT_EQ(reg("al_ice-"), 409);
+    EXPECT_EQ(reg("al_ice"), 409);
     EXPECT_EQ(reg("..."), 400);
     EXPECT_EQ(reg("bob"), 201);
     EXPECT_EQ(reg("b0b"), 409);
@@ -446,8 +446,10 @@ TEST_F(SecurityFixTest, DisablingKillsAccessTokensAndLoginAndEnableRestoresLogin
     oidc->handle_userinfo(ureq, ures);
     EXPECT_EQ(status_of(ures), 401) << "access token of a disabled account still works";
 
-    // Answers exactly like a wrong password.
-    EXPECT_EQ(login("10.0.0.1"), 401);
+    // With the right password the owner is told the account is disabled
+    // (audit 3); a wrong password still answers like any wrong password.
+    EXPECT_EQ(login("10.0.0.1"), 403);
+    EXPECT_EQ(login("10.0.0.1", "not the password"), 401);
     EXPECT_TRUE(store->list_refresh_tokens_for_account("acct-1").empty());
 
     ASSERT_TRUE(store->enable_account("acct-1"));

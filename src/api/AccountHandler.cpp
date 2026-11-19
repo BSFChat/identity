@@ -8,6 +8,7 @@
 #include "core/WebUtil.h"
 
 #include <bsfchat/Identifiers.h>
+#include <bsfchat/JwtUtils.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -133,30 +134,60 @@ bool has_markup_characters(const std::string& s) {
 // smuggling, which parse_uri rejects outright). There is no reason for a
 // homeserver URL to be anything but absolute http(s) with a host.
 bool server_url_acceptable(const std::string& url, std::string& why) {
+    static const std::string kExample = " Use the address you connect to, for example "
+                                        "https://chat.example.com";
     if (url.empty() || url.size() > kMaxServerUrlLength) {
-        why = "server_url must be 1-512 characters";
+        why = url.empty() ? "Enter the server's address." : "That server address is too long.";
         return false;
     }
     if (std::any_of(url.begin(), url.end(),
                     [](unsigned char c) { return c < 0x21 || c == 0x7f; }) ||
         has_markup_characters(url)) {
-        why = "server_url contains invalid characters";
+        why = "That server address contains characters an address cannot have." + kExample;
         return false;
     }
     const auto uri = parse_uri(url);
     if (!uri.valid || uri.host.empty()) {
-        why = "server_url must be an absolute URL with a host";
+        why = "That is not a complete server address." + kExample;
         return false;
     }
     if (uri.scheme != "http" && uri.scheme != "https") {
-        why = "server_url must use http or https";
+        why = "A server address starts with https://." + kExample;
         return false;
     }
     if (uri.has_fragment) {
-        why = "server_url must not have a fragment";
+        why = "A server address cannot contain '#'." + kExample;
         return false;
     }
     return true;
+}
+
+// Audit 3: the list stored whatever was typed, so "https://Chat.Example/"
+// and "https://chat.example" were two entries for one server, and a re-add
+// could never match the row a sign-in had recorded. Every write goes
+// through the protocol's canonical form — the same one the consent page
+// records and the chat server checks — and plain http is refused except on
+// loopback, as for sign-in tokens: nothing could sign in to such a server
+// through this service anyway.
+std::optional<std::string> canonical_server_url(const std::string& url, std::string& why) {
+    if (!server_url_acceptable(url, why)) return std::nullopt;
+    auto canonical = bsfchat::canonical_audience_url(url);
+    if (!canonical) {
+        why = "That server address is not in a form BSFChat can use: no query, no "
+              "\"..\" or empty path segments, no percent-escapes.";
+        return std::nullopt;
+    }
+    if (!bsfchat::audience_url_is_secure(*canonical)) {
+        why = "Server addresses must use https:// (plain http:// only works for localhost).";
+        return std::nullopt;
+    }
+    return canonical;
+}
+
+std::string trim_ascii(const std::string& s) {
+    const auto first = s.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return {};
+    return s.substr(first, s.find_last_not_of(" \t\r\n") - first + 1);
 }
 
 std::string generate_hex_token(int bytes) {
@@ -443,7 +474,7 @@ void AccountHandler::handle_register(const httplib::Request& req, httplib::Respo
 
     auto username = string_field(*body, "username");
     auto password = string_field(*body, "password");
-    auto email = string_field(*body, "email");
+    auto email = trim_ascii(string_field(*body, "email"));
 
     if (username.empty() || password.empty()) {
         json_error(res, 400, "Username and password are required");
@@ -642,9 +673,18 @@ void AccountHandler::handle_login(const httplib::Request& req, httplib::Response
     } else {
         verify_password(password, dummy_password_hash());
     }
-    // A disabled account answers exactly like a wrong password, so disabling
-    // does not confirm the password to whoever is trying it (H1).
-    if (ok && account->disabled()) ok = false;
+    // A disabled account: with a WRONG password it answers exactly like any
+    // wrong password, so nothing about it is learned without the password.
+    // With the right one the owner is told why they cannot get in (audit 3)
+    // instead of being sent to "forgot password". Confirming a password of
+    // an account that cannot be used gives an attacker nothing to use.
+    if (ok && account->disabled()) {
+        log->info("Sign-in refused for disabled account {}", account->id);
+        json_error(res, 403,
+                   "This account has been disabled. Contact the people who run this BSFChat ID "
+                   "if you think that is a mistake.");
+        return;
+    }
 
     if (!ok) {
         if (!ip_key.empty()) login_limiter_.record(ip_budget);
@@ -660,7 +700,7 @@ void AccountHandler::handle_login(const httplib::Request& req, httplib::Response
         // where people type their password by mistake.
         log->warn("Failed login from {}{}", redact_ip_for_log(ip_key),
                   account ? " for account " + account->id : std::string());
-        json_error(res, 401, "Invalid username or password");
+        json_error(res, 401, "The username or password is incorrect");
         return;
     }
 
@@ -806,8 +846,18 @@ void AccountHandler::handle_update_profile(const httplib::Request& req, httplib:
         !string_member("email", email)) {
         return;
     }
+    // Audit 3: an empty (or all-space) name was accepted, and every chat
+    // server then showed a blank member. Surrounding spaces are an editing
+    // artefact.
+    display_name = trim_ascii(display_name);
+    email = trim_ascii(email);
+    avatar_url = trim_ascii(avatar_url);
+    if (display_name.empty() && body->contains("display_name")) {
+        json_error(res, 400, "Display name cannot be empty");
+        return;
+    }
     if (display_name.size() > 128) {
-        json_error(res, 400, "Display name is too long");
+        json_error(res, 400, "Display name is too long (at most 128 characters)");
         return;
     }
     if (auto err = display_text_error(display_name)) {
@@ -1463,20 +1513,21 @@ void AccountHandler::handle_add_server(const httplib::Request& req, httplib::Res
     // a 500 rather than a 400.
     if (body.is_discarded() || !body.contains("server_url")
         || !body["server_url"].is_string()) {
-        json_error(res, 400, "Missing server_url");
+        json_error(res, 400, "Enter the server's address.");
         return;
     }
 
-    std::string url = body["server_url"].get<std::string>();
     std::string why;
-    if (!server_url_acceptable(url, why)) {
+    auto canonical = canonical_server_url(body["server_url"].get<std::string>(), why);
+    if (!canonical) {
         json_error(res, 400, why);
         return;
     }
+    const std::string& url = *canonical;
 
     std::string name;
     if (body.contains("server_name") && body["server_name"].is_string()) {
-        name = body["server_name"].get<std::string>();
+        name = trim_ascii(body["server_name"].get<std::string>());
         if (name.size() > kMaxServerNameLength) {
             // Cut on a code-point boundary. resize() at a byte split a
             // multi-byte character, stored invalid UTF-8, and every later
@@ -1490,8 +1541,12 @@ void AccountHandler::handle_add_server(const httplib::Request& req, httplib::Res
 
     // The list is a convenience sync, not storage. Without a cap a single
     // "openid"-scoped token could grow it without limit.
-    if (store_.list_server_memberships(account_id).size() >= kMaxServerMemberships) {
-        json_error(res, 409, "Too many servers on this account");
+    // A re-add of a listed server is a rename (or nothing), not a new row.
+    const auto existing = store_.list_server_memberships(account_id);
+    const bool listed = std::any_of(existing.begin(), existing.end(),
+                                    [&](const auto& m) { return m.server_url == url; });
+    if (!listed && existing.size() >= kMaxServerMemberships) {
+        json_error(res, 409, "Your server list is full. Remove a server you no longer use first.");
         return;
     }
 
@@ -1531,7 +1586,11 @@ void AccountHandler::handle_remove_server(const httplib::Request& req, httplib::
         return;
     }
 
+    // As stored before canonicalisation, and as stored since.
     store_.remove_server_membership(account_id, url);
+    if (auto canonical = bsfchat::canonical_audience_url(url); canonical && *canonical != url) {
+        store_.remove_server_membership(account_id, *canonical);
+    }
     res.set_content(nlohmann::json{{"success", true}}.dump(), "application/json");
 }
 

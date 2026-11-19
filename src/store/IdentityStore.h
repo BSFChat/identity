@@ -446,8 +446,10 @@ public:
         // server on the consent page (audit I-1); see server_signin_consented().
         int64_t consented_at = 0;
     };
-    // Adds or renames a row. Keeps consented_at: re-adding a server from the
-    // app or the portal neither grants nor withdraws a consent.
+    // Adds or renames a row; an empty `server_name` keeps the row's name.
+    // `server_url` should be canonical (canonical_audience_url). Keeps
+    // consented_at: re-adding a server from the app or the portal neither
+    // grants nor withdraws a consent.
     void add_server_membership(const std::string& account_id, const std::string& server_url,
                                 const std::string& server_name = "");
     // Adds a server to the account's list when one of the first-party apps

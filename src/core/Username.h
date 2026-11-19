@@ -26,6 +26,11 @@ namespace bsfchat::id {
 // worse failure than the one this prevents.
 std::optional<std::string> username_policy_error(std::string_view username);
 
+// True for names reserved for the service and its staff (admin, root,
+// support, anything starting "bsfchat", ...), compared by skeleton.
+// Registration refuses them; existing accounts are unaffected.
+bool is_reserved_username(std::string_view username);
+
 // Lossy confusable folding: separators dropped, ASCII lowercased, 0->o, 1->l,
 // then m->rn and w->vv expanded so every spelling of the same shape lands on
 // one string. A port of the chat server's localpart_skeleton()

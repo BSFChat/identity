@@ -28,10 +28,36 @@ std::optional<std::string> username_policy_error(std::string_view username) {
     }
     // Nothing but separators folds to an empty skeleton, and "" is also the
     // column default for rows that were never backfilled.
-    if (username_skeleton(username).empty()) {
+    const auto skeleton = username_skeleton(username);
+    if (skeleton.empty()) {
         return "Username must contain at least one letter or digit";
     }
+    // Audit 3: "-alice", "alice." read as typos or as someone else.
+    if (is_separator(username.front()) || is_separator(username.back())) {
+        return "Username must start and end with a letter or digit";
+    }
+    if (is_reserved_username(username)) {
+        return "That username is reserved. Choose another one.";
+    }
     return std::nullopt;
+}
+
+bool is_reserved_username(std::string_view username) {
+    // Names people would read as the service or its staff (audit 3).
+    // Compared by skeleton, so "adm1n", "Ad.min" and "rn0derator" are
+    // reserved too.
+    static constexpr std::string_view kReserved[] = {
+        "admin", "administrator", "root", "support", "bsfchat", "system", "moderator", "mod",
+        "help", "helpdesk", "security", "staff", "official", "operator", "sysop", "owner",
+        "abuse", "postmaster", "webmaster", "hostmaster", "noreply", "info", "everyone",
+        "here", "null", "undefined", "anonymous", "nobody",
+    };
+    const auto skeleton = username_skeleton(username);
+    for (auto reserved : kReserved) {
+        if (skeleton == username_skeleton(reserved)) return true;
+    }
+    // "bsfchat-team", "bsfchatsupport": anything that starts with the name.
+    return skeleton.rfind(username_skeleton("bsfchat"), 0) == 0;
 }
 
 std::string username_skeleton(std::string_view username) {

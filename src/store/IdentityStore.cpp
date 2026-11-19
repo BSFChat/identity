@@ -717,7 +717,11 @@ std::optional<std::string> IdentityStore::find_account_by_username_skeleton(cons
 bool IdentityStore::email_in_use(const std::string& email, const std::string& except_account_id) {
     if (email.empty()) return false;
     std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_, "SELECT 1 FROM accounts WHERE email = ? AND id != ?");
+    // Case-insensitive (audit 3): Alice@Example.com and alice@example.com
+    // are one mailbox in practice. Compared with lower() rather than by
+    // changing the UNIQUE constraint, so existing rows that differ only in
+    // case keep working; only new writes are held to it.
+    auto stmt = prepare(db_, "SELECT 1 FROM accounts WHERE lower(email) = lower(?) AND id != ?");
     bind_text(stmt.get(), 1, email);
     bind_text(stmt.get(), 2, except_account_id);
     return sqlite3_step(stmt.get()) == SQLITE_ROW;
@@ -1964,8 +1968,10 @@ void IdentityStore::add_server_membership(const std::string& account_id,
     auto stmt = prepare(db_,
         "INSERT INTO server_memberships (account_id, server_url, server_name, joined_at) "
         "VALUES (?, ?, ?, strftime('%s','now')) "
-        "ON CONFLICT(account_id, server_url) DO UPDATE SET server_name = excluded.server_name, "
-        "joined_at = excluded.joined_at");
+        // A re-add without a name keeps the one the row has (audit 3).
+        "ON CONFLICT(account_id, server_url) DO UPDATE SET server_name = CASE "
+        "WHEN excluded.server_name = '' THEN server_memberships.server_name "
+        "ELSE excluded.server_name END, joined_at = excluded.joined_at");
     bind_text(stmt.get(), 1, account_id);
     bind_text(stmt.get(), 2, server_url);
     bind_text(stmt.get(), 3, server_name);

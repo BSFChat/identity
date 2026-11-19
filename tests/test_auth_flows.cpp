@@ -928,7 +928,10 @@ TEST_F(TokenSeparationTest, ServerUrlMustBeAbsoluteHttp) {
 
     // Real homeserver URLs still work.
     EXPECT_EQ(add(json{{"server_url", "https://bsfchat.com"}}), 200);
-    EXPECT_EQ(add(json{{"server_url", "http://192.168.1.10:8448"}}), 200);
+    EXPECT_EQ(add(json{{"server_url", "http://localhost:8448"}}), 200);
+    // Plain http to anything but loopback is refused (audit 3): nothing
+    // could sign in to it through this service anyway.
+    EXPECT_EQ(add(json{{"server_url", "http://192.168.1.10:8448"}}), 400);
 }
 
 // body["server_url"].get<std::string>() on a non-string threw json::type_error,

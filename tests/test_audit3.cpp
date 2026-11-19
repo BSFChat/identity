@@ -10,6 +10,7 @@
 #include "core/ClientRegistration.h"
 #include "core/Config.h"
 #include "core/OperatorCommands.h"
+#include "core/Username.h"
 #include "core/RateLimiter.h"
 #include "core/WebUtil.h"
 #include "crypto/KeyManager.h"
@@ -414,4 +415,115 @@ TEST_F(Audit3TwoFactor, ABurnedLoginTokenSendsThePageBackToThePasswordStep) {
     accounts->handle_login_2fa(json_request({{"login_token", token}, {"code", current_code()}}),
                                third);
     EXPECT_TRUE(json::parse(third.body).value("restart", false)) << third.body;
+}
+
+// ---------------------------------------------------------------------------
+// Data validation
+// ---------------------------------------------------------------------------
+
+TEST(Audit3Validation, ReservedAndPunctuatedUsernamesAreRefused) {
+    for (const char* name : {"admin", "adm1n", "ad.min", "root", "support", "bsfchat",
+                             "bsfchat-team", "moderator", "security", "system", "help"}) {
+        EXPECT_TRUE(username_policy_error(name).has_value()) << name;
+    }
+    for (const char* name : {"-alice", "alice.", "_bob", "bob_"}) {
+        EXPECT_TRUE(username_policy_error(name).has_value()) << name;
+    }
+    for (const char* name : {"alice", "a.b-c_d", "rootbeer", "helpful"}) {
+        EXPECT_FALSE(username_policy_error(name).has_value()) << name;
+    }
+}
+
+namespace {
+
+class Audit3Profile : public ::testing::Test {
+protected:
+    void SetUp() override {
+        config.password_hash_iterations = kMinPbkdf2Iterations;
+        config.login_rate_limit = 1000;
+        store = std::make_unique<IdentityStore>(":memory:");
+        store->initialize();
+        auto alice = make_account("acct-1", "alice");
+        alice.email = "Alice@Example.com";
+        ASSERT_TRUE(store->create_account(alice));
+        ASSERT_TRUE(store->create_account(make_account("acct-2", "bob")));
+        Session s;
+        s.session_id = "bob-browser";
+        s.account_id = "acct-2";
+        s.created_at = now_seconds();
+        s.expires_at = s.created_at + 3600;
+        ASSERT_TRUE(store->create_session(s));
+        accounts = std::make_unique<AccountHandler>(*store, config);
+    }
+
+    httplib::Response as_bob(void (AccountHandler::*handler)(const httplib::Request&, httplib::Response&),
+                             const json& body) {
+        auto req = json_request(body);
+        req.set_header("Cookie", "session=bob-browser");
+        httplib::Response res;
+        ((*accounts).*handler)(req, res);
+        return res;
+    }
+
+    Config config;
+    std::unique_ptr<IdentityStore> store;
+    std::unique_ptr<AccountHandler> accounts;
+};
+
+} // namespace
+
+TEST_F(Audit3Profile, DisplayNameIsTrimmedAndCannotBeEmpty) {
+    auto empty = as_bob(&AccountHandler::handle_update_profile, {{"display_name", "   "}});
+    EXPECT_EQ(status_of(empty), 400);
+    auto padded = as_bob(&AccountHandler::handle_update_profile, {{"display_name", "  Bob B.  "}});
+    ASSERT_EQ(status_of(padded), 200) << padded.body;
+    EXPECT_EQ(store->get_account_by_id("acct-2")->display_name, "Bob B.");
+}
+
+TEST_F(Audit3Profile, EmailUniquenessIgnoresCase) {
+    auto res = as_bob(&AccountHandler::handle_update_profile, {{"email", "alice@example.COM"}});
+    EXPECT_EQ(status_of(res), 409) << res.body;
+    httplib::Response reg;
+    accounts->handle_register(json_request({{"username", "carol"},
+                                            {"password", "carol password"},
+                                            {"email", "ALICE@example.com"}}),
+                              reg);
+    EXPECT_EQ(status_of(reg), 409) << reg.body;
+}
+
+TEST_F(Audit3Profile, ServerListIsCanonicalHttpsAndKeepsNamesOnReAdd) {
+    auto add = [&](const json& body) {
+        return as_bob(&AccountHandler::handle_add_server, body);
+    };
+    ASSERT_EQ(status_of(add({{"server_url", "https://Chat.Example.com:443/"},
+                             {"server_name", "Team chat"}})), 200);
+    // The same server spelled differently: one row, name kept.
+    ASSERT_EQ(status_of(add({{"server_url", "https://chat.example.com"}})), 200);
+    auto list = store->list_server_memberships("acct-2");
+    ASSERT_EQ(list.size(), 1u);
+    EXPECT_EQ(list[0].server_url, "https://chat.example.com");
+    EXPECT_EQ(list[0].server_name, "Team chat");
+
+    // Plain http only on loopback; errors do not name the JSON field.
+    auto lan = add({{"server_url", "http://192.168.1.10:8448"}});
+    EXPECT_EQ(status_of(lan), 400);
+    EXPECT_EQ(json::parse(lan.body)["error"].get<std::string>().find("server_url"), std::string::npos);
+    EXPECT_EQ(status_of(add({{"server_url", "http://localhost:8448"}})), 200);
+
+    // Removing by any spelling.
+    auto rm = as_bob(&AccountHandler::handle_remove_server, {{"server_url", "https://CHAT.example.com/"}});
+    EXPECT_EQ(status_of(rm), 200);
+    EXPECT_EQ(store->list_server_memberships("acct-2").size(), 1u);  // localhost left
+}
+
+TEST_F(Audit3Profile, DisabledAccountIsToldSoOnlyWithTheRightPassword) {
+    ASSERT_TRUE(store->disable_account("acct-2"));
+    httplib::Response wrong;
+    accounts->handle_login(json_request({{"username", "bob"}, {"password", "nope nope"}}), wrong);
+    EXPECT_EQ(status_of(wrong), 401);
+    httplib::Response right;
+    accounts->handle_login(json_request({{"username", "bob"}, {"password", "correct horse battery"}}),
+                           right);
+    EXPECT_EQ(status_of(right), 403);
+    EXPECT_NE(json::parse(right.body)["error"].get<std::string>().find("disabled"), std::string::npos);
 }
